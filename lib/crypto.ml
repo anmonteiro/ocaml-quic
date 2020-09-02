@@ -59,6 +59,7 @@ module AEAD = struct
     { encrypt_payload :
         packet_number:int64 -> header:Cstruct.t -> Cstruct.t -> Cstruct.t
     ; encrypt_header : sample:Cstruct.t -> Cstruct.t -> Cstruct.t
+    ; decrypt_header : sample:Cstruct.t -> Cstruct.t -> Cstruct.t
     }
 
   let encrypt_payload
@@ -86,10 +87,6 @@ module AEAD = struct
          * header, up to and including the unprotected packet number. *)
       ~adata:header
       data
-
-  type header_type =
-    | Short
-    | Long
 
   (* mutates [header] *)
   (*
@@ -125,6 +122,40 @@ module AEAD = struct
       Cstruct.get_uint8 header 0 lxor (Cstruct.get_uint8 mask 0 land masked_bits)
     in
     Cstruct.set_uint8 header 0 masked_header_first_byte;
+    let pn_offset = Cstruct.len header - pn_length in
+    (* From RFC<QUIC-TLS-RFC>§5.4.1:
+     *   [...] the packet number is masked with the remaining bytes. *)
+    for i = 0 to pn_length - 1 do
+      Cstruct.set_uint8
+        header
+        (pn_offset + i)
+        (Cstruct.get_uint8 header (pn_offset + i)
+        lxor Cstruct.get_uint8 mask (i + 1))
+    done;
+    header
+
+  let decrypt_header ~mask header =
+    (* From RFC<QUIC-TLS-RFC>§5.4.1:
+     *   The output of this algorithm is a 5 byte mask which is applied to the
+     *   protected header fields using exclusive OR. *)
+    let mask = Cstruct.sub mask 0 5 in
+    let masked_bits =
+      if is_long header then (* Long header: 4 bits masked *)
+        0x0f
+      else (* Short header: 5 bits masked *)
+        0x1f
+    in
+    (* From RFC<QUIC-TLS-RFC>§5.4.1:
+     *   The least significant bits of the first byte of the packet are masked
+     *   by the least significant bits of the first mask byte. *)
+    let masked_header_first_byte =
+      Cstruct.get_uint8 header 0 lxor (Cstruct.get_uint8 mask 0 land masked_bits)
+    in
+    Cstruct.set_uint8 header 0 masked_header_first_byte;
+    (* From RFC<QUIC-TLS-RFC>§5.4.1:
+     *   Removing header protection only differs in the order in which the
+     *   packet number length (pn_length) is determined. *)
+    let pn_length = packet_number_length header in
     let pn_offset = Cstruct.len header - pn_length in
     (* From RFC<QUIC-TLS-RFC>§5.4.1:
      *   [...] the packet number is masked with the remaining bytes. *)
@@ -212,15 +243,17 @@ module InitialAEAD = struct
   let make ~mode dest_cid =
     let secret = get_secret ~mode dest_cid in
     let key, iv = get_key_and_iv secret in
+    let hp_key = get_header_protection_key secret in
+    let encrypt_or_decrypt f ~sample header =
+      (* From RFC<QUIC-TLS-RFC>§5.4.3:
+       *   mask = AES-ECB(hp_key, sample) *)
+      let mask = AES_ECB.encrypt ~key:(AES_ECB.of_secret hp_key) sample in
+      f ~mask header
+    in
     { AEAD.encrypt_payload =
         AEAD.encrypt_payload (module AES_GCM) ~key:(AES_GCM.of_secret key) ~iv
-    ; encrypt_header =
-        (fun ~sample header ->
-          let hp_key = get_header_protection_key secret in
-          (* From RFC<QUIC-TLS-RFC>§5.4.3:
-           *   mask = AES-ECB(hp_key, sample) *)
-          let mask = AES_ECB.encrypt ~key:(AES_ECB.of_secret hp_key) sample in
-          AEAD.encrypt_header ~mask header)
+    ; encrypt_header = encrypt_or_decrypt AEAD.encrypt_header
+    ; decrypt_header = encrypt_or_decrypt AEAD.decrypt_header
     }
 end
 
@@ -273,25 +306,32 @@ module ChaCha20 = struct
 
   let make ~secret =
     let key, iv = get_key_and_iv secret in
+    let hp_key = get_header_protection_key secret in
+    let encrypt_or_decrypt f ~sample header =
+      (* From RFC<QUIC-TLS-RFC>§5.4.3:
+       *   counter = sample[0..3]
+       *   nonce = sample[4..15]
+       *   mask = ChaCha20(hp_key, counter, nonce, {0,0,0,0,0}) *)
+      let counter = Cstruct.sub sample 0 4 in
+      let nonce = Cstruct.sub sample 4 12 in
+      let ctr =
+        Int64.logand
+          (Int64.of_int32 (Cstruct.LE.get_uint32 counter 0))
+          0x00000000FFFFFFFFL
+      in
+      let mask =
+        Chacha20.crypt
+          ~key:(Chacha20.of_secret hp_key)
+          ~nonce
+          ~ctr
+          (Cstruct.create 5)
+      in
+      f ~mask header
+    in
     { AEAD.encrypt_payload =
         AEAD.encrypt_payload (module Chacha20) ~key:(Chacha20.of_secret key) ~iv
-    ; encrypt_header =
-        (fun ~sample header ->
-          (* From RFC<QUIC-TLS-RFC>§5.4.3:
-           *   counter = sample[0..3]
-           *   nonce = sample[4..15]
-           *   mask = ChaCha20(hp_key, counter, nonce, {0,0,0,0,0}) *)
-          let hp_key = get_header_protection_key secret in
-          let counter = Cstruct.sub sample 0 4 in
-          let nonce = Cstruct.sub sample 4 12 in
-          let mask =
-            Chacha20.crypt
-              ~key:(Chacha20.of_secret hp_key)
-              ~nonce
-              ~ctr:(Int64.of_int32 (Cstruct.LE.get_uint32 counter 0))
-              (Cstruct.create 5)
-          in
-          AEAD.encrypt_header ~mask header)
+    ; encrypt_header = encrypt_or_decrypt AEAD.encrypt_header
+    ; decrypt_header = encrypt_or_decrypt AEAD.decrypt_header
     }
 end
 

@@ -1,3 +1,5 @@
+module Quic = Quic__
+
 let packet =
   Hex.to_string
     (`Hex

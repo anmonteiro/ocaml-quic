@@ -253,6 +253,95 @@ let test_chacha_short_header () =
     expected_protected_packet
     (Hex.of_cstruct packet)
 
+let test_initial_aead_header_encryption_decryption () =
+  let conn_id = Hex.to_string (`Hex "decafbad") in
+  let client_encrypter = InitialAEAD.make ~mode:Client conn_id in
+  let unprotected_header = Hex.to_string (`Hex "8e0001020304deadbeef") in
+  let sample = Cstruct.of_hex "655e5cd55c41f69080575d7999c25a5b" in
+  assert (Cstruct.len sample = 16);
+  let header =
+    (* the first byte and the last 4 bytes should be encrypted *)
+    client_encrypter.encrypt_header
+      ~sample
+      (Cstruct.of_string unprotected_header)
+  in
+  (*
+   *  Initial Packet {
+   *    Header Form (1) = 1,
+   *    Fixed Bit (1) = 1,
+   *    Long Packet Type (2) = 0,
+   *    Reserved Bits (2),         # Protected
+   *    Packet Number Length (2),  # Protected
+   *    Version (32),
+   *    DCID Len (8),
+   *    Destination Connection ID (0..160),
+   *    SCID Len (8),
+   *    Source Connection ID (0..160),
+   *    Token Length (i),
+   *    Token (..),
+   *    Length (i),
+   *    Packet Number (8..32),     # Protected
+   *    Protected Payload (0..24), # Skipped Part
+   *    Protected Payload (128),   # Sampled Part
+   *    Protected Payload (..)     # Remainder
+   *  }
+   *)
+  Alcotest.(check bool)
+    "only the last 4 bits of the first byte are encrypted"
+    true
+    (Cstruct.get_uint8 header 0 land 0x0f
+    <> Char.code unprotected_header.[0] land 0x0f);
+  Alcotest.check
+    hex
+    "bytes 1-6 are unmodified (not protected)"
+    (Hex.of_cstruct (Cstruct.sub header 1 5))
+    (Hex.of_string (String.sub unprotected_header 1 5));
+  Alcotest.(check bool)
+    "bytes 6-10 are unmodified (not protected)"
+    true
+    (Cstruct.to_string (Cstruct.sub header 6 4)
+    <> String.sub unprotected_header 6 4);
+  let decrypted_header = client_encrypter.decrypt_header ~sample header in
+  Alcotest.check
+    hex
+    "decrypted_header matches unprotected_header"
+    (Hex.of_string unprotected_header)
+    (Hex.of_cstruct decrypted_header)
+
+let test_chacha20_header_encryption_decryption () =
+  let module ChaCha20 = Quic.Crypto.ChaCha20 in
+  let client_encrypter = ChaCha20.make ~secret:chacha_secret in
+  let unprotected_header = Hex.to_string (`Hex "8e0001020304deadbeef") in
+  let sample = Cstruct.of_hex "655e5cd55c41f69080575d7999c25a5b" in
+  assert (Cstruct.len sample = 16);
+  let header =
+    (* the first byte and the last 4 bytes should be encrypted *)
+    client_encrypter.encrypt_header
+      ~sample
+      (Cstruct.of_string unprotected_header)
+  in
+  Alcotest.(check bool)
+    "only the last 4 bits of the first byte are encrypted"
+    true
+    (Cstruct.get_uint8 header 0 land 0x0f
+    <> Char.code unprotected_header.[0] land 0x0f);
+  Alcotest.check
+    hex
+    "bytes 1-6 are unmodified (not protected)"
+    (Hex.of_cstruct (Cstruct.sub header 1 5))
+    (Hex.of_string (String.sub unprotected_header 1 5));
+  Alcotest.(check bool)
+    "bytes 6-10 are unmodified (not protected)"
+    true
+    (Cstruct.to_string (Cstruct.sub header 6 4)
+    <> String.sub unprotected_header 6 4);
+  let decrypted_header = client_encrypter.decrypt_header ~sample header in
+  Alcotest.check
+    hex
+    "decrypted_header matches unprotected_header"
+    (Hex.of_string unprotected_header)
+    (Hex.of_cstruct decrypted_header)
+
 let keys_suite =
   [ "initial secret", `Quick, test_initial_secret
   ; "client secrets", `Quick, test_client_secrets
@@ -273,6 +362,18 @@ let chacha_short_header_suite =
   ; "chacha short header", `Quick, test_chacha_short_header
   ]
 
+let initial_aead_suite =
+  [ ( "header encryption / decryption"
+    , `Quick
+    , test_initial_aead_header_encryption_decryption )
+  ]
+
+let chacha20_suite =
+  [ ( "header encryption / decryption"
+    , `Quick
+    , test_chacha20_header_encryption_decryption )
+  ]
+
 let () =
   Alcotest.run
     "packets"
@@ -281,4 +382,6 @@ let () =
     ; "A.3. Server Initial", server_initial_suite
     ; "A.4. Retry", retry_integrity_check_suite
     ; "A.5. ChaCha20-Poly1305 Short Header Packet", chacha_short_header_suite
+    ; "Initial AEAD", initial_aead_suite
+    ; "ChaCha20", chacha20_suite
     ]
