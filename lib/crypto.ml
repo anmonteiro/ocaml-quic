@@ -53,11 +53,61 @@ let[@inline] packet_number_length header =
    *   field, plus one. *)
   (Cstruct.get_uint8 header 0 land 0x03) + 1
 
+(* From RFC<QUIC-RFC>§Appendix A:
+ *
+ *   DecodePacketNumber(largest_pn, truncated_pn, pn_nbits):
+ *      expected_pn  = largest_pn + 1
+ *      pn_win       = 1 << pn_nbits
+ *      pn_hwin      = pn_win / 2
+ *      pn_mask      = pn_win - 1
+ *      // The incoming packet number should be greater than
+ *      // expected_pn - pn_hwin and less than or equal to
+ *      // expected_pn + pn_hwin
+ *      //
+ *      // This means we can't just strip the trailing bits from
+ *      // expected_pn and add the truncated_pn because that might
+ *      // yield a value outside the window.
+ *      //
+ *      // The following code calculates a candidate value and
+ *      // makes sure it's within the packet number window.
+ *      // Note the extra checks to prevent overflow and underflow.
+ *      candidate_pn = (expected_pn & ~pn_mask) | truncated_pn
+ *      if candidate_pn <= expected_pn - pn_hwin and
+ *         candidate_pn < (1 << 62) - pn_win:
+ *         return candidate_pn + pn_win
+ *      if candidate_pn > expected_pn + pn_hwin and
+ *         candidate_pn >= pn_win:
+ *         return candidate_pn - pn_win
+ *      return candidate_pn
+ *)
+let decode_packet_number ~largest_pn ~truncated_pn ~pn_nbits =
+  let expected_pn = Int64.add largest_pn 1L in
+  let pn_win = Int64.shift_left 1L pn_nbits in
+  let pn_hwin = Int64.div pn_win 2L in
+  let pn_mask = Int64.sub pn_win 1L in
+  let candidate_pn =
+    Int64.logor (Int64.logand expected_pn (Int64.lognot pn_mask)) truncated_pn
+  in
+  if
+    Int64.compare candidate_pn (Int64.sub expected_pn pn_hwin) <= 0
+    && Int64.compare candidate_pn (Int64.sub (Int64.shift_left 1L 62) pn_win)
+       < 0
+  then
+    Int64.add candidate_pn pn_win
+  else if
+    Int64.compare candidate_pn (Int64.add expected_pn pn_hwin) > 0
+    && Int64.compare candidate_pn pn_win >= 0
+  then
+    Int64.sub candidate_pn pn_win
+  else
+    candidate_pn
+
 module AEAD = struct
-  (* Initial: AES_128_GCM_SHA256 *)
   type t =
     { encrypt_payload :
         packet_number:int64 -> header:Cstruct.t -> Cstruct.t -> Cstruct.t
+    ; decrypt_payload :
+        packet_number:int64 -> header:Cstruct.t -> Cstruct.t -> Cstruct.t option
     ; encrypt_header : sample:Cstruct.t -> Cstruct.t -> Cstruct.t
     ; decrypt_header : sample:Cstruct.t -> Cstruct.t -> Cstruct.t
     }
@@ -87,6 +137,32 @@ module AEAD = struct
          * header, up to and including the unprotected packet number. *)
       ~adata:header
       data
+
+  let decrypt_payload
+      (type k)
+      (module Cipher : Mirage_crypto.AEAD with type key = k)
+      ~key
+      ~iv
+      ~packet_number
+      ~header
+      ciphertext
+    =
+    (* From RFC<QUIC-TLS-RFC>§5.3:
+     *   The nonce, N, is formed by combining the packet protection IV with the
+     *   packet number. The 62 bits of the reconstructed QUIC packet number in
+     *   network byte order are left-padded with zeros to the size of the IV.
+     *   The exclusive OR of the padded packet number and the IV forms the AEAD
+     *   nonce. *)
+    let nonce = Tls.Crypto.aead_nonce iv packet_number in
+    Cipher.authenticate_decrypt
+      ~key
+      ~nonce
+        (*
+         * The associated data, A, for the AEAD is the contents of the QUIC
+         * header, starting from the flags byte in either the short or long
+         * header, up to and including the unprotected packet number. *)
+      ~adata:header
+      ciphertext
 
   (* mutates [header] *)
   (*
@@ -180,6 +256,120 @@ module AEAD = struct
     let sample = Cstruct.sub sealed_payload offset 16 in
     let header = t.encrypt_header ~sample header in
     Cstruct.append header sealed_payload
+
+  let variable_length_integer header ~off =
+    let rec inner r off rem =
+      match rem with
+      | 0 ->
+        r
+      | n ->
+        let b = Cstruct.get_uint8 header off in
+        inner ((r * 256) + b) (off + 1) (n - 1)
+    in
+    let parse_remaining r n = inner r (off + 1) n in
+    let first_byte = Cstruct.get_uint8 header off in
+    let encoding = first_byte lsr 6 in
+    let b1 = first_byte land 0b00111111 in
+    match encoding with
+    | 0 ->
+      1, b1
+    | 1 ->
+      2, parse_remaining b1 1
+    | 2 ->
+      4, parse_remaining b1 3
+    | _ ->
+      assert (encoding = 3);
+      8, parse_remaining b1 7
+
+  let parse_long_header_offset header =
+    (*
+     * Note: Sizes below are in bytes
+     *
+     * Initial Packet {
+     *   Header Form, Fixed Bit, Type, Res. Bits, Packet Number Length (1),
+     *   Version (4),
+     *   DCID Len (1),
+     *   Destination Connection ID (0..20),
+     *   SCID Len (1),
+     *   Source Connection ID (0..20),
+     *   Token Length (i),
+     *   Token (..),
+     *   Length (i),
+     *   Packet Number (8..32),     # Protected
+     *   Protected Payload (0..24), # Skipped Part
+     *   Protected Payload (128),   # Sampled Part
+     *   Protected Payload (..)     # Remainder
+     * }
+     *)
+    let dest_cid_len = Cstruct.get_uint8 header 5 in
+    let src_cid_len = Cstruct.get_uint8 header (6 + dest_cid_len) in
+    let token_length =
+      match Packet.Header.parse_type (Cstruct.get_uint8 header 0) with
+      | Initial ->
+        let varint_len, token_len =
+          variable_length_integer header ~off:(7 + src_cid_len + dest_cid_len)
+        in
+        varint_len + token_len
+      | _ ->
+        0
+    in
+    let payload_varint_len, _payload_len =
+      variable_length_integer
+        header
+        ~off:(7 + src_cid_len + dest_cid_len + token_length)
+    in
+    (*
+     * sample_offset = 7 + len(destination_connection_id) +
+     *                     len(source_connection_id) +
+     *                     len(payload_length) + 4
+     * if packet_type == Initial:
+     *     sample_offset += len(token_length) +
+     *                      len(token)
+     *)
+    7 + dest_cid_len + src_cid_len + payload_varint_len + token_length + 4
+
+  let decrypt_packet
+      t ~largest_pn ?(conn_id_len = Packet.CID.length) ~header ciphertext
+    =
+    let offset' =
+      if is_long header then
+        parse_long_header_offset header
+      else
+        (*
+         * sample_offset = 1 + len(connection_id) + 4
+         *
+         * sample = packet[sample_offset..sample_offset+sample_leng
+         *)
+        1 + conn_id_len + 4
+    in
+    let offset = offset' - Cstruct.len header in
+    let sample = Cstruct.sub ciphertext offset 16 in
+    let header = t.decrypt_header ~sample header in
+    let pn_length = packet_number_length header in
+    let off = Cstruct.len header - pn_length in
+    let truncated_pn =
+      match pn_length with
+      | 4 ->
+        Int64.logand
+          (Int64.of_int32 (Cstruct.BE.get_uint32 header off))
+          0x00000000FFFFFFFFL
+      | 3 ->
+        Int64.of_int
+          ((Cstruct.get_uint8 header off * (1 lsl 16))
+          + Cstruct.BE.get_uint16 header (off + 1))
+      | 2 ->
+        Int64.of_int (Cstruct.BE.get_uint16 header off)
+      | _ ->
+        assert (pn_length = 1);
+        Int64.of_int (Cstruct.get_uint8 header off)
+    in
+    let pn =
+      decode_packet_number ~largest_pn ~pn_nbits:(8 * pn_length) ~truncated_pn
+    in
+    let plaintext_payload =
+      t.decrypt_payload ~packet_number:pn ~header ciphertext
+    in
+    header, plaintext_payload
 end
 
 let get_key_and_iv ~key_length secret =
@@ -250,8 +440,9 @@ module InitialAEAD = struct
       let mask = AES_ECB.encrypt ~key:(AES_ECB.of_secret hp_key) sample in
       f ~mask header
     in
-    { AEAD.encrypt_payload =
-        AEAD.encrypt_payload (module AES_GCM) ~key:(AES_GCM.of_secret key) ~iv
+    let key = AES_GCM.of_secret key in
+    { AEAD.encrypt_payload = AEAD.encrypt_payload (module AES_GCM) ~key ~iv
+    ; AEAD.decrypt_payload = AEAD.decrypt_payload (module AES_GCM) ~key ~iv
     ; encrypt_header = encrypt_or_decrypt AEAD.encrypt_header
     ; decrypt_header = encrypt_or_decrypt AEAD.decrypt_header
     }
@@ -328,8 +519,9 @@ module ChaCha20 = struct
       in
       f ~mask header
     in
-    { AEAD.encrypt_payload =
-        AEAD.encrypt_payload (module Chacha20) ~key:(Chacha20.of_secret key) ~iv
+    let key = Chacha20.of_secret key in
+    { AEAD.encrypt_payload = AEAD.encrypt_payload (module Chacha20) ~key ~iv
+    ; AEAD.decrypt_payload = AEAD.decrypt_payload (module Chacha20) ~key ~iv
     ; encrypt_header = encrypt_or_decrypt AEAD.encrypt_header
     ; decrypt_header = encrypt_or_decrypt AEAD.decrypt_header
     }

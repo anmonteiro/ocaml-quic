@@ -273,14 +273,6 @@ module Packet = struct
           ( Packet.Version.parse version
           , { Packet.CID.length = src_len; id = src_cid }
           , { Packet.CID.length = dst_len; id = dst_cid } )
-
-      let parse_type first_byte =
-        (* From RFC<QUIC-RFC>§17.2:
-         *   Long Packet Type: The next two bits (those with a mask of 0x30) of
-         *   byte 0 contain a packet type. Packet types are listed in Table 5. *)
-        let masked = first_byte land 0b00110000 in
-        let type_ = masked lsr 4 in
-        Packet.Header.Type.parse type_
     end
 
     module Short = struct
@@ -356,7 +348,7 @@ module Packet = struct
             { source_cid = src_cid; dest_cid = dst_cid; versions })
         parse_version_negotiation_packet
     | Number _ ->
-      (match Header.Long.parse_type first_byte with
+      (match Packet.Header.parse_type first_byte with
       | Initial ->
         variable_length_integer >>= fun token_length ->
         take token_length >>= fun token ->

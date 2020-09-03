@@ -90,6 +90,14 @@ module Header = struct
         0x3
   end
 
+  let parse_type first_byte =
+    (* From RFC<QUIC-RFC>§17.2:
+     *   Long Packet Type: The next two bits (those with a mask of 0x30) of
+     *   byte 0 contain a packet type. Packet types are listed in Table 5. *)
+    let masked = first_byte land 0b00110000 in
+    let type_ = masked lsr 4 in
+    Type.parse type_
+
   type t =
     | Initial of
         { version : Version.t
