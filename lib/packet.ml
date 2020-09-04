@@ -90,6 +90,12 @@ module Header = struct
         0x3
   end
 
+  let[@inline] is_long first_byte =
+    (* From RFC<QUIC-RFC>§17.2:
+     *   Header Form: The most significant bit (0x80) of byte 0 (the first
+     *   byte) is set to 1 for long headers. *)
+    Bits.test first_byte 7
+
   let parse_type first_byte =
     (* From RFC<QUIC-RFC>§17.2:
      *   Long Packet Type: The next two bits (those with a mask of 0x30) of
@@ -100,39 +106,54 @@ module Header = struct
 
   type t =
     | Initial of
-        { version : Version.t
+        { version : int32
         ; source_cid : CID.t
         ; dest_cid : CID.t
+        ; payload_length : int
         ; token : string
         }
     | Zero_RTT of
-        { version : Version.t
+        { version : int32
         ; source_cid : CID.t
+        ; payload_length : int
         ; dest_cid : CID.t
         }
     | Handshake of
-        { version : Version.t
+        { version : int32
         ; source_cid : CID.t
+        ; payload_length : int
         ; dest_cid : CID.t
         }
     | Short of { dest_cid : CID.t }
+
+  let payload_length = function
+    | Initial { payload_length; _ }
+    | Zero_RTT { payload_length; _ }
+    | Handshake { payload_length; _ } ->
+      payload_length
+    | Short _ ->
+      failwith "Packet.Header.payload_length called on short header"
 end
 
-type t =
-  | VersionNegotiation of
+type _ t =
+  | VersionNegotiation :
       { source_cid : CID.t
       ; dest_cid : CID.t
       ; versions : Version.t list
       }
-  | Crypt of
+      -> [ `decrypted ] t
+  | Frames :
       { header : Header.t
       ; payload : Bigstringaf.t
+      ; packet_number : int64
       }
-  | Retry of
-      { version : Version.t
+      -> [ `decrypted ] t
+  | Retry :
+      { version : int32
       ; source_cid : CID.t
       ; dest_cid : CID.t
       ; token : string
       ; pseudo : Bigstringaf.t
       ; tag : string
       }
+      -> [ `decrypted ] t

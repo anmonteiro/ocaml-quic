@@ -41,7 +41,7 @@ module Hkdf = struct
     key
 end
 
-let[@inline] is_long header = Cstruct.get_uint8 header 0 land 0x80 = 0x80
+let[@inline] is_long header = Packet.Header.is_long (Cstruct.get_uint8 header 0)
 
 let[@inline] packet_number_length header =
   (* From RFC<QUIC-RFC>§17.2:
@@ -104,7 +104,8 @@ let decode_packet_number ~largest_pn ~truncated_pn ~pn_nbits =
 
 module AEAD = struct
   type t =
-    { encrypt_payload :
+    { conn_id_len : int
+    ; encrypt_payload :
         packet_number:int64 -> header:Cstruct.t -> Cstruct.t -> Cstruct.t
     ; decrypt_payload :
         packet_number:int64 -> header:Cstruct.t -> Cstruct.t -> Cstruct.t option
@@ -210,53 +211,6 @@ module AEAD = struct
     done;
     header
 
-  let decrypt_header ~mask header =
-    (* From RFC<QUIC-TLS-RFC>§5.4.1:
-     *   The output of this algorithm is a 5 byte mask which is applied to the
-     *   protected header fields using exclusive OR. *)
-    let mask = Cstruct.sub mask 0 5 in
-    let masked_bits =
-      if is_long header then (* Long header: 4 bits masked *)
-        0x0f
-      else (* Short header: 5 bits masked *)
-        0x1f
-    in
-    (* From RFC<QUIC-TLS-RFC>§5.4.1:
-     *   The least significant bits of the first byte of the packet are masked
-     *   by the least significant bits of the first mask byte. *)
-    let masked_header_first_byte =
-      Cstruct.get_uint8 header 0 lxor (Cstruct.get_uint8 mask 0 land masked_bits)
-    in
-    Cstruct.set_uint8 header 0 masked_header_first_byte;
-    (* From RFC<QUIC-TLS-RFC>§5.4.1:
-     *   Removing header protection only differs in the order in which the
-     *   packet number length (pn_length) is determined. *)
-    let pn_length = packet_number_length header in
-    let pn_offset = Cstruct.len header - pn_length in
-    (* From RFC<QUIC-TLS-RFC>§5.4.1:
-     *   [...] the packet number is masked with the remaining bytes. *)
-    for i = 0 to pn_length - 1 do
-      Cstruct.set_uint8
-        header
-        (pn_offset + i)
-        (Cstruct.get_uint8 header (pn_offset + i)
-        lxor Cstruct.get_uint8 mask (i + 1))
-    done;
-    header
-
-  let encrypt_packet t ~packet_number ~header data =
-    let sealed_payload = t.encrypt_payload ~packet_number ~header data in
-    let offset =
-      (* From RFC<QUIC-TLS-RFC>§5.4.2:
-       *  This results in needing at least 3 bytes of frames in the unprotected
-       *  payload if the packet number is encoded on a single byte, or 2 bytes
-       *  of frames for a 2-byte packet number encoding. *)
-      4 - packet_number_length header
-    in
-    let sample = Cstruct.sub sealed_payload offset 16 in
-    let header = t.encrypt_header ~sample header in
-    Cstruct.append header sealed_payload
-
   let variable_length_integer header ~off =
     let rec inner r off rem =
       match rem with
@@ -328,25 +282,78 @@ module AEAD = struct
      *)
     7 + dest_cid_len + src_cid_len + payload_varint_len + token_length + 4
 
-  let decrypt_packet
-      t ~largest_pn ?(conn_id_len = Packet.CID.length) ~header ciphertext
-    =
-    let offset' =
-      if is_long header then
-        parse_long_header_offset header
-      else
-        (*
-         * sample_offset = 1 + len(connection_id) + 4
-         *
-         * sample = packet[sample_offset..sample_offset+sample_leng
-         *)
-        1 + conn_id_len + 4
+  let sample_offset ~conn_id_len header =
+    if is_long header then
+      parse_long_header_offset header
+    else
+      (*
+       * sample_offset = 1 + len(connection_id) + 4
+       *
+       * sample = packet[sample_offset..sample_offset+sample_leng
+       *)
+      1 + conn_id_len + 4
+
+  let decrypt_header ?(conn_id_len = Packet.CID.length) ~mask header =
+    (* From RFC<QUIC-TLS-RFC>§5.4.1:
+     *   The output of this algorithm is a 5 byte mask which is applied to the
+     *   protected header fields using exclusive OR. *)
+    let mask = Cstruct.sub mask 0 5 in
+    let masked_bits =
+      if is_long header then (* Long header: 4 bits masked *)
+        0x0f
+      else (* Short header: 5 bits masked *)
+        0x1f
     in
-    let offset = offset' - Cstruct.len header in
-    let sample = Cstruct.sub ciphertext offset 16 in
-    let header = t.decrypt_header ~sample header in
+    (* From RFC<QUIC-TLS-RFC>§5.4.1:
+     *   The least significant bits of the first byte of the packet are masked
+     *   by the least significant bits of the first mask byte. *)
+    let masked_header_first_byte =
+      Cstruct.get_uint8 header 0 lxor (Cstruct.get_uint8 mask 0 land masked_bits)
+    in
+    Cstruct.set_uint8 header 0 masked_header_first_byte;
+    (* From RFC<QUIC-TLS-RFC>§5.4.1:
+     *   Removing header protection only differs in the order in which the
+     *   packet number length (pn_length) is determined. *)
     let pn_length = packet_number_length header in
-    let off = Cstruct.len header - pn_length in
+    let pn_offset = sample_offset ~conn_id_len header - 4 in
+    (* From RFC<QUIC-TLS-RFC>§5.4.1:
+     *   [...] the packet number is masked with the remaining bytes. *)
+    for i = 0 to pn_length - 1 do
+      Cstruct.set_uint8
+        header
+        (pn_offset + i)
+        (Cstruct.get_uint8 header (pn_offset + i)
+        lxor Cstruct.get_uint8 mask (i + 1))
+    done;
+    header
+
+  let encrypt_packet t ~packet_number ~header data =
+    let sealed_payload = t.encrypt_payload ~packet_number ~header data in
+    let offset =
+      (* From RFC<QUIC-TLS-RFC>§5.4.2:
+       *  This results in needing at least 3 bytes of frames in the unprotected
+       *  payload if the packet number is encoded on a single byte, or 2 bytes
+       *  of frames for a 2-byte packet number encoding. *)
+      4 - packet_number_length header
+    in
+    let sample = Cstruct.sub sealed_payload offset 16 in
+    let header = t.encrypt_header ~sample header in
+    Cstruct.append header sealed_payload
+
+  type ret =
+    { packet_number : int64
+    ; header : Cstruct.t
+    ; plaintext : Cstruct.t
+    }
+
+  (* Ciphertext includes header + payload *)
+  let decrypt_packet t ~largest_pn ciphertext =
+    let conn_id_len = t.conn_id_len in
+    let offset = sample_offset ~conn_id_len ciphertext in
+    let sample = Cstruct.sub ciphertext offset 16 in
+    let header = t.decrypt_header ~sample ciphertext in
+    let pn_length = packet_number_length header in
+    let off = offset - 4 in
     let truncated_pn =
       match pn_length with
       | 4 ->
@@ -366,10 +373,17 @@ module AEAD = struct
     let pn =
       decode_packet_number ~largest_pn ~pn_nbits:(8 * pn_length) ~truncated_pn
     in
+    let header, ciphertext =
+      Cstruct.split ciphertext ~start:0 (offset - 4 + pn_length)
+    in
     let plaintext_payload =
       t.decrypt_payload ~packet_number:pn ~header ciphertext
     in
-    header, plaintext_payload
+    match plaintext_payload with
+    | Some plaintext ->
+      Some { packet_number = pn; header; plaintext }
+    | None ->
+      None
 end
 
 let get_key_and_iv ~key_length secret =
@@ -430,21 +444,23 @@ module InitialAEAD = struct
   module AES_GCM = Mirage_crypto.Cipher_block.AES.GCM
   module AES_ECB = Mirage_crypto.Cipher_block.AES.ECB
 
-  let make ~mode dest_cid =
+  let make ?(conn_id_len = Packet.CID.length) ~mode dest_cid =
     let secret = get_secret ~mode dest_cid in
     let key, iv = get_key_and_iv secret in
     let hp_key = get_header_protection_key secret in
-    let encrypt_or_decrypt f ~sample header =
+    let encrypt_or_decrypt_header f ~sample header =
       (* From RFC<QUIC-TLS-RFC>§5.4.3:
        *   mask = AES-ECB(hp_key, sample) *)
       let mask = AES_ECB.encrypt ~key:(AES_ECB.of_secret hp_key) sample in
       f ~mask header
     in
     let key = AES_GCM.of_secret key in
-    { AEAD.encrypt_payload = AEAD.encrypt_payload (module AES_GCM) ~key ~iv
-    ; AEAD.decrypt_payload = AEAD.decrypt_payload (module AES_GCM) ~key ~iv
-    ; encrypt_header = encrypt_or_decrypt AEAD.encrypt_header
-    ; decrypt_header = encrypt_or_decrypt AEAD.decrypt_header
+    { AEAD.conn_id_len
+    ; encrypt_payload = AEAD.encrypt_payload (module AES_GCM) ~key ~iv
+    ; decrypt_payload = AEAD.decrypt_payload (module AES_GCM) ~key ~iv
+    ; encrypt_header = encrypt_or_decrypt_header AEAD.encrypt_header
+    ; decrypt_header =
+        encrypt_or_decrypt_header (AEAD.decrypt_header ~conn_id_len)
     }
 end
 
@@ -495,7 +511,7 @@ module ChaCha20 = struct
 
   module Chacha20 = Mirage_crypto.Chacha20
 
-  let make ~secret =
+  let make ?(conn_id_len = Packet.CID.length) secret =
     let key, iv = get_key_and_iv secret in
     let hp_key = get_header_protection_key secret in
     let encrypt_or_decrypt f ~sample header =
@@ -520,10 +536,11 @@ module ChaCha20 = struct
       f ~mask header
     in
     let key = Chacha20.of_secret key in
-    { AEAD.encrypt_payload = AEAD.encrypt_payload (module Chacha20) ~key ~iv
-    ; AEAD.decrypt_payload = AEAD.decrypt_payload (module Chacha20) ~key ~iv
+    { AEAD.conn_id_len
+    ; encrypt_payload = AEAD.encrypt_payload (module Chacha20) ~key ~iv
+    ; decrypt_payload = AEAD.decrypt_payload (module Chacha20) ~key ~iv
     ; encrypt_header = encrypt_or_decrypt AEAD.encrypt_header
-    ; decrypt_header = encrypt_or_decrypt AEAD.decrypt_header
+    ; decrypt_header = encrypt_or_decrypt (AEAD.decrypt_header ~conn_id_len)
     }
 end
 

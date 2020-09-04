@@ -280,50 +280,83 @@ module Packet = struct
     end
   end
 
-  let parse_long_header_packet_payload =
-    variable_length_integer >>= take_bigstring
+  module Payload = struct
+    let version_negotiation ~source_cid ~dest_cid =
+      (* From RFC<QUIC-RFC>§17.2:
+       *   The Version Negotiation packet does not include the Packet Number
+       *   and Length fields present in other packets that use the long header
+       *   form. Consequently, a Version Negotiation packet consumes an entire
+       *   UDP datagram.
+       *
+       *   A server MUST NOT send more than one Version Negotiation packet in
+       *   response to a single UDP datagram. *)
+      available >>= fun remaining_size ->
+      lift
+        (fun versions ->
+          Packet.VersionNegotiation
+            { source_cid
+            ; dest_cid
+            ; versions = List.map Packet.Version.parse versions
+            })
+        (count remaining_size BE.any_int32)
 
-  let parse_version_negotiation_packet =
-    (* From RFC<QUIC-RFC>§17.2:
-     *   The Version Negotiation packet does not include the Packet Number
-     *   and Length fields present in other packets that use the long header
-     *   form. Consequently, a Version Negotiation packet consumes an entire
-     *   UDP datagram.
-     *
-     *   A server MUST NOT send more than one Version Negotiation packet in
-     *   response to a single UDP datagram. *)
-    available >>= fun remaining_size ->
-    count remaining_size (lift Packet.Version.parse BE.any_int32)
+    (*
+     *  Retry Packet {
+     *    Header Form (1) = 1,
+     *    Fixed Bit (1) = 1,
+     *    Long Packet Type (2) = 3,
+     *    Unused (4),
+     *    Version (32),
+     *    Destination Connection ID Length (8),
+     *    Destination Connection ID (0..160),
+     *    Source Connection ID Length (8),
+     *    Source Connection ID (0..160),
+     *    Retry Token (..),
+     *    Retry Integrity Tag (128),
+     *  }
+     *)
+    let retry ~version ~source_cid ~dest_cid =
+      (* From RFC<QUIC-RFC>§12.2:
+       *   Retry packets (Section 17.2.5), Version Negotiation packets (Section
+       *   17.2.1), and packets with a short header (Section 17.3) do not contain a
+       *   Length field and so cannot be followed by other packets in the same UDP
+       *   datagram. *)
+      available >>= fun remaining_size ->
+      (* take until the last 128 bits, reserved for the integrity tag *)
+      take (remaining_size - 16) >>= fun retry_token ->
+      pos >>= fun position ->
+      (* XXX(anmonteiro): terrible hack, do better here *)
+      Unsafe.take 0 (fun bs ~off:_ ~len:_ ->
+          Bigstringaf.sub bs ~off:0 ~len:position)
+      >>= fun pseudo ->
+      lift
+        (fun tag ->
+          Packet.Retry
+            { version; source_cid; dest_cid; token = retry_token; pseudo; tag })
+        (take 16)
 
-  (*
-   *  Retry Packet {
-   *    Header Form (1) = 1,
-   *    Fixed Bit (1) = 1,
-   *    Long Packet Type (2) = 3,
-   *    Unused (4),
-   *    Version (32),
-   *    Destination Connection ID Length (8),
-   *    Destination Connection ID (0..160),
-   *    Source Connection ID Length (8),
-   *    Source Connection ID (0..160),
-   *    Retry Token (..),
-   *    Retry Integrity Tag (128),
-   *  }
-   *)
-  let parse_retry_packet =
-    (* From RFC<QUIC-RFC>§12.2:
-     *   Retry packets (Section 17.2.5), Version Negotiation packets (Section
-     *   17.2.1), and packets with a short header (Section 17.3) do not contain a
-     *   Length field and so cannot be followed by other packets in the same UDP
-     *   datagram. *)
-    available >>= fun remaining_size ->
-    (* take until the last 128 bits, reserved for the integrity tag *)
-    take (remaining_size - 16) >>= fun retry_token ->
-    pos >>= fun position ->
-    (* XXX(anmonteiro): terrible hack, do better here *)
-    Unsafe.take 0 (fun bs ~off:_ ~len:_ ->
-        Bigstringaf.sub bs ~off:0 ~len:position)
-    >>= fun pseudo -> lift (fun tag -> retry_token, pseudo, tag) (take 16)
+    let payload ~payload_length ~header ~packet_number plaintext =
+      let plaintext = Cstruct.to_bigarray plaintext in
+      assert (payload_length = Bigstringaf.length plaintext);
+      advance payload_length
+      *> return (Packet.Frames { header; payload = plaintext; packet_number })
+
+    let long_header ~header ~packet_number plaintext =
+      let payload_length = Packet.Header.payload_length header in
+      payload ~payload_length ~header ~packet_number plaintext
+
+    let short_header ~header ~packet_number plaintext =
+      available >>= fun payload_length ->
+      payload ~payload_length ~header ~packet_number plaintext
+  end
+
+  let unprotected =
+    Header.Long.parse >>= fun (version, source_cid, dest_cid) ->
+    match version with
+    | Negotiation ->
+      Payload.version_negotiation ~source_cid ~dest_cid
+    | Number version ->
+      Payload.retry ~version ~source_cid ~dest_cid
 
   (*
    *  Long Header Packet {
@@ -338,55 +371,39 @@ module Packet = struct
    *    Source Connection ID (0..160),
    *  }
    *)
-  let parse_long_header_packet first_byte =
-    Header.Long.parse >>= fun (version, src_cid, dst_cid) ->
+  let protected_long_header ~header_type ~packet_number plaintext =
+    Header.Long.parse >>= fun (version, source_cid, dest_cid) ->
     match version with
     | Negotiation ->
-      lift
-        (fun versions ->
-          Packet.VersionNegotiation
-            { source_cid = src_cid; dest_cid = dst_cid; versions })
-        parse_version_negotiation_packet
-    | Number _ ->
-      (match Packet.Header.parse_type first_byte with
-      | Initial ->
-        variable_length_integer >>= fun token_length ->
-        take token_length >>= fun token ->
-        let header =
-          Packet.Header.Initial
-            { version; source_cid = src_cid; dest_cid = dst_cid; token }
-        in
-        lift
-          (fun bs -> Packet.Crypt { header; payload = bs })
-          parse_long_header_packet_payload
-      | Zero_RTT ->
-        let header =
-          Packet.Header.Zero_RTT
-            { version; source_cid = src_cid; dest_cid = dst_cid }
-        in
-        lift
-          (fun bs -> Packet.Crypt { header; payload = bs })
-          parse_long_header_packet_payload
-      | Handshake ->
-        let header =
-          Packet.Header.Zero_RTT
-            { version; source_cid = src_cid; dest_cid = dst_cid }
-        in
-        lift
-          (fun bs -> Packet.Crypt { header; payload = bs })
-          parse_long_header_packet_payload
-      | Retry ->
-        lift
-          (fun (retry_token, pseudo, tag) ->
-            Packet.Retry
-              { version
-              ; source_cid = src_cid
-              ; dest_cid = dst_cid
-              ; token = retry_token
-              ; pseudo
-              ; tag
-              })
-          parse_retry_packet)
+      assert false
+    | Number version ->
+      let header =
+        match header_type with
+        | Packet.Header.Type.Initial ->
+          variable_length_integer >>= fun token_length ->
+          lift2
+            (fun token payload_length ->
+              Packet.Header.Initial
+                { version; source_cid; dest_cid; token; payload_length })
+            (take token_length)
+            variable_length_integer
+        | Zero_RTT ->
+          lift
+            (fun payload_length ->
+              Packet.Header.Zero_RTT
+                { version; source_cid; dest_cid; payload_length })
+            variable_length_integer
+        | Handshake ->
+          lift
+            (fun payload_length ->
+              Packet.Header.Zero_RTT
+                { version; source_cid; dest_cid; payload_length })
+            variable_length_integer
+        | Retry ->
+          failwith "retry is unprotected"
+      in
+      header >>= fun header ->
+      Payload.long_header ~header ~packet_number plaintext
 
   (*
    *  Short Header Packet {
@@ -401,35 +418,188 @@ module Packet = struct
    *    Packet Payload (..),
    *  }
    *)
-  let parse_short_header_packet =
+  let short_header ~packet_number plaintext =
     Header.Short.parse >>= fun dest_cid ->
     let header =
       Packet.Header.Short { dest_cid = Packet.CID.{ id = dest_cid; length } }
     in
-    lift
-      (fun payload -> Packet.Crypt { header; payload })
-      (available >>= take_bigstring)
+    Payload.short_header ~header ~packet_number plaintext
 
-  let parser =
-    any_uint8 >>= fun first_byte ->
-    if not (Bits.test first_byte 6) then
-      (* From RFC<QUIC-RFC>§17.2:
-       *   Fixed Bit: The next bit (0x40) of byte 0 is set to 1. Packets
-       *   containing a zero value for this bit are not valid packets in
-       *   this version and MUST be discarded. *)
-      failwith "TODO: error"
-    else
-      match Bits.test first_byte 7 with
+  let is_protected bs ~off =
+    let first_byte = Char.code (Bigstringaf.unsafe_get bs off) in
+    let version = Bigstringaf.unsafe_get_int32_be bs (off + 1) in
+    (* From RFC<QUIC-TLS-RFC>§5.3:
+     *   All QUIC packets other than Version Negotiation and Retry packets are
+     *   protected with an AEAD algorithm [AEAD]. *)
+    not
+      (Packet.Header.is_long first_byte
+      &&
+      match Packet.Version.parse version with
+      | Negotiation ->
+        true
+      | Number _ ->
+        (match Packet.Header.parse_type first_byte with
+        | Retry ->
+          true
+        | _ ->
+          false))
+
+  type protection_type =
+    | Unprotected
+    | Decrypted of Crypto.AEAD.ret option
+
+  let parser
+      ~(decrypt :
+         Cstruct.buffer -> off:int -> len:int -> Crypto.AEAD.ret option)
+    =
+    (* XXX(anmonteiro): it's important to call `peek_char_fail` before calling
+     * `available` because Angstrom.Unbuffered starts the parser with
+     * `Bigstringaf.empty` before starting to get input. If `available` is
+     * called right away, it'll be 0 and fail. *)
+    peek_char_fail >>= fun first_byte ->
+    let first_byte = Char.code first_byte in
+    available >>= fun avail ->
+    Unsafe.peek avail (fun bs ~off ~len ->
+        (* let first_byte = Char.code (Bigstringaf.unsafe_get bs off) in *)
+        if not (Bits.test first_byte 6) then
+          (* From RFC<QUIC-RFC>§17.2:
+           *   Fixed Bit: The next bit (0x40) of byte 0 is set to 1. Packets
+           *   containing a zero value for this bit are not valid packets in
+           *   this version and MUST be discarded. *)
+          failwith "TODO: error"
+        else
+          let has_header_protection = is_protected bs ~off in
+          if has_header_protection then
+            Decrypted (decrypt bs ~off ~len)
+          else
+            Unprotected)
+    >>= function
+    | Decrypted None ->
+      failwith "failed to decrypt, fix me"
+    | Decrypted (Some { Crypto.AEAD.packet_number; plaintext; _ }) ->
+      any_uint8 >>= fun first_byte ->
+      (match Packet.Header.is_long first_byte with
       | true ->
-        (* From RFC<QUIC-RFC>§17.2:
-         *   Header Form: The most significant bit (0x80) of byte 0 (the
-         *   first byte) is set to 1 for long headers. *)
-        parse_long_header_packet first_byte
+        protected_long_header
+          ~header_type:(Packet.Header.parse_type first_byte)
+          ~packet_number
+          plaintext
       | false ->
-        (* From RFC<QUIC-RFC>§17.3:
-         *   Header Form: The most significant bit (0x80) of byte 0 is set
-         *   to 0 for the short header. *)
-        parse_short_header_packet
+        short_header ~packet_number plaintext)
+    | Unprotected ->
+      (* From RFC<QUIC-TLS-RFC>§5.3:
+       *   All QUIC packets other than Version Negotiation and Retry packets
+       *   are protected with an AEAD algorithm [AEAD].
+       *
+       * NOTE(anmonteiro): Can only be one of the above: Negotiation or Retry.
+       *)
+      advance 1 *> unprotected
 end
 
-(* TODO: parse packet number?! *)
+module Reader = struct
+  module AU = Angstrom.Unbuffered
+
+  type error = [ `Parse of string list * string ]
+
+  type 'error parse_state =
+    | Done
+    | Fail of 'error
+    | Partial of
+        (Bigstringaf.t
+         -> off:int
+         -> len:int
+         -> AU.more
+         -> (unit, 'error) result AU.state)
+
+  type 'error t =
+    { parser : (unit, 'error) result Angstrom.t
+    ; mutable parse_state : 'error parse_state
+          (* The state of the parse for the current request *)
+    ; mutable closed : bool
+          (* Whether the input source has left the building, indicating that no
+           * further input will be received. *)
+    ; mutable wakeup : Optional_thunk.t
+    }
+
+  type server = error t
+
+  let create parser =
+    { parser; parse_state = Done; closed = false; wakeup = Optional_thunk.none }
+
+  let is_closed t = t.closed
+
+  let on_wakeup t k =
+    if is_closed t then
+      failwith "on_wakeup on closed reader"
+    else if Optional_thunk.is_some t.wakeup then
+      failwith "on_wakeup: only one callback can be registered at a time"
+    else
+      t.wakeup <- Optional_thunk.some k
+
+  let wakeup t =
+    let f = t.wakeup in
+    t.wakeup <- Optional_thunk.none;
+    Optional_thunk.call_if_some f
+
+  let packets ~decrypt handler =
+    let parser = skip_many (Packet.parser ~decrypt <* commit >>| handler) in
+    create (parser >>| Stdlib.Result.ok)
+
+  let transition t state =
+    match state with
+    | AU.Done (consumed, Ok ()) ->
+      t.parse_state <- Done;
+      consumed
+    | AU.Done (consumed, Error error) ->
+      t.parse_state <- Fail error;
+      consumed
+    | AU.Fail (consumed, marks, msg) ->
+      t.parse_state <- Fail (`Parse (marks, msg));
+      consumed
+    | AU.Partial { committed; continue } ->
+      t.parse_state <- Partial continue;
+      committed
+
+  let start t state =
+    match state with
+    | AU.Done _ ->
+      failwith "Quic.Parse.unable to start parser"
+    | AU.Fail (0, marks, msg) ->
+      t.parse_state <- Fail (`Parse (marks, msg))
+    | AU.Partial { committed = 0; continue } ->
+      t.parse_state <- Partial continue
+    | _ ->
+      assert false
+
+  let rec read_with_more t bs ~off ~len more =
+    let initial = match t.parse_state with Done -> true | _ -> false in
+    let consumed =
+      match t.parse_state with
+      | Fail _ ->
+        0
+      | Done ->
+        start t (AU.parse t.parser);
+        read_with_more t bs ~off ~len more
+      | Partial continue ->
+        transition t (continue bs more ~off ~len)
+    in
+    (* Special case where the parser just started and was fed a zero-length
+     * bigstring. Avoid putting them parser in an error state in this scenario.
+     * If we were already in a `Partial` state, return the error. *)
+    if initial && len = 0 then t.parse_state <- Done;
+    (match more with Complete -> t.closed <- true | Incomplete -> ());
+    consumed
+
+  let force_close t = t.closed <- true
+
+  let next t =
+    match t.parse_state with
+    | Fail failure ->
+      `Error failure
+    | _ when t.closed ->
+      `Close
+    | Done ->
+      `Start
+    | Partial _ ->
+      `Read
+end
