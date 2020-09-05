@@ -41,7 +41,12 @@ module Hkdf = struct
     key
 end
 
-let[@inline] is_long header = Packet.Header.is_long (Cstruct.get_uint8 header 0)
+let[@inline] is_long header =
+  match Packet.Header.Type.parse (Cstruct.get_uint8 header 0) with
+  | Long ->
+    true
+  | Short ->
+    false
 
 let[@inline] packet_number_length header =
   (* From RFC<QUIC-RFC>§17.2:
@@ -258,7 +263,7 @@ module AEAD = struct
     let dest_cid_len = Cstruct.get_uint8 header 5 in
     let src_cid_len = Cstruct.get_uint8 header (6 + dest_cid_len) in
     let token_length =
-      match Packet.Header.parse_type (Cstruct.get_uint8 header 0) with
+      match Packet.parse_type (Cstruct.get_uint8 header 0) with
       | Initial ->
         let varint_len, token_len =
           variable_length_integer header ~off:(7 + src_cid_len + dest_cid_len)
@@ -344,6 +349,7 @@ module AEAD = struct
     { packet_number : int64
     ; header : Cstruct.t
     ; plaintext : Cstruct.t
+    ; pn_length : int
     }
 
   (* Ciphertext includes header + payload *)
@@ -381,7 +387,7 @@ module AEAD = struct
     in
     match plaintext_payload with
     | Some plaintext ->
-      Some { packet_number = pn; header; plaintext }
+      Some { pn_length; packet_number = pn; header; plaintext }
     | None ->
       None
 end

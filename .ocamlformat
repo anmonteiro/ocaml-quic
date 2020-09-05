@@ -3,6 +3,7 @@ break-cases = nested
 break-fun-decl = smart
 cases-exp-indent = 2
 if-then-else = fit-or-vertical
+nested-match = align
 parens-tuple = multi-line-only
 parens-tuple-patterns = multi-line-only
 parens-ite = false

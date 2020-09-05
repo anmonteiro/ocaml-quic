@@ -59,101 +59,88 @@ module Version = struct
   let serialize = function Negotiation -> Int32.zero | Number n -> n
 end
 
+module Type = struct
+  type t =
+    | Initial
+    | Zero_RTT
+    | Handshake
+    | Retry
+
+  let parse = function
+    | 0x0 ->
+      Initial
+    | 0x1 ->
+      Zero_RTT
+    | 0x2 ->
+      Handshake
+    | 0x3 ->
+      Retry
+    | _ ->
+      assert false
+
+  let serialize = function
+    | Initial ->
+      0x0
+    | Zero_RTT ->
+      0x1
+    | Handshake ->
+      0x2
+    | Retry ->
+      0x3
+end
+
 module Header = struct
-  module Type = struct
-    type t =
-      | Initial
-      | Zero_RTT
-      | Handshake
-      | Retry
-
-    let parse = function
-      | 0x0 ->
-        Initial
-      | 0x1 ->
-        Zero_RTT
-      | 0x2 ->
-        Handshake
-      | 0x3 ->
-        Retry
-      | _ ->
-        assert false
-
-    let serialize = function
-      | Initial ->
-        0x0
-      | Zero_RTT ->
-        0x1
-      | Handshake ->
-        0x2
-      | Retry ->
-        0x3
-  end
-
-  let[@inline] is_long first_byte =
-    (* From RFC<QUIC-RFC>§17.2:
-     *   Header Form: The most significant bit (0x80) of byte 0 (the first
-     *   byte) is set to 1 for long headers. *)
-    Bits.test first_byte 7
-
-  let parse_type first_byte =
-    (* From RFC<QUIC-RFC>§17.2:
-     *   Long Packet Type: The next two bits (those with a mask of 0x30) of
-     *   byte 0 contain a packet type. Packet types are listed in Table 5. *)
-    let masked = first_byte land 0b00110000 in
-    let type_ = masked lsr 4 in
-    Type.parse type_
-
   type t =
     | Initial of
         { version : int32
         ; source_cid : CID.t
         ; dest_cid : CID.t
-        ; payload_length : int
         ; token : string
         }
-    | Zero_RTT of
+    | Long of
         { version : int32
         ; source_cid : CID.t
-        ; payload_length : int
         ; dest_cid : CID.t
-        }
-    | Handshake of
-        { version : int32
-        ; source_cid : CID.t
-        ; payload_length : int
-        ; dest_cid : CID.t
+        ; packet_type : Type.t
         }
     | Short of { dest_cid : CID.t }
 
-  let payload_length = function
-    | Initial { payload_length; _ }
-    | Zero_RTT { payload_length; _ }
-    | Handshake { payload_length; _ } ->
-      payload_length
-    | Short _ ->
-      failwith "Packet.Header.payload_length called on short header"
+  module Type = struct
+    type t =
+      | Long
+      | Short
+
+    let parse first_byte =
+      (* From RFC<QUIC-RFC>§17.2:
+       *   Header Form: The most significant bit (0x80) of byte 0 (the first
+       *   byte) is set to 1 for long headers. *)
+      if Bits.test first_byte 7 then Long else Short
+  end
 end
 
-type _ t =
-  | VersionNegotiation :
+let parse_type first_byte =
+  (* From RFC<QUIC-RFC>§17.2:
+   *   Long Packet Type: The next two bits (those with a mask of 0x30) of
+   *   byte 0 contain a packet type. Packet types are listed in Table 5. *)
+  let masked = first_byte land 0b00110000 in
+  let type_ = masked lsr 4 in
+  Type.parse type_
+
+type t =
+  | VersionNegotiation of
       { source_cid : CID.t
       ; dest_cid : CID.t
-      ; versions : Version.t list
+      ; versions : int32 list
       }
-      -> [ `decrypted ] t
-  | Frames :
+  | Frames of
       { header : Header.t
       ; payload : Bigstringaf.t
+      ; payload_length : int
       ; packet_number : int64
       }
-      -> [ `decrypted ] t
-  | Retry :
-      { version : int32
-      ; source_cid : CID.t
-      ; dest_cid : CID.t
+  | Retry of
+      { header : Header.t
       ; token : string
       ; pseudo : Bigstringaf.t
       ; tag : string
       }
-      -> [ `decrypted ] t

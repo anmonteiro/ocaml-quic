@@ -30,6 +30,7 @@
  *  POSSIBILITY OF SUCH DAMAGE.
  *---------------------------------------------------------------------------*)
 
+module Result = Stdlib.Result
 open Angstrom
 
 (* XXX: technically could be a 62-bit int. *)
@@ -197,7 +198,7 @@ module Frame = struct
         Frame.Connection_close_app { error_code; reason_phrase })
       (take reason_phrase_length)
 
-  let parser =
+  let frame =
     (* From RFC<QUIC-RFC>§12.4:
      *   The Frame Type field uses a variable length integer encoding (see
      *   Section 16) with one exception. To ensure simple and efficient
@@ -251,6 +252,8 @@ module Frame = struct
       return Frame.Handshake_done
     | Unknown x ->
       return (Frame.Unknown x)
+
+  let parser handler = skip_many (frame <* commit >>| handler)
 end
 
 module Packet = struct
@@ -293,11 +296,8 @@ module Packet = struct
       available >>= fun remaining_size ->
       lift
         (fun versions ->
-          Packet.VersionNegotiation
-            { source_cid
-            ; dest_cid
-            ; versions = List.map Packet.Version.parse versions
-            })
+          (* TODO: do we need to validate that version is not 0? *)
+          Packet.VersionNegotiation { source_cid; dest_cid; versions })
         (count remaining_size BE.any_int32)
 
     (*
@@ -332,22 +332,32 @@ module Packet = struct
       lift
         (fun tag ->
           Packet.Retry
-            { version; source_cid; dest_cid; token = retry_token; pseudo; tag })
+            { header =
+                Long { version; source_cid; dest_cid; packet_type = Retry }
+            ; token = retry_token
+            ; pseudo
+            ; tag
+            })
         (take 16)
 
     let payload ~payload_length ~header ~packet_number plaintext =
       let plaintext = Cstruct.to_bigarray plaintext in
-      assert (payload_length = Bigstringaf.length plaintext);
-      advance payload_length
-      *> return (Packet.Frames { header; payload = plaintext; packet_number })
+      assert (payload_length >= Bigstringaf.length plaintext);
+      advance payload_length >>| fun () ->
+      Packet.Frames
+        { header; payload_length; payload = plaintext; packet_number }
 
-    let long_header ~header ~packet_number plaintext =
-      let payload_length = Packet.Header.payload_length header in
-      payload ~payload_length ~header ~packet_number plaintext
-
-    let short_header ~header ~packet_number plaintext =
-      available >>= fun payload_length ->
-      payload ~payload_length ~header ~packet_number plaintext
+    let parser ~pn_length ~header ~packet_number ~payload_length plaintext =
+      match header with
+      | Packet.Header.Short _ ->
+        payload ~payload_length ~header ~packet_number plaintext
+      | Initial _ | Long _ ->
+        (* From RFC<QUIC-RFC>§17.2:
+         *   Length: The length of the remainder of the packet (that is, the
+         *   Packet Number and Payload fields) in bytes, encoded as a
+         *   variable-length integer (Section 16). *)
+        let payload_length = payload_length - pn_length in
+        payload ~payload_length ~header ~packet_number plaintext
   end
 
   let unprotected =
@@ -371,39 +381,29 @@ module Packet = struct
    *    Source Connection ID (0..160),
    *  }
    *)
-  let protected_long_header ~header_type ~packet_number plaintext =
+  let protected_long_header ~packet_type =
     Header.Long.parse >>= fun (version, source_cid, dest_cid) ->
     match version with
     | Negotiation ->
       assert false
     | Number version ->
-      let header =
-        match header_type with
-        | Packet.Header.Type.Initial ->
-          variable_length_integer >>= fun token_length ->
-          lift2
-            (fun token payload_length ->
-              Packet.Header.Initial
-                { version; source_cid; dest_cid; token; payload_length })
-            (take token_length)
-            variable_length_integer
-        | Zero_RTT ->
-          lift
-            (fun payload_length ->
-              Packet.Header.Zero_RTT
-                { version; source_cid; dest_cid; payload_length })
-            variable_length_integer
-        | Handshake ->
-          lift
-            (fun payload_length ->
-              Packet.Header.Zero_RTT
-                { version; source_cid; dest_cid; payload_length })
-            variable_length_integer
-        | Retry ->
-          failwith "retry is unprotected"
-      in
-      header >>= fun header ->
-      Payload.long_header ~header ~packet_number plaintext
+      match packet_type with
+      | Packet.Type.Initial ->
+        variable_length_integer >>= fun token_length ->
+        lift2
+          (fun token payload_length ->
+            ( Packet.Header.Initial { version; source_cid; dest_cid; token }
+            , payload_length ))
+          (take token_length)
+          variable_length_integer
+      | Zero_RTT | Handshake ->
+        lift
+          (fun payload_length ->
+            ( Packet.Header.Long { version; source_cid; dest_cid; packet_type }
+            , payload_length ))
+          variable_length_integer
+      | Retry ->
+        failwith "retry is unprotected"
 
   (*
    *  Short Header Packet {
@@ -418,12 +418,20 @@ module Packet = struct
    *    Packet Payload (..),
    *  }
    *)
-  let short_header ~packet_number plaintext =
-    Header.Short.parse >>= fun dest_cid ->
-    let header =
-      Packet.Header.Short { dest_cid = Packet.CID.{ id = dest_cid; length } }
-    in
-    Payload.short_header ~header ~packet_number plaintext
+  let short_header =
+    lift
+      (fun dest_cid ->
+        Packet.Header.Short { dest_cid = Packet.CID.{ id = dest_cid; length } })
+      Header.Short.parse
+
+  let protected_header =
+    any_uint8 >>= fun first_byte ->
+    match Packet.Header.Type.parse first_byte with
+    | Packet.Header.Type.Long ->
+      protected_long_header ~packet_type:(Packet.parse_type first_byte)
+    | Short ->
+      short_header >>= fun hdr ->
+      available >>| fun avail -> hdr, avail
 
   let is_protected bs ~off =
     let first_byte = Char.code (Bigstringaf.unsafe_get bs off) in
@@ -431,26 +439,31 @@ module Packet = struct
     (* From RFC<QUIC-TLS-RFC>§5.3:
      *   All QUIC packets other than Version Negotiation and Retry packets are
      *   protected with an AEAD algorithm [AEAD]. *)
-    not
-      (Packet.Header.is_long first_byte
-      &&
+    match Packet.Header.Type.parse first_byte with
+    | Short ->
+      true
+    | Long ->
       match Packet.Version.parse version with
       | Negotiation ->
-        true
+        false
       | Number _ ->
-        (match Packet.Header.parse_type first_byte with
-        | Retry ->
-          true
-        | _ ->
-          false))
+        match Packet.parse_type first_byte with Retry -> false | _ -> true
 
   type protection_type =
     | Unprotected
-    | Decrypted of Crypto.AEAD.ret option
+    | Decrypted of
+        { header : Packet.Header.t
+        ; payload_length : int
+        ; decrypted : Crypto.AEAD.ret option
+        }
 
   let parser
       ~(decrypt :
-         Cstruct.buffer -> off:int -> len:int -> Crypto.AEAD.ret option)
+         header:Packet.Header.t
+         -> Cstruct.buffer
+         -> off:int
+         -> len:int
+         -> Crypto.AEAD.ret option)
     =
     (* XXX(anmonteiro): it's important to call `peek_char_fail` before calling
      * `available` because Angstrom.Unbuffered starts the parser with
@@ -470,22 +483,36 @@ module Packet = struct
         else
           let has_header_protection = is_protected bs ~off in
           if has_header_protection then
-            Decrypted (decrypt bs ~off ~len)
+            let header, payload_length =
+              Result.get_ok
+                (Angstrom.parse_bigstring
+                   ~consume:Prefix
+                   protected_header
+                   (Bigstringaf.sub bs ~off ~len))
+            in
+            Decrypted
+              { header
+              ; payload_length
+              ; decrypted = decrypt ~header bs ~off ~len
+              }
           else
             Unprotected)
     >>= function
-    | Decrypted None ->
+    | Decrypted { decrypted = None; _ } ->
       failwith "failed to decrypt, fix me"
-    | Decrypted (Some { Crypto.AEAD.packet_number; plaintext; _ }) ->
-      any_uint8 >>= fun first_byte ->
-      (match Packet.Header.is_long first_byte with
-      | true ->
-        protected_long_header
-          ~header_type:(Packet.Header.parse_type first_byte)
-          ~packet_number
-          plaintext
-      | false ->
-        short_header ~packet_number plaintext)
+    | Decrypted
+        { header
+        ; payload_length
+        ; decrypted =
+            Some
+              { Crypto.AEAD.packet_number
+              ; pn_length
+              ; plaintext
+              ; header = header_cs
+              }
+        } ->
+      advance (Cstruct.len header_cs) >>= fun () ->
+      Payload.parser ~pn_length ~header ~packet_number ~payload_length plaintext
     | Unprotected ->
       (* From RFC<QUIC-TLS-RFC>§5.3:
        *   All QUIC packets other than Version Negotiation and Retry packets
@@ -543,7 +570,7 @@ module Reader = struct
 
   let packets ~decrypt handler =
     let parser = skip_many (Packet.parser ~decrypt <* commit >>| handler) in
-    create (parser >>| Stdlib.Result.ok)
+    create (parser >>| Result.ok)
 
   let transition t state =
     match state with
