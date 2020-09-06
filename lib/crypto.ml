@@ -60,6 +60,8 @@ module Hkdf = struct
     let lbl = Cstruct.concat [ len; label; context ] in
     lbl
 
+  (* TODO: this is called `derive_secret_no_hash` in ocaml-tls, we should use
+   * that. *)
   let expand_label ~hash ~prk ?length ?(ctx = Cstruct.empty) label =
     let length =
       match length with
@@ -153,9 +155,16 @@ let get_ku ~length secret =
   Hkdf.expand_label ~hash:`SHA256 ~prk:secret ~length "quic ku"
 
 module AEAD = struct
+  type 'k aead_state =
+    { cipher : 'k Tls.State.aead_cipher
+    ; key : 'k
+    }
+
+  type cipher_st = AEAD : 'k aead_state -> cipher_st
+
   type t =
     { conn_id_len : int
-    ; tag_len : int
+    ; cipher : cipher_st
     ; encrypt_payload :
         packet_number:int64 -> header:Cstruct.t -> Cstruct.t -> Cstruct.t
     ; decrypt_payload :
@@ -164,15 +173,11 @@ module AEAD = struct
     ; decrypt_header : sample:Cstruct.t -> Cstruct.t -> Cstruct.t
     }
 
-  let encrypt_payload
-      (type k)
-      (module Cipher : Mirage_crypto.AEAD with type key = k)
-      ~key
-      ~iv
-      ~packet_number
-      ~header
-      data
-    =
+  let tag_len t =
+    let (AEAD { cipher; _ }) = t.cipher in
+    Tls.Crypto.tag_len cipher
+
+  let encrypt_payload (AEAD { cipher; key }) ~iv ~packet_number ~header data =
     (* From RFC<QUIC-TLS-RFC>§5.3:
      *   The nonce, N, is formed by combining the packet protection IV with the
      *   packet number. The 62 bits of the reconstructed QUIC packet number in
@@ -180,7 +185,8 @@ module AEAD = struct
      *   The exclusive OR of the padded packet number and the IV forms the AEAD
      *   nonce. *)
     let nonce = Tls.Crypto.aead_nonce iv packet_number in
-    Cipher.authenticate_encrypt
+    Tls.Crypto.encrypt_aead
+      ~cipher
       ~key
       ~nonce
         (*
@@ -191,13 +197,7 @@ module AEAD = struct
       data
 
   let decrypt_payload
-      (type k)
-      (module Cipher : Mirage_crypto.AEAD with type key = k)
-      ~key
-      ~iv
-      ~packet_number
-      ~header
-      ciphertext
+      (AEAD { cipher; key }) ~iv ~packet_number ~header ciphertext
     =
     (* From RFC<QUIC-TLS-RFC>§5.3:
      *   The nonce, N, is formed by combining the packet protection IV with the
@@ -206,7 +206,8 @@ module AEAD = struct
      *   The exclusive OR of the padded packet number and the IV forms the AEAD
      *   nonce. *)
     let nonce = Tls.Crypto.aead_nonce iv packet_number in
-    Cipher.authenticate_decrypt
+    Tls.Crypto.decrypt_aead
+      ~cipher
       ~key
       ~nonce
         (*
@@ -436,6 +437,46 @@ module AEAD = struct
       Some { pn_length; packet_number = pn; header; plaintext }
     | None ->
       None
+
+  let get_key_and_iv secret = get_key_and_iv ~key_length:16 secret
+
+  let get_header_protection_key secret =
+    get_header_protection_key ~length:16 secret
+
+  module AES_ECB = Mirage_crypto.Cipher_block.AES.ECB
+
+  let get_cipher_st : type a. a Tls.State.aead_cipher -> Cstruct.t -> cipher_st =
+   fun cipher secret ->
+    match cipher with
+    | CCM (module CCM) ->
+      AEAD { cipher; key = CCM.of_secret ~maclen:16 secret }
+    | GCM (module GCM) ->
+      AEAD { cipher; key = GCM.of_secret secret }
+    | ChaCha20_Poly1305 _ ->
+      let cipher =
+        (module Mirage_crypto.Chacha20 : Mirage_crypto.AEAD
+          with type key = Mirage_crypto.Chacha20.key)
+      in
+      let key = Mirage_crypto.Chacha20.of_secret secret in
+      AEAD { cipher = ChaCha20_Poly1305 cipher; key }
+
+  let make ?(conn_id_len = CID.length) ~cipher secret =
+    let key, iv = get_key_and_iv secret in
+    let hp_key = get_header_protection_key secret in
+    let encrypt_or_decrypt_header f ~sample header =
+      (* From RFC<QUIC-TLS-RFC>§5.4.3:
+       *   mask = AES-ECB(hp_key, sample) *)
+      let mask = AES_ECB.encrypt ~key:(AES_ECB.of_secret hp_key) sample in
+      f ~mask header
+    in
+    let cipher = get_cipher_st cipher key in
+    { conn_id_len
+    ; cipher
+    ; encrypt_payload = encrypt_payload cipher ~iv
+    ; decrypt_payload = decrypt_payload cipher ~iv
+    ; encrypt_header = encrypt_or_decrypt_header encrypt_header
+    ; decrypt_header = encrypt_or_decrypt_header (decrypt_header ~conn_id_len)
+    }
 end
 
 module InitialAEAD = struct
@@ -475,33 +516,11 @@ module InitialAEAD = struct
         ~length:Mirage_crypto.Hash.SHA256.digest_size
         "server in"
 
-  let get_key_and_iv secret = get_key_and_iv ~key_length:16 secret
-
-  let get_header_protection_key secret =
-    get_header_protection_key ~length:16 secret
-
   module AES_GCM = Mirage_crypto.Cipher_block.AES.GCM
-  module AES_ECB = Mirage_crypto.Cipher_block.AES.ECB
 
   let make ?(conn_id_len = CID.length) ~mode dest_cid =
     let secret = get_secret ~mode dest_cid in
-    let key, iv = get_key_and_iv secret in
-    let hp_key = get_header_protection_key secret in
-    let encrypt_or_decrypt_header f ~sample header =
-      (* From RFC<QUIC-TLS-RFC>§5.4.3:
-       *   mask = AES-ECB(hp_key, sample) *)
-      let mask = AES_ECB.encrypt ~key:(AES_ECB.of_secret hp_key) sample in
-      f ~mask header
-    in
-    let key = AES_GCM.of_secret key in
-    { AEAD.conn_id_len
-    ; tag_len = AES_GCM.tag_size
-    ; encrypt_payload = AEAD.encrypt_payload (module AES_GCM) ~key ~iv
-    ; decrypt_payload = AEAD.decrypt_payload (module AES_GCM) ~key ~iv
-    ; encrypt_header = encrypt_or_decrypt_header AEAD.encrypt_header
-    ; decrypt_header =
-        encrypt_or_decrypt_header (AEAD.decrypt_header ~conn_id_len)
-    }
+    AEAD.make ~conn_id_len ~cipher:(GCM (module AES_GCM)) secret
 end
 
 module Retry = struct
@@ -575,17 +594,19 @@ module ChaCha20 = struct
       in
       f ~mask header
     in
-    let key = Chacha20.of_secret key in
+    let cipher = AEAD.get_cipher_st (ChaCha20_Poly1305 (module Chacha20)) key in
     { AEAD.conn_id_len
-    ; tag_len = Mirage_crypto.Poly1305.mac_size
-    ; encrypt_payload = AEAD.encrypt_payload (module Chacha20) ~key ~iv
-    ; decrypt_payload = AEAD.decrypt_payload (module Chacha20) ~key ~iv
+    ; cipher
+    ; encrypt_payload = AEAD.encrypt_payload cipher ~iv
+    ; decrypt_payload = AEAD.decrypt_payload cipher ~iv
     ; encrypt_header = encrypt_or_decrypt AEAD.encrypt_header
     ; decrypt_header = encrypt_or_decrypt (AEAD.decrypt_header ~conn_id_len)
     }
 end
 
 type encdec =
-  { mutable encrypter : AEAD.t
-  ; mutable decrypter : AEAD.t
+  { encrypter : AEAD.t
+  ; (* decrypter might not always be available at the same time as the
+     * encrypter *)
+    decrypter : AEAD.t option
   }

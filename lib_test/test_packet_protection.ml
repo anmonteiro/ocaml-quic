@@ -5,6 +5,7 @@ let hex = Alcotest.of_pp Hex.pp
 let dest_cid = Hex.to_string (`Hex "8394c8f03e515708")
 
 module InitialAEAD = Quic.Crypto.InitialAEAD
+module AEAD = Quic.Crypto.AEAD
 
 module Keys = struct
   let test_initial_secret () =
@@ -22,7 +23,7 @@ module Keys = struct
       "client_initial_secret"
       (`Hex "0088119288f1d866733ceeed15ff9d50902cf82952eee27e9d4d4918ea371d87")
       (Hex.of_string (Cstruct.to_string client_secret));
-    let client_key, client_iv = InitialAEAD.get_key_and_iv client_secret in
+    let client_key, client_iv = AEAD.get_key_and_iv client_secret in
     Alcotest.check
       hex
       "client_key"
@@ -33,7 +34,7 @@ module Keys = struct
       "client_iv"
       (`Hex "6b26114b9cba2b63a9e8dd4f")
       (Hex.of_string (Cstruct.to_string client_iv));
-    let client_hp = InitialAEAD.get_header_protection_key client_secret in
+    let client_hp = AEAD.get_header_protection_key client_secret in
     Alcotest.check
       hex
       "client_hp"
@@ -47,7 +48,7 @@ module Keys = struct
       "client_initial_secret"
       (`Hex "006f881359244dd9ad1acf85f595bad67c13f9f5586f5e64e1acae1d9ea8f616")
       (Hex.of_string (Cstruct.to_string server_secret));
-    let server_key, server_iv = InitialAEAD.get_key_and_iv server_secret in
+    let server_key, server_iv = AEAD.get_key_and_iv server_secret in
     Alcotest.check
       hex
       "server_key"
@@ -58,7 +59,7 @@ module Keys = struct
       "server_iv"
       (`Hex "bab2b12a4c76016ace47856d")
       (Hex.of_string (Cstruct.to_string server_iv));
-    let server_hp = InitialAEAD.get_header_protection_key server_secret in
+    let server_hp = AEAD.get_header_protection_key server_secret in
     Alcotest.check
       hex
       "server_hp"
@@ -504,7 +505,7 @@ module InitialAEAD_encryption = struct
     let writer = Writer.create 0x1000 in
     Writer.write_frames_packet
       writer
-      ~encdec:{ Quic.Crypto.encrypter; decrypter = encrypter }
+      ~encdec:{ Quic.Crypto.encrypter; decrypter = Some encrypter }
       ~encryption_level:Initial
       ~header_info:(Writer.make_header_info { Quic.CID.id = "abc"; length = 3 })
       ~packet_number:1L

@@ -114,4 +114,18 @@ let find_exn k t = LMap.find k t.vals
 
 let find_current t = LMap.find t.current t.vals
 
-let create () = { current = Initial; vals = LMap.empty }
+let update_current f t =
+  let vals' = LMap.update t.current f t.vals in
+  t.vals <- vals'
+
+let create ?(current = Initial) () = { current; vals = LMap.empty }
+
+let next = function
+  | Initial ->
+    Handshake
+  | Handshake ->
+    Application_data
+  | Zero_RTT ->
+    failwith "Encryption_level.next: 0-RTT not supported"
+  | Application_data ->
+    failwith "Encryption_level.next: no level after Application Data"

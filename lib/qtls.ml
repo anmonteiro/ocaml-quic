@@ -69,13 +69,13 @@ let handle_packet hs buf = function
      of Application data MAY be sent as they are potentially useful as a traffic
      analysis countermeasure. *)
   | Packet.ALERT ->
-    Alert.handle buf >|= fun (err, out) -> hs, out, None, err
+    Alert.handle buf >|= fun (err, out) -> hs, out, err
   | Packet.APPLICATION_DATA ->
     (* Quic doesn't handle AppData from TLS *)
     fail (`Fatal `CannotHandleApplicationDataYet)
   | Packet.CHANGE_CIPHER_SPEC ->
     handle_change_cipher_spec hs.machina hs buf >|= fun (hs, items) ->
-    hs, items, None, `No_err
+    hs, items, `No_err
   | Packet.HANDSHAKE ->
     separate_handshakes (hs.hs_fragment <+> buf) >>= fun (hss, hs_fragment) ->
     let hs = { hs with hs_fragment } in
@@ -85,7 +85,7 @@ let handle_packet hs buf = function
         hs', items @ items')
       (hs, [])
       hss
-    >|= fun (hs, items) -> hs, items, None, `No_err
+    >|= fun (hs, items) -> hs, items, `No_err
   | Packet.HEARTBEAT ->
     fail (`Fatal `NoHeartbeat)
 
@@ -145,36 +145,27 @@ let handle_raw_record state buf =
   >>= fun () ->
   let ty = hdr.content_type in
   decrement_early_data hs ty buf >>= fun handshake ->
-  handle_packet handshake buf ty >|= fun (handshake, items, _data, err) ->
-  let encryptor, decryptor, encs =
-    List.fold_left
-      (fun (enc, dec, es) item ->
-        match item with
-        | `Change_enc enc' ->
-          Format.eprintf "change enc@.";
-          Some enc', dec, es
-        | `Change_dec dec' ->
-          Format.eprintf "change dec@.";
-          (match dec'.cipher_st with
-          | AEAD { cipher = GCM _; nonce; cipher_secret = _ } ->
-            Format.eprintf "heh: %a @." Hex.pp (Hex.of_cstruct nonce)
-          | _ ->
-            assert false);
-          enc, Some dec', es
-        | `Record r ->
-          enc, dec, es @ [ r ])
-      (None, None, [])
-      items
-  in
-  let state' = { state with handshake; encryptor; decryptor } in
-  state', encs, err
+  handle_packet handshake buf ty >|= fun (handshake, items, err) ->
+  { state with handshake }, items, err
+
+(* From RFC<QUIC-TLS-RFC>§5.3:
+ *   QUIC can use any of the ciphersuites defined in [TLS13] with the exception
+ *   of TLS_AES_128_CCM_8_SHA256. *)
+let ciphersuites =
+  [ `AES_128_GCM_SHA256
+  ; `AES_256_GCM_SHA384
+  ; `CHACHA20_POLY1305_SHA256
+  ; `AES_128_CCM_SHA256
+  ]
 
 let server ~cert ~priv_key =
   let server =
     Engine.server
       (Config.server
+         ~ciphers:ciphersuites
          ~certificates:(`Single (Qx509.private_of_pems ~cert ~priv_key))
          ~version:(`TLS_1_3, `TLS_1_3)
          ())
   in
   (Obj.magic server : t)
+(* TODO: transport parameters in EncryptedExtensions *)
