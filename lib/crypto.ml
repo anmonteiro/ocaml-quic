@@ -75,6 +75,24 @@ module Hkdf = struct
     key
 end
 
+module Kdf = struct
+  (* From RFC<QUIC-TLS-RFC>§5.1:
+   *   The keys used for packet protection are computed from the TLS secrets
+   *   using the KDF provided by TLS. In TLS 1.3, the HKDF-Expand-Label
+   *   function described in Section 7.1 of [TLS13] is used, using the hash
+   *   function from the negotiated cipher suite. *)
+  let get_key_and_iv ~hash ~kn ~ivn secret =
+    let key = Hkdf.expand_label ~hash ~prk:secret ~length:kn "quic key" in
+    let iv = Hkdf.expand_label ~hash ~prk:secret ~length:ivn "quic iv" in
+    key, iv
+
+  let get_header_protection_key ~hash ~kn secret =
+    Hkdf.expand_label ~hash ~prk:secret ~length:kn "quic hp"
+
+  let get_ku ~hash ~kn secret =
+    Hkdf.expand_label ~hash ~prk:secret ~length:kn "quic ku"
+end
+
 let[@inline] is_long header =
   match Packet.Header.Type.parse (Cstruct.get_uint8 header 0) with
   | Long ->
@@ -140,19 +158,6 @@ let decode_packet_number ~largest_pn ~truncated_pn ~pn_nbits =
     Int64.sub candidate_pn pn_win
   else
     candidate_pn
-
-let get_key_and_iv ~key_length secret =
-  let key =
-    Hkdf.expand_label ~hash:`SHA256 ~prk:secret ~length:key_length "quic key"
-  in
-  let iv = Hkdf.expand_label ~hash:`SHA256 ~prk:secret ~length:12 "quic iv" in
-  key, iv
-
-let get_header_protection_key ~length secret =
-  Hkdf.expand_label ~hash:`SHA256 ~prk:secret ~length "quic hp"
-
-let get_ku ~length secret =
-  Hkdf.expand_label ~hash:`SHA256 ~prk:secret ~length "quic ku"
 
 module AEAD = struct
   type 'k aead_state =
@@ -438,44 +443,74 @@ module AEAD = struct
     | None ->
       None
 
-  let get_key_and_iv secret = get_key_and_iv ~key_length:16 secret
-
-  let get_header_protection_key secret =
-    get_header_protection_key ~length:16 secret
-
   module AES_ECB = Mirage_crypto.Cipher_block.AES.ECB
 
-  let get_cipher_st : type a. a Tls.State.aead_cipher -> Cstruct.t -> cipher_st =
-   fun cipher secret ->
-    match cipher with
-    | CCM (module CCM) ->
-      AEAD { cipher; key = CCM.of_secret ~maclen:16 secret }
-    | GCM (module GCM) ->
-      AEAD { cipher; key = GCM.of_secret secret }
-    | ChaCha20_Poly1305 _ ->
-      let cipher =
-        (module Mirage_crypto.Chacha20 : Mirage_crypto.AEAD
-          with type key = Mirage_crypto.Chacha20.key)
-      in
-      let key = Mirage_crypto.Chacha20.of_secret secret in
-      AEAD { cipher = ChaCha20_Poly1305 cipher; key }
+  let encrypt_or_decrypt_header_ecb ~hp_key f ~sample header =
+    (* From RFC<QUIC-TLS-RFC>§5.4.3:
+     *   mask = AES-ECB(hp_key, sample) *)
+    let mask = AES_ECB.encrypt ~key:(AES_ECB.of_secret hp_key) sample in
+    f ~mask header
 
-  let make ?(conn_id_len = CID.length) ~cipher secret =
-    let key, iv = get_key_and_iv secret in
-    let hp_key = get_header_protection_key secret in
-    let encrypt_or_decrypt_header f ~sample header =
-      (* From RFC<QUIC-TLS-RFC>§5.4.3:
-       *   mask = AES-ECB(hp_key, sample) *)
-      let mask = AES_ECB.encrypt ~key:(AES_ECB.of_secret hp_key) sample in
-      f ~mask header
+  let encrypt_or_decrypt_header_chacha20 ~hp_key f ~sample header =
+    let module Chacha20 = Mirage_crypto.Chacha20 in
+    (* From RFC<QUIC-TLS-RFC>§5.4.3:
+     *   counter = sample[0..3]
+     *   nonce = sample[4..15]
+     *   mask = ChaCha20(hp_key, counter, nonce, {0,0,0,0,0}) *)
+    let counter = Cstruct.sub sample 0 4 in
+    let nonce = Cstruct.sub sample 4 12 in
+    let ctr =
+      Int64.logand
+        (Int64.of_int32 (Cstruct.LE.get_uint32 counter 0))
+        0x00000000FFFFFFFFL
     in
-    let cipher = get_cipher_st cipher key in
+    let mask =
+      Chacha20.crypt
+        ~key:(Chacha20.of_secret hp_key)
+        ~nonce
+        ~ctr
+        (Cstruct.create 5)
+    in
+    f ~mask header
+
+  let encrypt_or_decrypt_header ~ciphersuite ~hp_key f =
+    match ciphersuite with
+    | Tls.Ciphersuite.AES_128_GCM | AES_256_GCM | AES_128_CCM | AES_256_CCM ->
+      encrypt_or_decrypt_header_ecb ~hp_key f
+    | CHACHA20_POLY1305 ->
+      encrypt_or_decrypt_header_chacha20 ~hp_key f
+
+  let get_cipher_st : Tls.Ciphersuite.aead_cipher -> Cstruct.t -> cipher_st =
+   fun ciphersuite secret ->
+    match
+      Tls.Crypto.Ciphers.get_aead ~secret ~nonce:Cstruct.empty ciphersuite
+    with
+    | Tls.State.AEAD { cipher; cipher_secret; _ } ->
+      AEAD { cipher; key = cipher_secret }
+    | CBC _ ->
+      assert false
+
+  let make ?(conn_id_len = CID.length) ~ciphersuite secret =
+    let ciphersuite13 = Tls.Ciphersuite.privprot13 ciphersuite in
+    let hash = Tls.Ciphersuite.hash13 ciphersuite in
+    let kn, ivn = Tls.Ciphersuite.kn_13 ciphersuite13 in
+    let key, iv = Kdf.get_key_and_iv ~hash ~kn ~ivn secret in
+    let hp_key = Kdf.get_header_protection_key ~hash ~kn secret in
+    let cipher = get_cipher_st ciphersuite13 key in
     { conn_id_len
     ; cipher
     ; encrypt_payload = encrypt_payload cipher ~iv
     ; decrypt_payload = decrypt_payload cipher ~iv
-    ; encrypt_header = encrypt_or_decrypt_header encrypt_header
-    ; decrypt_header = encrypt_or_decrypt_header (decrypt_header ~conn_id_len)
+    ; encrypt_header =
+        encrypt_or_decrypt_header
+          ~ciphersuite:ciphersuite13
+          ~hp_key
+          encrypt_header
+    ; decrypt_header =
+        encrypt_or_decrypt_header
+          ~ciphersuite:ciphersuite13
+          ~hp_key
+          (decrypt_header ~conn_id_len)
     }
 end
 
@@ -516,11 +551,17 @@ module InitialAEAD = struct
         ~length:Mirage_crypto.Hash.SHA256.digest_size
         "server in"
 
-  module AES_GCM = Mirage_crypto.Cipher_block.AES.GCM
-
+  (* From RFC<QUIC-TLS-RFC>§5.2:
+   *   The hash function for HKDF when deriving initial secrets and keys is
+   *   SHA-256 [SHA].
+   *
+   * From RFC<QUIC-TLS-RFC>§5.3:
+   *   Prior to establishing a shared secret, packets are protected with
+   *   AEAD_AES_128_GCM and a key derived from the Destination Connection ID in
+   *   the client's first Initial packet (see Section 5.2). *)
   let make ?(conn_id_len = CID.length) ~mode dest_cid =
     let secret = get_secret ~mode dest_cid in
-    AEAD.make ~conn_id_len ~cipher:(GCM (module AES_GCM)) secret
+    AEAD.make ~conn_id_len ~ciphersuite:`AES_128_GCM_SHA256 secret
 end
 
 module Retry = struct
@@ -558,50 +599,6 @@ module Retry = struct
         (Bigstringaf.unsafe_get pseudo0 i)
     done;
     AES_GCM.authenticate_encrypt ~key ~nonce ~adata:pseudo Cstruct.empty
-end
-
-module ChaCha20 = struct
-  let get_key_and_iv secret = get_key_and_iv ~key_length:32 secret
-
-  let get_header_protection_key secret =
-    get_header_protection_key ~length:32 secret
-
-  let get_ku secret = get_ku ~length:32 secret
-
-  module Chacha20 = Mirage_crypto.Chacha20
-
-  let make ?(conn_id_len = CID.length) secret =
-    let key, iv = get_key_and_iv secret in
-    let hp_key = get_header_protection_key secret in
-    let encrypt_or_decrypt f ~sample header =
-      (* From RFC<QUIC-TLS-RFC>§5.4.3:
-       *   counter = sample[0..3]
-       *   nonce = sample[4..15]
-       *   mask = ChaCha20(hp_key, counter, nonce, {0,0,0,0,0}) *)
-      let counter = Cstruct.sub sample 0 4 in
-      let nonce = Cstruct.sub sample 4 12 in
-      let ctr =
-        Int64.logand
-          (Int64.of_int32 (Cstruct.LE.get_uint32 counter 0))
-          0x00000000FFFFFFFFL
-      in
-      let mask =
-        Chacha20.crypt
-          ~key:(Chacha20.of_secret hp_key)
-          ~nonce
-          ~ctr
-          (Cstruct.create 5)
-      in
-      f ~mask header
-    in
-    let cipher = AEAD.get_cipher_st (ChaCha20_Poly1305 (module Chacha20)) key in
-    { AEAD.conn_id_len
-    ; cipher
-    ; encrypt_payload = AEAD.encrypt_payload cipher ~iv
-    ; decrypt_payload = AEAD.decrypt_payload cipher ~iv
-    ; encrypt_header = encrypt_or_decrypt AEAD.encrypt_header
-    ; decrypt_header = encrypt_or_decrypt (AEAD.decrypt_header ~conn_id_len)
-    }
 end
 
 type encdec =

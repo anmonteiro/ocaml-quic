@@ -4,6 +4,7 @@ let hex = Alcotest.of_pp Hex.pp
 
 let dest_cid = Hex.to_string (`Hex "8394c8f03e515708")
 
+module Crypto = Quic.Crypto
 module InitialAEAD = Quic.Crypto.InitialAEAD
 module AEAD = Quic.Crypto.AEAD
 
@@ -23,7 +24,9 @@ module Keys = struct
       "client_initial_secret"
       (`Hex "0088119288f1d866733ceeed15ff9d50902cf82952eee27e9d4d4918ea371d87")
       (Hex.of_string (Cstruct.to_string client_secret));
-    let client_key, client_iv = AEAD.get_key_and_iv client_secret in
+    let client_key, client_iv =
+      Crypto.Kdf.get_key_and_iv ~hash:`SHA256 ~kn:16 ~ivn:12 client_secret
+    in
     Alcotest.check
       hex
       "client_key"
@@ -34,7 +37,9 @@ module Keys = struct
       "client_iv"
       (`Hex "6b26114b9cba2b63a9e8dd4f")
       (Hex.of_string (Cstruct.to_string client_iv));
-    let client_hp = AEAD.get_header_protection_key client_secret in
+    let client_hp =
+      Crypto.Kdf.get_header_protection_key ~hash:`SHA256 ~kn:16 client_secret
+    in
     Alcotest.check
       hex
       "client_hp"
@@ -48,7 +53,9 @@ module Keys = struct
       "client_initial_secret"
       (`Hex "006f881359244dd9ad1acf85f595bad67c13f9f5586f5e64e1acae1d9ea8f616")
       (Hex.of_string (Cstruct.to_string server_secret));
-    let server_key, server_iv = AEAD.get_key_and_iv server_secret in
+    let server_key, server_iv =
+      Crypto.Kdf.get_key_and_iv ~hash:`SHA256 ~kn:16 ~ivn:12 server_secret
+    in
     Alcotest.check
       hex
       "server_key"
@@ -59,7 +66,9 @@ module Keys = struct
       "server_iv"
       (`Hex "bab2b12a4c76016ace47856d")
       (Hex.of_string (Cstruct.to_string server_iv));
-    let server_hp = AEAD.get_header_protection_key server_secret in
+    let server_hp =
+      Crypto.Kdf.get_header_protection_key ~hash:`SHA256 ~kn:16 server_secret
+    in
     Alcotest.check
       hex
       "server_hp"
@@ -118,7 +127,7 @@ module Client_initial = struct
       (Hex.of_cstruct (Cstruct.append header sealed_payload));
     let header = Cstruct.of_string unprotected_header in
     let packet =
-      Quic.Crypto.AEAD.encrypt_packet encrypter ~packet_number ~header data
+      Crypto.AEAD.encrypt_packet encrypter ~packet_number ~header data
     in
     Alcotest.check
       hex
@@ -169,7 +178,7 @@ module Server_initial = struct
       (Hex.of_cstruct (Cstruct.append header sealed_payload));
     let header = Cstruct.of_string unprotected_header in
     let packet =
-      Quic.Crypto.AEAD.encrypt_packet encrypter ~packet_number ~header data
+      Crypto.AEAD.encrypt_packet encrypter ~packet_number ~header data
     in
     Alcotest.check
       hex
@@ -188,7 +197,7 @@ module Retry = struct
           "ffff00001d0008f067a5502a4262b5746f6b656ed16926d81f6f9ca2953a8aa4575e1e49")
     in
     let integrity_tag =
-      Quic.Crypto.Retry.calculate_integrity_tag
+      Crypto.Retry.calculate_integrity_tag
         { Quic.CID.length = String.length dest_cid; id = dest_cid }
         (Bigstringaf.of_string ~off:0 ~len:(String.length data - 16) data)
     in
@@ -216,7 +225,9 @@ module ChaCha = struct
     `Hex "4cfe4189655e5cd55c41f69080575d7999c25a5bfb"
 
   let test_chacha_keys () =
-    let key, iv = Quic.Crypto.ChaCha20.get_key_and_iv secret in
+    let key, iv =
+      Crypto.Kdf.get_key_and_iv ~hash:`SHA256 ~kn:32 ~ivn:12 secret
+    in
     Alcotest.check
       hex
       "key"
@@ -227,13 +238,13 @@ module ChaCha = struct
       "iv"
       (`Hex "e0459b3474bdd0e44a41c144")
       (Hex.of_string (Cstruct.to_string iv));
-    let hp = Quic.Crypto.ChaCha20.get_header_protection_key secret in
+    let hp = Crypto.Kdf.get_header_protection_key ~hash:`SHA256 ~kn:32 secret in
     Alcotest.check
       hex
       "hp"
       (`Hex "25a282b9e82f06f21f488917a4fc8f1b73573685608597d0efcb076b0ab7a7a4")
       (Hex.of_string (Cstruct.to_string hp));
-    let ku = Quic.Crypto.ChaCha20.get_ku secret in
+    let ku = Crypto.Kdf.get_ku ~hash:`SHA256 ~kn:32 secret in
     Alcotest.check
       hex
       "ku"
@@ -241,9 +252,8 @@ module ChaCha = struct
       (Hex.of_string (Cstruct.to_string ku))
 
   let test_chacha_short_header () =
-    let module ChaCha20 = Quic.Crypto.ChaCha20 in
     let packet_number = 654360564L in
-    let encrypter = ChaCha20.make secret in
+    let encrypter = AEAD.make ~ciphersuite:`CHACHA20_POLY1305_SHA256 secret in
     let sealed_payload =
       encrypter.encrypt_payload
         ~packet_number
@@ -270,7 +280,7 @@ module ChaCha = struct
       expected_protected_packet
       (Hex.of_cstruct (Cstruct.append header sealed_payload));
     let packet =
-      Quic.Crypto.AEAD.encrypt_packet
+      Crypto.AEAD.encrypt_packet
         encrypter
         ~packet_number
         ~header:(Hex.to_cstruct unprotected_header)
@@ -333,7 +343,7 @@ module InitialAEAD_encryption = struct
       (Hex.of_cstruct (Cstruct.sub header 1 5))
       (Hex.of_string (String.sub unprotected_header 1 5));
     let pn_length =
-      Quic.Crypto.packet_number_length (Cstruct.of_string unprotected_header)
+      Crypto.packet_number_length (Cstruct.of_string unprotected_header)
     in
     Alcotest.(check bool)
       "last 4 bytes are modified (protected)"
@@ -391,7 +401,7 @@ module InitialAEAD_encryption = struct
     let data = Cstruct.of_string Client_initial.unprotected_payload in
     let packet_number = 2L in
     let protected_packet =
-      Quic.Crypto.AEAD.encrypt_packet
+      Crypto.AEAD.encrypt_packet
         client_encrypter
         ~packet_number
         ~header:unprotected_header
@@ -402,13 +412,13 @@ module InitialAEAD_encryption = struct
       "resulting protected packet"
       Client_initial.expected_protected_packet
       (Hex.of_cstruct protected_packet);
-    let { Quic.Crypto.AEAD.header = decrypted_header
+    let { Crypto.AEAD.header = decrypted_header
         ; plaintext = decrypted_packet
         ; _
         }
       =
       Option.get
-        (Quic.Crypto.AEAD.decrypt_packet
+        (Crypto.AEAD.decrypt_packet
            client_encrypter
            ~largest_pn:0L
            protected_packet)
@@ -432,7 +442,7 @@ module InitialAEAD_encryption = struct
     let data = Cstruct.of_string Server_initial.unprotected_payload in
     let packet_number = 1L in
     let protected_packet =
-      Quic.Crypto.AEAD.encrypt_packet
+      Crypto.AEAD.encrypt_packet
         server_encrypter
         ~packet_number
         ~header:unprotected_header
@@ -443,13 +453,13 @@ module InitialAEAD_encryption = struct
       "resulting protected packet"
       Server_initial.expected_protected_packet
       (Hex.of_cstruct protected_packet);
-    let { Quic.Crypto.AEAD.header = decrypted_header
+    let { Crypto.AEAD.header = decrypted_header
         ; plaintext = decrypted_packet
         ; _
         }
       =
       Option.get
-        (Quic.Crypto.AEAD.decrypt_packet
+        (Crypto.AEAD.decrypt_packet
            server_encrypter
            ~largest_pn:0L
            protected_packet)
@@ -471,22 +481,19 @@ module InitialAEAD_encryption = struct
     let plaintext_payload = `Hex "0201000000" in
     let encrypter = InitialAEAD.make ~mode:Server dest_cid in
     let protected_packet =
-      Quic.Crypto.AEAD.encrypt_packet
+      Crypto.AEAD.encrypt_packet
         encrypter
         ~packet_number:1L
         ~header:(Hex.to_cstruct unprotected_header)
         (Hex.to_cstruct plaintext_payload)
     in
-    let { Quic.Crypto.AEAD.header = decrypted_header
+    let { Crypto.AEAD.header = decrypted_header
         ; plaintext = decrypted_packet
         ; _
         }
       =
       Option.get
-        (Quic.Crypto.AEAD.decrypt_packet
-           encrypter
-           ~largest_pn:0L
-           protected_packet)
+        (Crypto.AEAD.decrypt_packet encrypter ~largest_pn:0L protected_packet)
     in
     Alcotest.check
       hex
@@ -505,7 +512,7 @@ module InitialAEAD_encryption = struct
     let writer = Writer.create 0x1000 in
     Writer.write_frames_packet
       writer
-      ~encdec:{ Quic.Crypto.encrypter; decrypter = Some encrypter }
+      ~encdec:{ Crypto.encrypter; decrypter = Some encrypter }
       ~encryption_level:Initial
       ~header_info:(Writer.make_header_info { Quic.CID.id = "abc"; length = 3 })
       ~packet_number:1L
@@ -521,10 +528,10 @@ module InitialAEAD_encryption = struct
       Cstruct.of_bigarray (Faraday.serialize_to_bigstring writer.encoder)
     in
     let ret =
-      Quic.Crypto.AEAD.decrypt_packet encrypter ~largest_pn:0L protected_packet
+      Crypto.AEAD.decrypt_packet encrypter ~largest_pn:0L protected_packet
     in
     match ret with
-    | Some { Quic.Crypto.AEAD.packet_number; pn_length; _ } ->
+    | Some { Crypto.AEAD.packet_number; pn_length; _ } ->
       Alcotest.(check int64) "packet number" 1L packet_number;
       Alcotest.(check int) "packet number length" 4 pn_length
     | None ->
@@ -547,8 +554,12 @@ end
 
 module ChaCha20_encryption = struct
   let test_chacha20_header_encryption_decryption () =
-    let module ChaCha20 = Quic.Crypto.ChaCha20 in
-    let client_encrypter = ChaCha20.make ~conn_id_len:0 ChaCha.secret in
+    let client_encrypter =
+      AEAD.make
+        ~conn_id_len:0
+        ~ciphersuite:`CHACHA20_POLY1305_SHA256
+        ChaCha.secret
+    in
     let unprotected_header = Client_initial.unprotected_header in
     let sample = Cstruct.of_hex "655e5cd55c41f69080575d7999c25a5b" in
     assert (Cstruct.len sample = 16);
@@ -569,7 +580,7 @@ module ChaCha20_encryption = struct
       (Hex.of_cstruct (Cstruct.sub header 1 5))
       (Hex.of_string (String.sub unprotected_header 1 5));
     let pn_length =
-      Quic.Crypto.packet_number_length (Cstruct.of_string unprotected_header)
+      Crypto.packet_number_length (Cstruct.of_string unprotected_header)
     in
     Alcotest.(check bool)
       "last 4 bytes are modified (protected)"
@@ -588,12 +599,16 @@ module ChaCha20_encryption = struct
       (Hex.of_cstruct decrypted_header)
 
   let test_chacha20_packet_encryption_decryption () =
-    let module ChaCha20 = Quic.Crypto.ChaCha20 in
     let packet_number = 654360564L in
-    let encrypter = ChaCha20.make ~conn_id_len:0 ChaCha.secret in
+    let encrypter =
+      AEAD.make
+        ~conn_id_len:0
+        ~ciphersuite:`CHACHA20_POLY1305_SHA256
+        ChaCha.secret
+    in
     let unprotected_header = Hex.to_cstruct ChaCha.unprotected_header in
     let protected_packet =
-      Quic.Crypto.AEAD.encrypt_packet
+      Crypto.AEAD.encrypt_packet
         encrypter
         ~packet_number
         ~header:unprotected_header
@@ -604,13 +619,13 @@ module ChaCha20_encryption = struct
       "resulting protected packet"
       ChaCha.expected_protected_packet
       (Hex.of_cstruct protected_packet);
-    let { Quic.Crypto.AEAD.header = decrypted_header
+    let { Crypto.AEAD.header = decrypted_header
         ; plaintext = decrypted_packet
         ; _
         }
       =
       Option.get
-        (Quic.Crypto.AEAD.decrypt_packet
+        (Crypto.AEAD.decrypt_packet
            encrypter
            ~largest_pn:(Int64.sub packet_number 100L)
            protected_packet)
