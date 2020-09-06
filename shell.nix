@@ -21,7 +21,9 @@ in
       ++ (with ocamlPackages; [ merlin ocamlformat utop ]);
   }).overrideAttrs (o : {
     propagatedBuildInputs = lib.filter
-      (drv: drv.pname == null || !(lib.any (name: name == drv.pname) (lib.attrNames h2Drvs)))
+    (drv:
+        !(lib.hasAttr "pname" drv) ||
+    drv.pname == null || !(lib.any (name: name == drv.pname) (lib.attrNames h2Drvs)))
       o.propagatedBuildInputs;
   })
 

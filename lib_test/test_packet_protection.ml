@@ -188,7 +188,7 @@ module Retry = struct
     in
     let integrity_tag =
       Quic.Crypto.Retry.calculate_integrity_tag
-        { Quic.Packet.CID.length = String.length dest_cid; id = dest_cid }
+        { Quic.CID.length = String.length dest_cid; id = dest_cid }
         (Bigstringaf.of_string ~off:0 ~len:(String.length data - 16) data)
     in
     Alcotest.check
@@ -464,6 +464,71 @@ module InitialAEAD_encryption = struct
       (Hex.of_string Server_initial.unprotected_payload)
       (Hex.of_cstruct decrypted_packet)
 
+  let test_ocaml_quic_enc_dec () =
+    let module Writer = Quic.Serialize.Writer in
+    let unprotected_header = `Hex "c3ff00001d0361626300001900000001" in
+    let plaintext_payload = `Hex "0201000000" in
+    let encrypter = InitialAEAD.make ~mode:Server dest_cid in
+    let protected_packet =
+      Quic.Crypto.AEAD.encrypt_packet
+        encrypter
+        ~packet_number:1L
+        ~header:(Hex.to_cstruct unprotected_header)
+        (Hex.to_cstruct plaintext_payload)
+    in
+    let { Quic.Crypto.AEAD.header = decrypted_header
+        ; plaintext = decrypted_packet
+        ; _
+        }
+      =
+      Option.get
+        (Quic.Crypto.AEAD.decrypt_packet
+           encrypter
+           ~largest_pn:0L
+           protected_packet)
+    in
+    Alcotest.check
+      hex
+      "roundtrip header"
+      unprotected_header
+      (Hex.of_cstruct decrypted_header);
+    Alcotest.check
+      hex
+      "roundtrip payload"
+      plaintext_payload
+      (Hex.of_cstruct decrypted_packet)
+
+  let test_ocaml_quic_decrypt_serialized () =
+    let module Writer = Quic.Serialize.Writer in
+    let encrypter = InitialAEAD.make ~mode:Server "abc" in
+    let writer = Writer.create 0x1000 in
+    Writer.write_frames_packet
+      writer
+      ~encdec:{ Quic.Crypto.encrypter; decrypter = encrypter }
+      ~encryption_level:Initial
+      ~header_info:(Writer.make_header_info { Quic.CID.id = "abc"; length = 3 })
+      ~packet_number:1L
+      [ Ack
+          { largest = Int64.to_int 1L
+          ; delay = 0
+          ; first_range = 0
+          ; ranges = []
+          ; ecn_counts = None
+          }
+      ];
+    let protected_packet =
+      Cstruct.of_bigarray (Faraday.serialize_to_bigstring writer.encoder)
+    in
+    let ret =
+      Quic.Crypto.AEAD.decrypt_packet encrypter ~largest_pn:0L protected_packet
+    in
+    match ret with
+    | Some { Quic.Crypto.AEAD.packet_number; pn_length; _ } ->
+      Alcotest.(check int64) "packet number" 1L packet_number;
+      Alcotest.(check int) "packet number length" 4 pn_length
+    | None ->
+      Alcotest.fail "expected packet to decrypt successfully"
+
   let suite =
     [ ( "header encryption / decryption"
       , `Quick
@@ -474,6 +539,8 @@ module InitialAEAD_encryption = struct
     ; ( "server packet encryption / decryption"
       , `Quick
       , test_server_initial_aead_packet_encryption_decryption )
+    ; "ocaml-quic generated", `Quick, test_ocaml_quic_enc_dec
+    ; "ocaml-quic serialized", `Quick, test_ocaml_quic_decrypt_serialized
     ]
 end
 

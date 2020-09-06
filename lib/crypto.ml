@@ -1,3 +1,35 @@
+(*----------------------------------------------------------------------------
+ *  Copyright (c) 2020 António Nuno Monteiro
+ *
+ *  All rights reserved.
+ *
+ *  Redistribution and use in source and binary forms, with or without
+ *  modification, are permitted provided that the following conditions are met:
+ *
+ *  1. Redistributions of source code must retain the above copyright notice,
+ *  this list of conditions and the following disclaimer.
+ *
+ *  2. Redistributions in binary form must reproduce the above copyright
+ *  notice, this list of conditions and the following disclaimer in the
+ *  documentation and/or other materials provided with the distribution.
+ *
+ *  3. Neither the name of the copyright holder nor the names of its
+ *  contributors may be used to endorse or promote products derived from this
+ *  software without specific prior written permission.
+ *
+ *  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ *  AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ *  IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ *  ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ *  LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ *  CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ *  SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ *  INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ *  CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ *  ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ *  POSSIBILITY OF SUCH DAMAGE.
+ *---------------------------------------------------------------------------*)
+
 type mode =
   | Client
   | Server
@@ -107,9 +139,23 @@ let decode_packet_number ~largest_pn ~truncated_pn ~pn_nbits =
   else
     candidate_pn
 
+let get_key_and_iv ~key_length secret =
+  let key =
+    Hkdf.expand_label ~hash:`SHA256 ~prk:secret ~length:key_length "quic key"
+  in
+  let iv = Hkdf.expand_label ~hash:`SHA256 ~prk:secret ~length:12 "quic iv" in
+  key, iv
+
+let get_header_protection_key ~length secret =
+  Hkdf.expand_label ~hash:`SHA256 ~prk:secret ~length "quic hp"
+
+let get_ku ~length secret =
+  Hkdf.expand_label ~hash:`SHA256 ~prk:secret ~length "quic ku"
+
 module AEAD = struct
   type t =
     { conn_id_len : int
+    ; tag_len : int
     ; encrypt_payload :
         packet_number:int64 -> header:Cstruct.t -> Cstruct.t -> Cstruct.t
     ; decrypt_payload :
@@ -298,7 +344,7 @@ module AEAD = struct
        *)
       1 + conn_id_len + 4
 
-  let decrypt_header ?(conn_id_len = Packet.CID.length) ~mask header =
+  let decrypt_header ?(conn_id_len = CID.length) ~mask header =
     (* From RFC<QUIC-TLS-RFC>§5.4.1:
      *   The output of this algorithm is a 5 byte mask which is applied to the
      *   protected header fields using exclusive OR. *)
@@ -392,19 +438,6 @@ module AEAD = struct
       None
 end
 
-let get_key_and_iv ~key_length secret =
-  let key =
-    Hkdf.expand_label ~hash:`SHA256 ~prk:secret ~length:key_length "quic key"
-  in
-  let iv = Hkdf.expand_label ~hash:`SHA256 ~prk:secret ~length:12 "quic iv" in
-  key, iv
-
-let get_header_protection_key ~length secret =
-  Hkdf.expand_label ~hash:`SHA256 ~prk:secret ~length "quic hp"
-
-let get_ku ~length secret =
-  Hkdf.expand_label ~hash:`SHA256 ~prk:secret ~length "quic ku"
-
 module InitialAEAD = struct
   let get_initial_secret dest_connection_id =
     (* From RFC<QUIC-TLS-RFC>§A.1:
@@ -450,7 +483,7 @@ module InitialAEAD = struct
   module AES_GCM = Mirage_crypto.Cipher_block.AES.GCM
   module AES_ECB = Mirage_crypto.Cipher_block.AES.ECB
 
-  let make ?(conn_id_len = Packet.CID.length) ~mode dest_cid =
+  let make ?(conn_id_len = CID.length) ~mode dest_cid =
     let secret = get_secret ~mode dest_cid in
     let key, iv = get_key_and_iv secret in
     let hp_key = get_header_protection_key secret in
@@ -462,6 +495,7 @@ module InitialAEAD = struct
     in
     let key = AES_GCM.of_secret key in
     { AEAD.conn_id_len
+    ; tag_len = AES_GCM.tag_size
     ; encrypt_payload = AEAD.encrypt_payload (module AES_GCM) ~key ~iv
     ; decrypt_payload = AEAD.decrypt_payload (module AES_GCM) ~key ~iv
     ; encrypt_header = encrypt_or_decrypt_header AEAD.encrypt_header
@@ -491,7 +525,7 @@ module Retry = struct
   let nonce =
     Cstruct.of_string "\xe5\x49\x30\xf9\x7f\x21\x36\xf0\x53\x0a\x8c\x1c"
 
-  let calculate_integrity_tag { Packet.CID.length; id } pseudo0 =
+  let calculate_integrity_tag { CID.length; id } pseudo0 =
     let pseudo_len = length + Bigstringaf.length pseudo0 + 1 in
     let pseudo = Cstruct.create pseudo_len in
     Cstruct.set_uint8 pseudo 0 length;
@@ -517,7 +551,7 @@ module ChaCha20 = struct
 
   module Chacha20 = Mirage_crypto.Chacha20
 
-  let make ?(conn_id_len = Packet.CID.length) secret =
+  let make ?(conn_id_len = CID.length) secret =
     let key, iv = get_key_and_iv secret in
     let hp_key = get_header_protection_key secret in
     let encrypt_or_decrypt f ~sample header =
@@ -543,6 +577,7 @@ module ChaCha20 = struct
     in
     let key = Chacha20.of_secret key in
     { AEAD.conn_id_len
+    ; tag_len = Mirage_crypto.Poly1305.mac_size
     ; encrypt_payload = AEAD.encrypt_payload (module Chacha20) ~key ~iv
     ; decrypt_payload = AEAD.decrypt_payload (module Chacha20) ~key ~iv
     ; encrypt_header = encrypt_or_decrypt AEAD.encrypt_header
@@ -550,18 +585,7 @@ module ChaCha20 = struct
     }
 end
 
-module Encryption_level = struct
-  (* From RFC<QUIC-TLS-RFC>§A.1:
-   *   Data is protected using a number of encryption levels:
-   *
-   *   Initial Keys
-   *   Early Data (0-RTT) Keys
-   *   Handshake Keys
-   *   Application Data (1-RTT) Keys
-   *)
-  type t =
-    | Initial
-    | Zero_RTT
-    | Handshake
-    | Application_Data
-end
+type encdec =
+  { mutable encrypter : AEAD.t
+  ; mutable decrypter : AEAD.t
+  }

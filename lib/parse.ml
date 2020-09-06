@@ -106,11 +106,11 @@ module Frame = struct
       variable_length_integer
 
   let parse_crypto_frame =
-    variable_length_integer >>= fun offset ->
-    variable_length_integer >>= fun length ->
+    variable_length_integer >>= fun off ->
+    variable_length_integer >>= fun len ->
     lift
-      (fun data -> Frame.Crypto { offset; length; data })
-      (take_bigstring length)
+      (fun buffer -> Frame.Crypto { IOVec.off; len; buffer })
+      (take_bigstring len)
 
   let parse_new_token_frame =
     variable_length_integer >>= fun length ->
@@ -120,12 +120,13 @@ module Frame = struct
     let parse_off = if off then variable_length_integer else return 0 in
     let parse_len = if len then variable_length_integer else available in
     variable_length_integer >>= fun stream_id ->
-    parse_off >>= fun offset ->
-    parse_len >>= fun length ->
+    parse_off >>= fun off ->
+    parse_len >>= fun len ->
     lift
-      (fun data ->
-        Frame.Stream { stream_id; offset; length; data; is_fin = fin })
-      (take_bigstring length)
+      (fun buffer ->
+        Frame.Stream
+          { stream_id; fragment = { IOVec.off; len; buffer }; is_fin = fin })
+      (take_bigstring len)
 
   let parse_max_data_frame =
     lift (fun n -> Frame.Max_data n) variable_length_integer
@@ -158,7 +159,7 @@ module Frame = struct
     lift2
       (fun conn_id stateless_reset_token ->
         Frame.New_connection_id
-          { cid = { Packet.CID.length; id = conn_id }
+          { cid = { CID.length; id = conn_id }
           ; sequence_no
           ; stateless_reset_token
           ; retire_prior_to
@@ -274,12 +275,12 @@ module Packet = struct
         take src_len >>= fun src_cid ->
         return
           ( Packet.Version.parse version
-          , { Packet.CID.length = src_len; id = src_cid }
-          , { Packet.CID.length = dst_len; id = dst_cid } )
+          , { CID.length = src_len; id = src_cid }
+          , { CID.length = dst_len; id = dst_cid } )
     end
 
     module Short = struct
-      let parse = take Packet.CID.length
+      let parse = take CID.length
     end
   end
 
@@ -421,7 +422,7 @@ module Packet = struct
   let short_header =
     lift
       (fun dest_cid ->
-        Packet.Header.Short { dest_cid = Packet.CID.{ id = dest_cid; length } })
+        Packet.Header.Short { dest_cid = CID.{ id = dest_cid; length } })
       Header.Short.parse
 
   let protected_header =

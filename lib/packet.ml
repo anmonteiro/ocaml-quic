@@ -30,15 +30,6 @@
  *  POSSIBILITY OF SUCH DAMAGE.
  *---------------------------------------------------------------------------*)
 
-module CID = struct
-  type t =
-    { length : int
-    ; id : string
-    }
-
-  let length = 8
-end
-
 module Version = struct
   type t =
     | Negotiation
@@ -105,6 +96,24 @@ module Header = struct
         }
     | Short of { dest_cid : CID.t }
 
+  let long_packet_type = function
+    | Initial _ ->
+      Type.Initial
+    | Long { packet_type; _ } ->
+      packet_type
+    | Short _ ->
+      assert false
+
+  let source_cid = function
+    | Initial { source_cid; _ } | Long { source_cid; _ } ->
+      Some source_cid
+    | Short _ ->
+      None
+
+  let destination_cid = function
+    | Initial { dest_cid; _ } | Long { dest_cid; _ } | Short { dest_cid; _ } ->
+      dest_cid
+
   module Type = struct
     type t =
       | Long
@@ -144,3 +153,15 @@ type t =
       ; pseudo : Bigstringaf.t
       ; tag : string
       }
+
+let destination_cid = function
+  | VersionNegotiation { dest_cid; _ } ->
+    dest_cid
+  | Frames { header; _ } | Retry { header; _ } ->
+    Header.destination_cid header
+
+let source_cid = function
+  | VersionNegotiation { source_cid; _ } ->
+    Some source_cid
+  | Frames { header; _ } | Retry { header; _ } ->
+    Header.source_cid header

@@ -52,7 +52,20 @@ in
           hpack
           httpaf
           mirage-crypto
-          tls
+          ppx_sexp_conv
+          ppx_cstruct
+          cstruct
+          cstruct-sexp
+          sexplib
+          mirage-crypto-pk
+          mirage-crypto-rng
+          x509
+          domain-name
+          fmt
+          ptime
+          hacl_x25519
+          fiat-p256
+          logs
           hkdf
         ];
       };

@@ -30,5 +30,47 @@
  *  POSSIBILITY OF SUCH DAMAGE.
  *---------------------------------------------------------------------------*)
 
-module Server_connection = Server_connection
-module IOVec = IOVec
+(* From RFC<QUIC-RFC>§2.2:
+ *   Endpoints MUST be able to deliver stream data to an application as an
+ *   ordered byte-stream. Delivering an ordered byte-stream requires that an
+ *   endpoint buffer any data that is received out of order, up to the
+ *   advertised flow control limit. *)
+
+type fragment = Bigstringaf.t IOVec.t
+
+module Q : Psq.S with type k = int and type p = fragment =
+  Psq.Make
+    (Int)
+    (struct
+      type t = fragment
+
+      let compare { IOVec.off = off1; _ } { IOVec.off = off2; _ } =
+        compare off1 off2
+    end)
+
+type t =
+  { mutable q : Q.t
+  ; mutable processed : int (* TODO: int64? *)
+  }
+
+let create () = { q = Q.empty; processed = 0 }
+
+let add ({ IOVec.off; len; _ } as fragment) t =
+  (* From RFC<QUIC-RFC>§2.2:
+   *   An endpoint could receive data for a stream at the same stream offset
+   *   multiple times. Data that has already been received can be discarded. *)
+  if t.processed < off + len then
+    let q' = Q.add off fragment t.q in
+    t.q <- q'
+
+let pop t =
+  match Q.pop t.q with
+  | Some ((off, fragment), q') ->
+    if off = t.processed then (
+      t.processed <- t.processed + fragment.len;
+      t.q <- q';
+      Some fragment)
+    else
+      None
+  | None ->
+    None

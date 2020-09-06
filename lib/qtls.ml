@@ -62,6 +62,7 @@ and handle_handshake = function
   | Server13 ss ->
     Handshake_server13.handle_handshake ss
 
+(* TODO: Only handle HANDSHAKE packets. *)
 let handle_packet hs buf = function
   (* RFC 5246 -- 6.2.1.: Implementations MUST NOT send zero-length fragments of
      Handshake, Alert, or ChangeCipherSpec content types. Zero-length fragments
@@ -125,7 +126,7 @@ let handle_raw_record state buf =
   (* From RFC<QUIC-TLS-RFC>§4.1.3:
    *   QUIC is only capable of conveying TLS handshake records in CRYPTO
    *   frames. *)
-  let hdr = { Core.content_type = Packet.HANDSHAKE; version = `TLS_1_3 } in
+  let hdr = { Core.content_type = Packet.HANDSHAKE; version = `TLS_1_2 } in
   let hs = state.handshake in
   let version = hs.protocol_version in
   (match hs.machina, version with
@@ -135,10 +136,9 @@ let handle_raw_record state buf =
     return ()
   | Server13 AwaitClientHelloHRR13, _ ->
     return ()
-    (* | _, `TLS_1_3 -> *)
-    (* guard (hdr.version = `TLS_1_2) (`Fatal (`BadRecordVersion hdr.version)) *)
+  | _, `TLS_1_3 ->
+    guard (hdr.version = `TLS_1_2) (`Fatal (`BadRecordVersion hdr.version))
   | _, v ->
-    Format.eprintf "wait what?@.";
     guard
       (Core.version_eq hdr.version v)
       (`Fatal (`BadRecordVersion hdr.version)))
@@ -156,7 +156,7 @@ let handle_raw_record state buf =
         | `Change_dec dec' ->
           Format.eprintf "change dec@.";
           (match dec'.cipher_st with
-          | AEAD { cipher = GCM _; nonce; _ } ->
+          | AEAD { cipher = GCM _; nonce; cipher_secret = _ } ->
             Format.eprintf "heh: %a @." Hex.pp (Hex.of_cstruct nonce)
           | _ ->
             assert false);

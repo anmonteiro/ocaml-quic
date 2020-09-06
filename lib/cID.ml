@@ -30,5 +30,13 @@
  *  POSSIBILITY OF SUCH DAMAGE.
  *---------------------------------------------------------------------------*)
 
-module Server_connection = Server_connection
-module IOVec = IOVec
+type t =
+  { length : int
+  ; id : string
+  }
+
+let length = 8
+
+let empty = { length = 0; id = "" }
+
+let is_empty t = t == empty

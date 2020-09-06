@@ -94,22 +94,24 @@ module Frame = struct
     write_variable_length_integer t stream_id;
     write_variable_length_integer t application_protocol_error
 
-  let write_crypto t ~offset ~length ~data =
-    write_variable_length_integer t offset;
-    write_variable_length_integer t length;
-    Faraday.schedule_bigstring t data
+  let write_crypto t ~fragment =
+    let { IOVec.off; len; buffer } = fragment in
+    write_variable_length_integer t off;
+    write_variable_length_integer t len;
+    Faraday.schedule_bigstring t buffer
 
   let write_new_token t ~length ~data =
     write_variable_length_integer t length;
     Faraday.schedule_bigstring t data
 
-  let write_stream t ~stream_id ~offset ~length ~data =
+  let write_stream t ~stream_id ~fragment =
+    let { IOVec.off; len; buffer } = fragment in
     write_variable_length_integer t stream_id;
-    if offset > 0 then
-      write_variable_length_integer t offset;
-    if length > 0 then
-      write_variable_length_integer t length;
-    Faraday.schedule_bigstring t data
+    if off > 0 then
+      write_variable_length_integer t off;
+    if len > 0 then
+      write_variable_length_integer t len;
+    Faraday.schedule_bigstring t buffer
 
   let write_max_data t ~max = write_variable_length_integer t max
 
@@ -132,7 +134,7 @@ module Frame = struct
     =
     write_variable_length_integer t sequence_no;
     write_variable_length_integer t retire_prior_to;
-    Faraday.write_uint8 t cid.Packet.CID.length;
+    Faraday.write_uint8 t cid.CID.length;
     Faraday.write_string t cid.id;
     Faraday.write_string t stateless_reset_token
 
@@ -173,12 +175,12 @@ module Frame = struct
       write_reset_stream t ~stream_id ~application_protocol_error ~final_size
     | Stop_sending { stream_id; application_protocol_error } ->
       write_stop_sending t ~stream_id ~application_protocol_error
-    | Crypto { offset; length; data } ->
-      write_crypto t ~offset ~length ~data
+    | Crypto fragment ->
+      write_crypto t ~fragment
     | New_token { length; data } ->
       write_new_token t ~length ~data
-    | Stream { stream_id; length; offset; data; _ } ->
-      write_stream t ~stream_id ~length ~offset ~data
+    | Stream { stream_id; fragment; _ } ->
+      write_stream t ~stream_id ~fragment
     | Max_data max ->
       write_max_data t ~max
     | Max_stream_data { stream_id; max_data } ->
@@ -215,40 +217,35 @@ module Frame = struct
       assert false
 end
 
-module Packet = struct
+module Pkt = struct
   module Header = struct
     let write_connection_ids t ~source_cid ~dest_cid =
-      Faraday.write_uint8 t dest_cid.Packet.CID.length;
+      Faraday.write_uint8 t dest_cid.CID.length;
       Faraday.write_string t dest_cid.id;
-      Faraday.write_uint8 t source_cid.Packet.CID.length;
+      Faraday.write_uint8 t source_cid.CID.length;
       Faraday.write_string t source_cid.id
 
-    let write_version_negotiation_packet t ~versions ~source_cid ~dest_cid =
-      (* From RFC<QUIC-RFC>§17.2:
-       *   Header Form: The most significant bit (0x80) of byte 0 (the first
-       *                byte) is set to 1 for long headers.
-       *
-       *   Fixed Bit: The next bit (0x40) of byte 0 is set to 1. Packets
-       *              containing a zero value for this bit are not valid
-       *              packets in this version and MUST be discarded. *)
-      let form_and_fixed_bits = 0b11000000 in
-      Faraday.write_uint8 t form_and_fixed_bits;
-      (* From RFC<QUIC-RFC>§17.2.1:
-       *   The Version field of a Version Negotiation packet MUST be set to
-       *   0x00000000. *)
-      Faraday.write_string t "\x00\x00\x00\x00";
-      write_connection_ids t ~source_cid ~dest_cid;
-      List.iter (fun version -> Faraday.BE.write_uint32 t version) versions
-
-    let write_long_header t ~pn_length ~header ~packet_type ~payload_length =
-      let write_payload_length t ~packet_type len =
-        match packet_type with
-        | Packet.Type.Initial | Zero_RTT | Handshake ->
-          write_variable_length_integer t len
-        | Retry ->
-          ()
+    let write_packet_number t ~pn_length ~packet_number =
+      let packet_number =
+        Int64.to_int (Int64.logand packet_number 0xFFFFFFFFL)
       in
-      assert (1 >= pn_length && pn_length <= 4);
+      let pn_bytes = decomp pn_length [] packet_number in
+      List.iter (fun byte -> Faraday.write_uint8 t byte) pn_bytes
+
+    let write_payload_length t ~pn_length ~packet_type len =
+      match packet_type with
+      | Packet.Type.Initial | Zero_RTT | Handshake ->
+        (* From RFC<QUIC-RFC>§17.2:
+         * Length: The length of the remainder of the packet (that is, the
+         *         Packet Number and Payload fields) in bytes, encoded as a
+         *         variable-length integer (Section 16). *)
+        write_variable_length_integer t (pn_length + len)
+      | Retry ->
+        ()
+
+    let write_long_header t ~pn_length ~header =
+      let packet_type = Packet.Header.long_packet_type header in
+      assert (1 <= pn_length && pn_length <= 4);
       (* From RFC<QUIC-RFC>§17.2:
        *   Header Form: The most significant bit (0x80) of byte 0 (the first
        *                byte) is set to 1 for long headers.
@@ -272,7 +269,13 @@ module Packet = struct
       let first_byte =
         match packet_type with
         | Initial | Zero_RTT | Handshake ->
-          first_byte lor (pn_length land 0b11)
+          (* From RFC<QUIC-RFC>§17.2:
+           *   In packet types which contain a Packet Number field, the least
+           *   significant two bits (those with a mask of 0x03) of byte 0
+           *   contain the length of the packet number, encoded as an unsigned,
+           *   two-bit integer that is one less than the length of the packet
+           *   number field in bytes. *)
+          first_byte lor ((pn_length - 1) land 0b11)
         | Retry ->
           (* last 4 bits are unused. *)
           first_byte
@@ -283,16 +286,10 @@ module Packet = struct
         Faraday.BE.write_uint32 t version;
         write_connection_ids t ~source_cid ~dest_cid;
         write_variable_length_integer t (String.length token);
-        Faraday.write_string t token;
-        (* From RFC<QUIC-RFC>§17.2:
-         * Length: The length of the remainder of the packet (that is, the
-         *         Packet Number and Payload fields) in bytes, encoded as a
-         *         variable-length integer (Section 16). *)
-        write_variable_length_integer t (payload_length + pn_length)
+        Faraday.write_string t token
       | Long { version; source_cid; dest_cid; _ } ->
         Faraday.BE.write_uint32 t version;
-        write_connection_ids t ~source_cid ~dest_cid;
-        write_payload_length t ~packet_type (payload_length + pn_length)
+        write_connection_ids t ~source_cid ~dest_cid
       | Short _ ->
         assert false
 
@@ -312,57 +309,73 @@ module Packet = struct
        *                  protection; see Section 5.4 of [QUIC-TLS]. The value
        *                  included prior to protection MUST be set to 0. *)
       assert (first_byte land 0b00011000 = 0);
-      Faraday.write_string t dest_cid.Packet.CID.id
+      Faraday.write_string t dest_cid.CID.id
 
-    let write_packet_payload t ~pn_length ~packet_number payload =
-      (* From RFC<QUIC-RFC>§17.1:
-       *   When present in long or short packet headers, they are encoded in 1
-       *   to 4 bytes. The number of bits required to represent the packet
-       *   number is reduced by including the least significant bits of the
-       *   packet number. *)
-      let packet_number =
-        Int64.to_int (Int64.logand packet_number 0xFFFFFFFFL)
-      in
-      let pn_bytes = decomp pn_length [] packet_number in
-      List.iter (fun byte -> Faraday.write_uint8 t byte) pn_bytes;
-      Faraday.schedule_bigstring t payload
-
-    let write_retry_payload t ~token ~tag =
-      Faraday.write_string t token;
-      Faraday.write_string t tag
-
-    let write_packet t packet =
-      match packet with
-      | Packet.VersionNegotiation { source_cid; dest_cid; versions } ->
-        write_version_negotiation_packet t ~source_cid ~dest_cid ~versions
-      | Frames { header; payload_length; payload; packet_number; _ } ->
-        (* TODO: proper packet number length *)
-        (match header with
-        | Initial _ ->
-          write_long_header
-            t
-            ~pn_length:4
-            ~header
-            ~packet_type:Initial
-            ~payload_length
-        | Long { packet_type; _ } ->
-          write_long_header t ~pn_length:4 ~header ~packet_type ~payload_length
-        | Short { dest_cid } ->
-          write_short_header t ~pn_length:4 ~dest_cid);
-        write_packet_payload t ~pn_length:4 ~packet_number payload
-      | Retry { header; token; tag; _ } ->
-        write_long_header
-          t
-          ~pn_length:4
-          ~header
-          ~packet_type:Retry
-          ~payload_length:0;
-        write_retry_payload t ~token ~tag
+    let write_packet_header t ~header =
+      (* TODO: proper packet number length *)
+      match header with
+      | Packet.Header.Initial _ | Long _ ->
+        write_long_header t ~pn_length:4 ~header
+      | Short { dest_cid } ->
+        write_short_header t ~pn_length:4 ~dest_cid
   end
+
+  let write_version_negotiation_packet t ~versions ~source_cid ~dest_cid =
+    (* From RFC<QUIC-RFC>§17.2:
+     *   Header Form: The most significant bit (0x80) of byte 0 (the first
+     *                byte) is set to 1 for long headers.
+     *
+     *   Fixed Bit: The next bit (0x40) of byte 0 is set to 1. Packets
+     *              containing a zero value for this bit are not valid
+     *              packets in this version and MUST be discarded. *)
+    let form_and_fixed_bits = 0b11000000 in
+    Faraday.write_uint8 t form_and_fixed_bits;
+    (* From RFC<QUIC-RFC>§17.2.1:
+     *   The Version field of a Version Negotiation packet MUST be set to
+     *   0x00000000. *)
+    Faraday.write_string t "\x00\x00\x00\x00";
+    Header.write_connection_ids t ~source_cid ~dest_cid;
+    List.iter (fun version -> Faraday.BE.write_uint32 t version) versions
+
+  let write_packet_payload t payload =
+    (* From RFC<QUIC-RFC>§17.1:
+     *   When present in long or short packet headers, they are encoded in 1
+     *   to 4 bytes. The number of bits required to represent the packet
+     *   number is reduced by including the least significant bits of the
+     *   packet number. *)
+    Faraday.schedule_bigstring t payload
+
+  let write_retry_payload t ~token ~tag =
+    Faraday.write_string t token;
+    Faraday.write_string t tag
+
+  let write_packet t packet =
+    match packet with
+    | Packet.VersionNegotiation { source_cid; dest_cid; versions } ->
+      write_version_negotiation_packet t ~source_cid ~dest_cid ~versions
+    | Frames { header; payload_length; payload; packet_number; _ } ->
+      Header.write_packet_header t ~header;
+      Header.write_payload_length
+        t
+        ~pn_length:4
+        ~packet_type:(Packet.Header.long_packet_type header)
+        payload_length;
+      Header.write_packet_number t ~pn_length:4 ~packet_number;
+      write_packet_payload t payload
+    | Retry { header; token; tag; _ } ->
+      Header.write_long_header t ~pn_length:4 ~header;
+      write_retry_payload t ~token ~tag
 end
 
 module Writer = struct
   open Faraday
+
+  type header_info =
+    { version : int32
+    ; source_cid : CID.t
+    ; dest_cid : CID.t
+    ; token : string
+    }
 
   type t =
     { buffer : Bigstringaf.t
@@ -382,6 +395,86 @@ module Writer = struct
     let buffer = Bigstringaf.create buffer_size in
     let encoder = Faraday.of_bigstring buffer in
     { buffer; encoder; drained_bytes = 0; wakeup = Optional_thunk.none }
+
+  (* From RFC<QUIC-RFC>§15:
+   *   Version numbers used to identify IETF drafts are created by adding the
+   *   draft number to 0xff000000. For example, draft-ietf-quic-transport-13
+   *   would be identified as 0xff00000D.
+   *
+   * 29 (dec) = 0x1d
+   *
+   * 0xff000000 + 0x1d = 0xff00001d *)
+  let make_header_info
+      ?(source_cid = CID.empty) ?(version = 0xFF00001Dl) ?(token = "") dest_cid
+    =
+    { version; source_cid; dest_cid; token }
+
+  (* From RFC<QUIC-TLS-RFC>§4:
+   *
+   *     +---------------------+-----------------+------------------+
+   *     | Packet Type         | Encryption Keys | PN Space         |
+   *     +=====================+=================+==================+
+   *     | Initial             | Initial secrets | Initial          |
+   *     +---------------------+-----------------+------------------+
+   *     | 0-RTT Protected     | 0-RTT           | Application data |
+   *     +---------------------+-----------------+------------------+
+   *     | Handshake           | Handshake       | Handshake        |
+   *     +---------------------+-----------------+------------------+
+   *     | Retry               | Retry           | N/A              |
+   *     +---------------------+-----------------+------------------+
+   *     | Version Negotiation | N/A             | N/A              |
+   *     +---------------------+-----------------+------------------+
+   *     | Short Header        | 1-RTT           | Application data |
+   *     +---------------------+-----------------+------------------+
+   *
+   *               Table 1: Encryption Keys by Packet Type
+   *)
+  let header_of_encryption_level
+      ~encryption_level { version; source_cid; dest_cid; token }
+    =
+    match encryption_level with
+    | Encryption_level.Initial ->
+      Packet.Header.Initial { version; source_cid; dest_cid; token }
+    | Zero_RTT ->
+      Long { version; source_cid; dest_cid; packet_type = Zero_RTT }
+    | Handshake ->
+      Long { version; source_cid; dest_cid; packet_type = Handshake }
+    | Application_data ->
+      Short { dest_cid }
+
+  let write_frames_packet
+      t ~encdec ~encryption_level ~header_info ~packet_number frames
+    =
+    let tmpf = Faraday.create 0x400 in
+    List.iter (Frame.write_frame tmpf) frames;
+    let frames = Faraday.serialize_to_bigstring tmpf in
+    let tmpf = Faraday.create 0x400 in
+    Pkt.write_packet_payload tmpf frames;
+    let plaintext = Cstruct.of_bigarray (Faraday.serialize_to_bigstring tmpf) in
+    (* AEAD ciphertext length is the same as the plaintext length (+ tag). *)
+    let payload_length =
+      Cstruct.len plaintext + encdec.Crypto.encrypter.tag_len
+    in
+    let header = header_of_encryption_level ~encryption_level header_info in
+    let hf = Faraday.create 0x100 in
+    Pkt.Header.write_long_header hf ~pn_length:4 ~header;
+    Pkt.Header.write_payload_length
+      hf
+      ~pn_length:4
+      ~packet_type:(Packet.Header.long_packet_type header)
+      payload_length;
+    Pkt.Header.write_packet_number hf ~pn_length:4 ~packet_number;
+    let unprotected_header =
+      Cstruct.of_bigarray (Faraday.serialize_to_bigstring hf)
+    in
+    let protected =
+      Crypto.AEAD.encrypt_packet
+        encdec.encrypter
+        ~packet_number
+        ~header:unprotected_header
+        plaintext
+    in
+    Faraday.schedule_bigstring t.encoder (Cstruct.to_bigarray protected)
 
   let faraday t = t.encoder
 

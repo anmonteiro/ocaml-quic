@@ -279,20 +279,14 @@ type t =
       { stream_id : int
       ; application_protocol_error : int
       }
-  | Crypto of
-      { offset : int
-      ; length : int
-      ; data : Bigstringaf.t
-      }
+  | Crypto of Ordered_stream.fragment
   | New_token of
       { length : int
       ; data : Bigstringaf.t
       }
   | Stream of
       { stream_id : int
-      ; length : int
-      ; offset : int
-      ; data : Bigstringaf.t
+      ; fragment : Ordered_stream.fragment
       ; is_fin : bool
       }
   | Max_data of int
@@ -308,7 +302,7 @@ type t =
       }
   | Streams_blocked of Direction.t * int
   | New_connection_id of
-      { cid : Packet.CID.t
+      { cid : CID.t
       ; stateless_reset_token : string
       ; retire_prior_to : int
       ; sequence_no : int
@@ -343,8 +337,8 @@ let to_frame_type = function
     Crypto
   | New_token _ ->
     New_token
-  | Stream { length; offset; is_fin; _ } ->
-    Stream { off = offset <> 0; len = length <> 0; fin = is_fin }
+  | Stream { fragment = { IOVec.len; off; _ }; is_fin; _ } ->
+    Stream { off = off <> 0; len = len <> 0; fin = is_fin }
   | Max_data _ ->
     Max_data
   | Max_stream_data _ ->
