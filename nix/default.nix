@@ -67,6 +67,10 @@ in
           fiat-p256
           logs
           hkdf
+
+          # TLS tests
+          ounit
+          cstruct-unix
         ];
       };
 
