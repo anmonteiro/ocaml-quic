@@ -6,7 +6,7 @@ open Handshake_common
 
 open Handshake_crypto13
 
-let answer_client_hello ~hrr state ch raw =
+let answer_client_hello ?embed_quic_transport_params ~hrr state ch raw =
   (match client_hello_valid `TLS_1_3 ch with
    | `Error e -> fail (`Fatal (`InvalidClientHello e))
    | `Ok -> return () ) >>= fun () ->
@@ -221,19 +221,30 @@ let answer_client_hello ~hrr state ch raw =
       alpn_protocol config ch >>= fun alpn_protocol ->
       let session =
         let own_name = match hostname with None -> None | Some x -> Some (Domain_name.to_string x) in
+        let quic_transport_parameters = map_find ~f:(function
+         | `QUICTransportParameters buf -> Some buf
+         | _ -> None) ch.extensions
+        in
         let common_session_data13 = { session.common_session_data13 with
                                       own_name = own_name ; own_certificate = chain ;
                                       own_private_key = Some priv ; alpn_protocol }
         in
-        { session with common_session_data13 }
+        { session with common_session_data13; quic_transport_parameters }
       in
 
       let ee =
         let hostname_ext = option [] (fun _ -> [`Hostname]) hostname
         and alpn = option [] (fun proto -> [`ALPN proto]) alpn_protocol
         and early_data = if can_use_early_data && config.Config.zero_rtt <> 0l then [ `EarlyDataIndication ] else []
+        and quic_transport_params_ext = match embed_quic_transport_params with
+         | Some embed_quic_transport_params ->
+           begin match embed_quic_transport_params session.quic_transport_parameters with
+           | Some server_params -> [ `QUICTransportParameters server_params ]
+           | None -> []
+           end
+         | None -> []
         in
-        EncryptedExtensions (hostname_ext @ alpn @ early_data)
+        EncryptedExtensions (hostname_ext @ alpn @ early_data @ quic_transport_params_ext)
       in
       (* TODO also max_fragment_length ; client_certificate_url ; trusted_ca_keys ; user_mapping ; client_authz ; server_authz ; cert_type ; use_srtp ; heartbeat ; alpn ; status_request_v2 ; signed_cert_timestamp ; client_cert_type ; server_cert_type *)
       let ee_raw = Writer.assemble_handshake ee in
@@ -449,14 +460,14 @@ let handle_key_update state req =
     Ok (state', `Change_dec client_ctx :: out)
   | _ -> fail (`Fatal `InvalidSession)
 
-let handle_handshake cs hs buf =
+let handle_handshake ?embed_quic_transport_params cs hs buf =
   let open Reader in
   match parse_handshake buf with
   | Ok handshake ->
      Tracing.sexpf ~tag:"handshake-in" ~f:sexp_of_tls_handshake handshake;
      (match cs, handshake with
       | AwaitClientHelloHRR13, ClientHello ch ->
-        answer_client_hello ~hrr:true hs ch buf
+        answer_client_hello ?embed_quic_transport_params ~hrr:true hs ch buf
       | AwaitClientCertificate13 (sd, cf, cc, st, log), Certificate cert ->
         answer_client_certificate hs cert sd cf cc st buf log
       | AwaitClientCertificateVerify13 (sd, cf, cc, st, log), CertificateVerify cv ->

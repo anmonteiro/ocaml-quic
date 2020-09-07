@@ -52,42 +52,26 @@ let handle_change_cipher_spec = function
   | _ ->
     fun _ _ -> fail (`Fatal `UnexpectedCCS)
 
-and handle_handshake = function
+and handle_handshake ?embed_quic_transport_params = function
   | Client cs ->
     Handshake_client.handle_handshake cs
   | Server ss ->
-    Handshake_server.handle_handshake ss
+    Handshake_server.handle_handshake ?embed_quic_transport_params ss
   | Client13 cs ->
     Handshake_client13.handle_handshake cs
   | Server13 ss ->
-    Handshake_server13.handle_handshake ss
+    Handshake_server13.handle_handshake ?embed_quic_transport_params ss
 
-(* TODO: Only handle HANDSHAKE packets. *)
-let handle_packet hs buf = function
-  (* RFC 5246 -- 6.2.1.: Implementations MUST NOT send zero-length fragments of
-     Handshake, Alert, or ChangeCipherSpec content types. Zero-length fragments
-     of Application data MAY be sent as they are potentially useful as a traffic
-     analysis countermeasure. *)
-  | Packet.ALERT ->
-    Alert.handle buf >|= fun (err, out) -> hs, out, err
-  | Packet.APPLICATION_DATA ->
-    (* Quic doesn't handle AppData from TLS *)
-    fail (`Fatal `CannotHandleApplicationDataYet)
-  | Packet.CHANGE_CIPHER_SPEC ->
-    handle_change_cipher_spec hs.machina hs buf >|= fun (hs, items) ->
-    hs, items, `No_err
-  | Packet.HANDSHAKE ->
-    separate_handshakes (hs.hs_fragment <+> buf) >>= fun (hss, hs_fragment) ->
-    let hs = { hs with hs_fragment } in
-    foldM
-      (fun (hs, items) raw ->
-        handle_handshake hs.machina hs raw >|= fun (hs', items') ->
-        hs', items @ items')
-      (hs, [])
-      hss
-    >|= fun (hs, items) -> hs, items, `No_err
-  | Packet.HEARTBEAT ->
-    fail (`Fatal `NoHeartbeat)
+let handle_handshake_packet hs ?embed_quic_transport_params buf =
+  separate_handshakes (hs.hs_fragment <+> buf) >>= fun (hss, hs_fragment) ->
+  let hs = { hs with hs_fragment } in
+  foldM
+    (fun (hs, items) raw ->
+      handle_handshake ?embed_quic_transport_params hs.machina hs raw
+      >|= fun (hs', items') -> hs', items @ items')
+    (hs, [])
+    hss
+  >|= fun (hs, items) -> hs, items, `No_err
 
 let early_data s =
   match s.machina with
@@ -122,7 +106,34 @@ let decrement_early_data hs ty buf =
   else
     Ok hs
 
-let handle_raw_record state buf =
+let trace_handshake ?(s = "in") buf =
+  let open Reader in
+  match parse_handshake buf with
+  | Ok handshake ->
+    Format.eprintf
+      "handshake-%s: %a@."
+      s
+      Sexplib.Sexp.pp_hum
+      (Core.sexp_of_tls_handshake handshake)
+  | Error e ->
+    Format.eprintf
+      "READER ERR: %a@."
+      Sexplib.Sexp.pp_hum
+      (Reader.sexp_of_error e);
+    assert false
+
+let trace recs =
+  List.iter
+    (function
+      | `Change_enc _ | `Change_dec _ ->
+        ()
+      | `Record (content_type, data) ->
+        assert (content_type = Packet.HANDSHAKE);
+        trace_handshake ~s:"out" data)
+    recs
+
+let handle_raw_record ?embed_quic_transport_params state buf =
+  trace_handshake buf;
   (* From RFC<QUIC-TLS-RFC>§4.1.3:
    *   QUIC is only capable of conveying TLS handshake records in CRYPTO
    *   frames. *)
@@ -145,7 +156,9 @@ let handle_raw_record state buf =
   >>= fun () ->
   let ty = hdr.content_type in
   decrement_early_data hs ty buf >>= fun handshake ->
-  handle_packet handshake buf ty >|= fun (handshake, items, err) ->
+  handle_handshake_packet handshake ?embed_quic_transport_params buf
+  >|= fun (handshake, items, err) ->
+  (* trace items; *)
   { state with handshake }, items, err
 
 (* From RFC<QUIC-TLS-RFC>§5.3:
@@ -165,7 +178,25 @@ let server ~cert ~priv_key =
          ~ciphers:ciphersuites
          ~certificates:(`Single (Qx509.private_of_pems ~cert ~priv_key))
          ~version:(`TLS_1_3, `TLS_1_3)
+         ~alpn_protocols:[ "http/0.9" ]
          ())
   in
-  (Obj.magic server : t)
-(* TODO: transport parameters in EncryptedExtensions *)
+  (server : t)
+
+let current_cipher t : Tls.Ciphersuite.ciphersuite13 =
+  match Tls.Engine.epoch t with
+  | `InitialEpoch ->
+    failwith "don't call before handshake bytes"
+  | `Epoch { ciphersuite; _ } ->
+    match ciphersuite with
+    | #Tls.Ciphersuite.ciphersuite13 as cs13 ->
+      cs13
+    | _ ->
+      assert false
+
+let transport_params t =
+  match Tls.Engine.epoch t with
+  | `InitialEpoch ->
+    failwith "don't call before handshake bytes"
+  | `Epoch { quic_transport_parameters; _ } ->
+    quic_transport_parameters

@@ -123,6 +123,7 @@ let empty_session13 cipher = {
   resumed               = false ;
   client_app_secret     = Cstruct.empty ;
   server_app_secret     = Cstruct.empty ;
+  quic_transport_parameters = None ;
 }
 
 let common_session_data_of_epoch (epoch : epoch_data) common_session_data =
@@ -185,6 +186,7 @@ let to_client_ext_type = function
   | `PostHandshakeAuthentication -> `PostHandshakeAuthentication
   | `Cookie _              -> `Cookie
   | `PskKeyExchangeModes _ -> `PskKeyExchangeMode
+  | `QUICTransportParameters _ -> `QUICTransportParameters
 
 let to_server_ext_type = function
   | `Hostname              -> `Hostname
@@ -199,6 +201,7 @@ let to_server_ext_type = function
   | `PreSharedKey _        -> `PreSharedKey
   | `Draft _               -> `Draft
   | `SelectedVersion _     -> `SupportedVersion
+  | `QUICTransportParameters _ -> `QUICTransportParameters
 
 let extension_types t exts = List.(
   exts |> map t

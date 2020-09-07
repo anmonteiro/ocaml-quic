@@ -277,6 +277,8 @@ let assemble_encrypted_extension e =
     | `SupportedGroups groups ->
       (assemble_supported_groups (List.map group_to_named_group groups), SUPPORTED_GROUPS)
     | `EarlyDataIndication -> (create 0, EARLY_DATA)
+    | `QUICTransportParameters buf ->
+      (buf, QUIC_TRANSPORT_PARAMETERS)
     | _ -> invalid_arg "unknown extension"
 
 let assemble_retry_extension e =

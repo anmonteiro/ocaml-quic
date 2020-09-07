@@ -399,7 +399,7 @@ let agreed_version supported (client_hello : client_hello) =
     | [] -> fail (`Fatal (`NoVersions raw_client_versions))
     | _ -> fail (`Error (`NoConfiguredVersions supported_versions))
 
-let answer_client_hello state (ch : client_hello) raw =
+let answer_client_hello ?embed_quic_transport_params state (ch : client_hello) raw =
   let ensure_reneg ciphers their_data  =
     let reneg_cs = List.mem Packet.TLS_EMPTY_RENEGOTIATION_INFO_SCSV ciphers in
     match reneg_cs, their_data with
@@ -477,7 +477,7 @@ let answer_client_hello state (ch : client_hello) raw =
   in
 
   agreed_version state.config.protocol_versions ch >>= function
-  | `TLS_1_3 -> Handshake_server13.answer_client_hello ~hrr:false state ch raw
+  | `TLS_1_3 -> Handshake_server13.answer_client_hello ?embed_quic_transport_params ~hrr:false state ch raw
   | protocol_version -> process protocol_version
 
 let answer_client_hello_reneg state (ch : client_hello) raw =
@@ -535,13 +535,13 @@ let handle_change_cipher_spec ss state packet =
   | Error er, _ -> fail (`Fatal (`ReaderError er))
   | _ -> fail (`Fatal `UnexpectedCCS)
 
-let handle_handshake ss hs buf =
+let handle_handshake ?embed_quic_transport_params ss hs buf =
   match Reader.parse_handshake buf with
   | Ok handshake ->
      Tracing.sexpf ~tag:"handshake-in" ~f:sexp_of_tls_handshake handshake;
      ( match ss, handshake with
        | AwaitClientHello, ClientHello ch ->
-          answer_client_hello hs ch buf
+          answer_client_hello ?embed_quic_transport_params hs ch buf
        | AwaitClientCertificate_RSA (session, log), Certificate cs ->
           (match Reader.parse_certificates cs with
            | Ok cs -> answer_client_certificate_RSA hs session cs buf log

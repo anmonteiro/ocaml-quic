@@ -35,7 +35,7 @@ type t =
   ; id : string
   }
 
-let length = 8
+let length = 20
 
 let empty = { length = 0; id = "" }
 

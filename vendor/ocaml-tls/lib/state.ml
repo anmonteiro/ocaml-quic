@@ -148,6 +148,7 @@ type session_data13 = {
   resumed                : bool ;
   client_app_secret      : Cstruct_sexp.t ;
   server_app_secret      : Cstruct_sexp.t ;
+  quic_transport_parameters : Cstruct_sexp.t option ;
 } [@@deriving sexp]
 
 type client13_handshake_state =
@@ -301,7 +302,7 @@ type failure = [
 include Control.Or_error_make (struct type err = failure end)
 type 'a eff = 'a t
 
-let common_data_to_epoch common is_server peer_name =
+let common_data_to_epoch common is_server peer_name quic_transport_parameters =
   let own_random, peer_random =
     if is_server then
       common.server_random, common.client_random
@@ -326,12 +327,13 @@ let common_data_to_epoch common is_server peer_name =
       alpn_protocol          = common.alpn_protocol ;
       session_id             = Cstruct.empty ;
       extended_ms            = false ;
+      quic_transport_parameters ;
     } in
   epoch
 
 let epoch_of_session server peer_name protocol_version = function
   | `TLS (session : session_data) ->
-    let epoch = common_data_to_epoch session.common_session_data server peer_name in
+    let epoch = common_data_to_epoch session.common_session_data server peer_name None in
     {
       epoch with
       protocol_version       = protocol_version ;
@@ -340,7 +342,9 @@ let epoch_of_session server peer_name protocol_version = function
       extended_ms            = session.extended_ms ;
     }
   | `TLS13 (session : session_data13) ->
-    let epoch : epoch_data = common_data_to_epoch session.common_session_data13 server peer_name in
+    let epoch : epoch_data =
+      common_data_to_epoch session.common_session_data13 server peer_name session.quic_transport_parameters
+    in
     {
       epoch with
       ciphersuite            = (session.ciphersuite13 :> Ciphersuite.ciphersuite) ;

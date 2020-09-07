@@ -273,6 +273,8 @@ let parse_extension buf = function
          raise_trailing_bytes "extended master secret"
       else
         `ExtendedMasterSecret
+  | QUIC_TRANSPORT_PARAMETERS ->
+    `QUICTransportParameters buf
   | x -> `UnknownExtension (extension_type_to_int x, buf)
 
 let parse_keyshare_entry buf =
@@ -457,6 +459,8 @@ let parse_encrypted_extension raw =
          raise_trailing_bytes "server early_data"
        else
          `EarlyDataIndication
+    | Some QUIC_TRANSPORT_PARAMETERS ->
+      `QUICTransportParameters buf
     | Some x -> raise_unknown ("bad encrypted extension " ^ (extension_type_to_string x)) (* TODO maybe unknown instead? *)
     | None -> `UnknownExtension (etype, buf)
   in
