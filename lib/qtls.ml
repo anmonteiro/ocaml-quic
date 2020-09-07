@@ -133,7 +133,7 @@ let trace recs =
     recs
 
 let handle_raw_record ?embed_quic_transport_params state buf =
-  trace_handshake buf;
+  (* trace_handshake buf; *)
   (* From RFC<QUIC-TLS-RFC>§4.1.3:
    *   QUIC is only capable of conveying TLS handshake records in CRYPTO
    *   frames. *)

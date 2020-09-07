@@ -117,6 +117,8 @@ module Ord = struct
       3
 
   let compare t1 t2 = compare (to_int t1) (to_int t2)
+
+  let equal t1 t2 = compare t1 t2 = 0
 end
 
 module LMap = Map.Make (Ord)
@@ -140,6 +142,10 @@ let find_current t = LMap.find t.current t.vals
 
 let update_current f t =
   let vals' = LMap.update t.current f t.vals in
+  t.vals <- vals'
+
+let update level f t =
+  let vals' = LMap.update level f t.vals in
   t.vals <- vals'
 
 let ordered_iter f t =

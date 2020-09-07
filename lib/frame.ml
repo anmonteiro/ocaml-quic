@@ -367,3 +367,14 @@ let to_frame_type = function
     Handshake_done
   | Unknown x ->
     Unknown x
+
+(* From RFC<QUIC-RFC>§1.2:
+ *   Ack-eliciting Packet: A QUIC packet that contains frames other than ACK,
+ *                         PADDING, and CONNECTION_CLOSE. *)
+let is_ack_eliciting = function
+  | Ack _ | Padding _ | Connection_close_quic _ | Connection_close_app _ ->
+    false
+  | _all_other ->
+    true
+
+let is_any_ack_eliciting frames = List.exists is_ack_eliciting frames

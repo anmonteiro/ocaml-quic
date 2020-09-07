@@ -74,6 +74,13 @@ module Spaces = struct
       t.application_data
 end
 
+type packet_info =
+  { mutable ack_eliciting : bool
+  ; packet_number : int64
+  ; header : Packet.Header.t
+  ; outgoing_frames : Frame.t list Encryption_level.t
+  }
+
 type 'a t =
   { reader : Reader.server
   ; writer : Writer.t
@@ -96,23 +103,7 @@ type 'a t =
 
 let wakeup_writer t = Writer.wakeup t.writer
 
-(* TODO: outstanding acks (replace packet_number_to_ack) *)
-let send_packet t ~encryption_level ?packet_number_to_ack frames =
-  let frames =
-    List.rev
-      ((if packet_number_to_ack <> None then
-          [ Frame.Ack
-              { largest = Int64.to_int (Option.get packet_number_to_ack)
-              ; delay = 0
-              ; first_range = 0
-              ; ranges = []
-              ; ecn_counts = None
-              }
-          ]
-       else
-         [])
-      @ frames)
-  in
+let send_packet t ~encryption_level frames =
   Format.eprintf
     "Sending %d frames at encryption level: %a@."
     (List.length frames)
@@ -129,7 +120,34 @@ let send_packet t ~encryption_level ?packet_number_to_ack frames =
     frames;
   wakeup_writer t
 
-let process_ack_frame _t ~header ~largest ~first_range ~ranges =
+let send_packets t ~packet_info =
+  let { outgoing_frames; packet_number; header; _ } = packet_info in
+  let incoming_packet_enclevel = Encryption_level.of_header header in
+  Encryption_level.ordered_iter
+    (fun encryption_level frames ->
+      let frames =
+        if
+          packet_info.ack_eliciting
+          && Encryption_level.Ord.equal
+               incoming_packet_enclevel
+               encryption_level
+        then
+          Frame.Ack
+            { largest = Int64.to_int packet_number
+            ; delay = 0
+            ; first_range = 0
+            ; ranges = []
+            ; ecn_counts = None
+            }
+          :: frames
+        else
+          frames
+      in
+      send_packet t ~encryption_level (List.rev frames))
+    outgoing_frames
+
+let process_ack_frame _t ~packet_info ~largest ~first_range ~ranges =
+  let { header; _ } = packet_info in
   Format.eprintf
     "got ack %a %d %d %d@."
     Encryption_level.pp_hum
@@ -139,19 +157,16 @@ let process_ack_frame _t ~header ~largest ~first_range ~ranges =
     (List.length ranges);
   ()
 
-let process_tls_result ~new_tls_state ~tls_packets ~packet_number t =
+let process_tls_result t ~packet_info ~new_tls_state ~tls_packets =
+  let { outgoing_frames; _ } = packet_info in
   let current_cipher = Qtls.current_cipher new_tls_state in
-  let current_enclevel = t.encdec.current in
   (* TODO: send alert as quic error *)
-  let frames_by_enc_level =
-    Encryption_level.create ~current:t.encdec.current ()
-  in
-  let _off =
+  let (_ : Encryption_level.level * int) =
     List.fold_left
-      (fun off item ->
+      (fun (cur_encryption_level, off) item ->
         match item with
         | `Change_enc { Tls.State.traffic_secret; _ } ->
-          let next = Encryption_level.next frames_by_enc_level.current in
+          let next = Encryption_level.next cur_encryption_level in
           Encryption_level.add
             next
             { Crypto.encrypter =
@@ -159,12 +174,11 @@ let process_tls_result ~new_tls_state ~tls_packets ~packet_number t =
             ; decrypter = None
             }
             t.encdec;
-          off
+          cur_encryption_level, off
         | `Change_dec { Tls.State.traffic_secret; _ } ->
           (* decryption change signals switching to a new encryption level *)
-          let next = Encryption_level.next frames_by_enc_level.current in
+          let next = Encryption_level.next outgoing_frames.current in
           t.encdec.current <- next;
-          frames_by_enc_level.current <- next;
           Encryption_level.update_current
             (function
               | None ->
@@ -183,46 +197,35 @@ let process_tls_result ~new_tls_state ~tls_packets ~packet_number t =
            *   The offsets used by CRYPTO frames to ensure ordered delivery
            *   of cryptographic handshake data start from zero in each
            *   packet number space. *)
-          0
-        | `Record (_ct, cs) ->
+          next, 0
+        | `Record ((ct : Tls.Packet.content_type), cs) ->
+          assert (ct = HANDSHAKE);
           let len = Cstruct.len cs in
           let off' = off + len in
           let frame =
             Frame.Crypto { IOVec.off; len; buffer = Cstruct.to_bigarray cs }
           in
-          Encryption_level.update_current
+          Encryption_level.update
+            cur_encryption_level
             (function None -> Some [ frame ] | Some xs -> Some (frame :: xs))
-            frames_by_enc_level;
-          off')
+            outgoing_frames;
+          cur_encryption_level, off')
       (* TODO: it's wrong to start from 0 everytime. Need to keep track of
        * this stream's offset. *)
-      0
+      (outgoing_frames.current, 0)
       tls_packets
   in
-  (match Encryption_level.find current_enclevel frames_by_enc_level with
-  | Some frames ->
-    send_packet
-      t
-      ~encryption_level:current_enclevel
-      ~packet_number_to_ack:packet_number
-      frames;
-    Encryption_level.remove current_enclevel frames_by_enc_level
-  | None ->
-    ());
-  Encryption_level.ordered_iter
-    (fun encryption_level frames -> send_packet t ~encryption_level frames)
-    frames_by_enc_level;
   t.tls_state <- new_tls_state
 
-let process_crypto_frame t ~header ~packet_number fragment =
+let process_crypto_frame t ~packet_info fragment =
+  let { header; _ } = packet_info in
   let enclevel = Encryption_level.of_header header in
   let crypto_stream = Encryption_level.find_exn enclevel t.crypto_streams in
   Ordered_stream.add fragment crypto_stream;
   (* TODO: there might be many fragments *)
   match Ordered_stream.pop crypto_stream with
-  | Some { IOVec.off; len; buffer } ->
+  | Some { buffer; _ } ->
     let fragment_cstruct = Cstruct.of_bigarray buffer in
-    Format.eprintf "Crypto! %d %d@." off len;
     (match t.tls_state.handshake.machina with
     | Server Tls.State.AwaitClientHello | Server13 AwaitClientHelloHRR13 ->
       assert (Encryption_level.of_header header = Initial);
@@ -262,10 +265,10 @@ let process_crypto_frame t ~header ~packet_number fragment =
            with
           | Ok _ ->
             process_tls_result
+              t
+              ~packet_info
               ~new_tls_state:tls_state'
               ~tls_packets
-              ~packet_number
-              t
           | Error _ ->
             failwith "TODO: send connection error of TRANSPORT_PARAMETER_ERROR")
         | None ->
@@ -282,11 +285,7 @@ let process_crypto_frame t ~header ~packet_number fragment =
         failwith
           (Format.asprintf "Crypto failure: %a@." Sexplib.Sexp.pp_hum sexp)
       | Ok (tls_state', tls_packets, (`Alert _ | `Eof | `No_err)) ->
-        process_tls_result
-          ~new_tls_state:tls_state'
-          ~tls_packets
-          ~packet_number
-          t)
+        process_tls_result t ~packet_info ~new_tls_state:tls_state' ~tls_packets)
     | Server13 Established13 ->
       failwith "handle key updates here"
     | Server Established ->
@@ -297,17 +296,13 @@ let process_crypto_frame t ~header ~packet_number fragment =
     Format.eprintf "NOPE@.";
     ()
 
-let frame_handler ~header ~packet_number t frame =
-  Format.eprintf
-    "Frame! %d %Ld@."
-    (Frame.Type.serialize (Frame.to_frame_type frame))
-    packet_number;
+let frame_handler ~packet_info t frame =
+  if Frame.is_ack_eliciting frame then packet_info.ack_eliciting <- true;
   match frame with
-  | Frame.Padding n ->
+  | Frame.Padding _n ->
     (* From RFC<QUIC-RFC>§19.1:
      *   The PADDING frame (type=0x00) has no semantic value. PADDING frames
      *   can be used to increase the size of a packet. *)
-    Format.eprintf "how much padding: %d@." n;
     ()
   | Ping ->
     (* From RFC<QUIC-RFC>§19.2:
@@ -315,19 +310,19 @@ let frame_handler ~header ~packet_number t frame =
      *   containing this frame. *)
     ()
   | Ack { largest; first_range; ranges; _ } ->
-    process_ack_frame t ~header ~largest ~first_range ~ranges
+    process_ack_frame t ~packet_info ~largest ~first_range ~ranges
   | Reset_stream _ ->
     failwith
       (Format.asprintf
-         "frame NYI: %d"
+         "frame NYI: 0x%x"
          (Frame.Type.serialize (Frame.to_frame_type frame)))
   | Stop_sending _ ->
     failwith
       (Format.asprintf
-         "frame NYI: %d"
+         "frame NYI: 0x%x"
          (Frame.Type.serialize (Frame.to_frame_type frame)))
   | Crypto fragment ->
-    process_crypto_frame t ~header ~packet_number fragment
+    process_crypto_frame t ~packet_info fragment
   | New_token _
   | Stream _
   | Max_data _
@@ -346,42 +341,45 @@ let frame_handler ~header ~packet_number t frame =
   | Unknown _ ->
     failwith
       (Format.asprintf
-         "frame NYI: %d"
+         "frame NYI: 0x%x"
          (Frame.Type.serialize (Frame.to_frame_type frame)))
 
 let packet_handler t packet =
-  (* From RFC<QUIC-RFC>§19.6:
-   *   Upon receiving a packet, each endpoint sets the Destination Connection
-   *   ID it sends to match the value of the Source Connection ID that it
-   *   receives. *)
   if CID.is_empty t.original_dest_cid then
-    (* From RFC<QUIC-RFC>§7.2:
-     *   Upon first receiving an Initial or Retry packet from the server, the
-     *   client uses the Source Connection ID supplied by the server as the
-     *   Destination Connection ID for subsequent packets, including any 0-RTT
-     *   packets. This means that a client might have to change the connection
-     *   ID it sets in the Destination Connection ID field twice during
-     *   connection establishment: once in response to a Retry, and once in
-     *   response to an Initial packet from the server. *)
+    (* From RFC<QUIC-RFC>§7.3:
+     *   Each endpoint includes the value of the Source Connection ID field
+     *   from the first Initial packet it sent in the
+     *   initial_source_connection_id transport parameter; see Section 18.2. A
+     *   server includes the Destination Connection ID field from the first
+     *   Initial packet it received from the client in the
+     *   original_destination_connection_id transport parameter [...]. *)
     t.original_dest_cid <- Packet.destination_cid packet;
   if CID.is_empty t.dest_cid then
-    (* From RFC<QUIC-RFC>§12.3:
-     *   Each endpoint uses the Source Connection ID field to specify the
-     *   connection ID that is used in the Destination Connection ID field of
-     *   packets being sent to them. *)
+    (* From RFC<QUIC-RFC>§19.6:
+     *   Upon receiving a packet, each endpoint sets the Destination Connection
+     *   ID it sends to match the value of the Source Connection ID that it
+     *   receives. *)
     t.dest_cid <- Option.get (Packet.source_cid packet);
   match packet with
   | Packet.VersionNegotiation _ ->
     failwith "NYI: version negotiation"
   | Frames { header; payload; packet_number; _ } ->
+    let packet_info =
+      { header
+      ; packet_number
+      ; ack_eliciting = false
+      ; outgoing_frames = Encryption_level.create ~current:t.encdec.current ()
+      }
+    in
     (match
        Angstrom.parse_bigstring
          ~consume:All
-         (Parse.Frame.parser (frame_handler t ~header ~packet_number))
+         (Parse.Frame.parser (frame_handler t ~packet_info))
          payload
      with
     | Ok () ->
-      ()
+      (* packet_info should now contain frames we need to send in response. *)
+      send_packets t ~packet_info
     | Error e ->
       failwith ("Err: " ^ e))
   | Retry _ ->
