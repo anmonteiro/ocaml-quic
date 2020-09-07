@@ -48,8 +48,10 @@ module Spaces = struct
    *   Packet numbers are divided into 3 spaces in QUIC:
    *
    *   Initial space: All Initial packets (Section 17.2.2) are in this space.
+   *
    *   Handshake space: All Handshake packets (Section 17.2.4) are in this
    *                    space.
+   *
    *   Application data space: All 0-RTT and 1-RTT encrypted packets (Section
    *                           12.1) are in this space. *)
   type 'a t =

@@ -65,12 +65,12 @@ let test_quic_transport_parameters () =
   match
     Angstrom.parse_string
       ~consume:All
-      Quic.Transport_parameters.parser
+      Quic.Transport_parameters.Encoding.parser
       encoded_params
   with
   | Ok params ->
     let f = Faraday.create (String.length encoded_params) in
-    Quic.Transport_parameters.serialize f params;
+    Quic.Transport_parameters.Encoding.serialize f params;
     let serialized = Faraday.serialize_to_string f in
     Alcotest.check
       hex
