@@ -40,3 +40,17 @@ let length = 8
 let empty = { length = 0; id = "" }
 
 let is_empty t = t == empty
+
+let parse =
+  let open Angstrom in
+  (* From RFC<QUIC-RFC>§17.2:
+   *   This length is encoded as an 8-bit unsigned integer. In QUIC version 1,
+   *   this value MUST NOT exceed 20. Endpoints that receive a version 1 long
+   *   header with a value larger than 20 MUST drop the packet.  Servers SHOULD
+   *   be able to read longer connection IDs from other QUIC versions in order
+   *   to properly form a version negotiation packet. *)
+  any_uint8 >>= fun length -> lift (fun id -> { length; id }) (take length)
+
+let serialize t { length; id } =
+  Faraday.write_uint8 t length;
+  Faraday.write_string t id

@@ -81,6 +81,28 @@ let of_header = function
   | Short _ ->
     Application_data
 
+let next = function
+  | Initial ->
+    Handshake
+  | Handshake ->
+    Application_data
+  | Zero_RTT ->
+    failwith "Encryption_level.next: 0-RTT not supported"
+  | Application_data ->
+    failwith "Encryption_level.next: no level after Application Data"
+
+let to_string = function
+  | Initial ->
+    "Initial"
+  | Zero_RTT ->
+    "Zero_RTT"
+  | Handshake ->
+    "Handshake"
+  | Application_data ->
+    "Application_data"
+
+let pp_hum fmt t = Format.fprintf fmt "%s" (to_string t)
+
 module Ord = struct
   type t = level
 
@@ -104,6 +126,8 @@ type 'a t =
   ; mutable vals : 'a LMap.t
   }
 
+let create ?(current = Initial) () = { current; vals = LMap.empty }
+
 let add k v t = t.vals <- LMap.add k v t.vals
 
 let remove k t = t.vals <- LMap.remove k t.vals
@@ -118,14 +142,12 @@ let update_current f t =
   let vals' = LMap.update t.current f t.vals in
   t.vals <- vals'
 
-let create ?(current = Initial) () = { current; vals = LMap.empty }
-
-let next = function
-  | Initial ->
-    Handshake
-  | Handshake ->
-    Application_data
-  | Zero_RTT ->
-    failwith "Encryption_level.next: 0-RTT not supported"
-  | Application_data ->
-    failwith "Encryption_level.next: no level after Application Data"
+let ordered_iter f t =
+  (* From RFC<QUIC-RFC>§12.2:
+   *   Coalescing packets in order of increasing encryption levels (Initial,
+   *   0-RTT, Handshake, 1-RTT; see Section 4.1.4 of [QUIC-TLS]) makes it more
+   *   likely the receiver will be able to process all the packets in a single
+   *   pass.
+   *
+   * NOTE: Map.iter guarantees increasing ordering over the type of the keys. *)
+  LMap.iter f t.vals

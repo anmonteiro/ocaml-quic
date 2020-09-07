@@ -40,11 +40,13 @@ let test_parser () =
         ; _
         } ->
       Alcotest.(check int32) "draft-29 version" 0xff00001dl version;
-      Alcotest.(check hex)
+      Alcotest.check
+        hex
         "source connection id"
         (`Hex "c78d00d671c14508476004fd071c9227")
         (Hex.of_string source_cid.id);
-      Alcotest.(check hex)
+      Alcotest.check
+        hex
         "destination connection id"
         expected_dest_cid
         (Hex.of_string dest_cid.id);
@@ -54,6 +56,33 @@ let test_parser () =
   | Error e ->
     Alcotest.fail e
 
-let suites = [ "parser", `Quick, test_parser ]
+let test_quic_transport_parameters () =
+  let encoded_params =
+    Hex.to_string
+      (`Hex
+        "010480007530030245460404809896800504800f42400604800f42400704800f424008024064090240640a01030b01190c000f14e8302a4aab4c1dc29add56136a6f4e030e826d72")
+  in
+  match
+    Angstrom.parse_string
+      ~consume:All
+      Quic.Transport_parameters.parser
+      encoded_params
+  with
+  | Ok params ->
+    let f = Faraday.create (String.length encoded_params) in
+    Quic.Transport_parameters.serialize f params;
+    let serialized = Faraday.serialize_to_string f in
+    Alcotest.check
+      hex
+      "roundtrip"
+      (Hex.of_string encoded_params)
+      (Hex.of_string serialized)
+  | Error e ->
+    Alcotest.fail e
 
-let () = Alcotest.run "parsing" [ "parser", suites ]
+let suite =
+  [ "parser", `Quick, test_parser
+  ; "quic transport parameters", `Quick, test_quic_transport_parameters
+  ]
+
+let () = Alcotest.run "parsing" [ "parser", suite ]

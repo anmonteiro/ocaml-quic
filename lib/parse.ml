@@ -155,16 +155,11 @@ module Frame = struct
   let parse_new_connection_id_frame =
     variable_length_integer >>= fun sequence_no ->
     variable_length_integer >>= fun retire_prior_to ->
-    any_uint8 >>= fun length ->
     lift2
-      (fun conn_id stateless_reset_token ->
+      (fun cid stateless_reset_token ->
         Frame.New_connection_id
-          { cid = { CID.length; id = conn_id }
-          ; sequence_no
-          ; stateless_reset_token
-          ; retire_prior_to
-          })
-      (take length)
+          { cid; sequence_no; stateless_reset_token; retire_prior_to })
+      CID.parse
       (take 16)
 
   let parse_retire_connection_id_frame =
@@ -261,22 +256,19 @@ module Packet = struct
   module Header = struct
     module Long = struct
       let parse =
-        BE.any_int32 >>= fun version ->
-        any_uint8 >>= fun dst_len ->
-        (* From RFC<QUIC-RFC>§17.2:
-         *   This length is encoded as an 8-bit unsigned integer. In QUIC version
-         *   1, this value MUST NOT exceed 20. Endpoints that receive a version 1
-         *   long header with a value larger than 20 MUST drop the packet.
-         *   Servers SHOULD be able to read longer connection IDs from other QUIC
-         *   versions in order to properly form a version negotiation packet. *)
-        (* TODO: "drop" the packet. *)
-        take dst_len >>= fun dst_cid ->
-        any_uint8 >>= fun src_len ->
-        take src_len >>= fun src_cid ->
-        return
-          ( Packet.Version.parse version
-          , { CID.length = src_len; id = src_cid }
-          , { CID.length = dst_len; id = dst_cid } )
+        lift3
+          (fun version dst_cid src_cid ->
+            (* From RFC<QUIC-RFC>§17.2:
+             *   In QUIC version 1, this value MUST NOT exceed 20. Endpoints that
+             *   receive a version 1 long header with a value larger than 20 MUST
+             *   drop the packet.  Servers SHOULD be able to read longer connection
+             *   IDs from other QUIC versions in order to properly form a version
+             *   negotiation packet. *)
+            (* TODO: "drop" the packet. *)
+            Packet.Version.parse version, src_cid, dst_cid)
+          BE.any_int32
+          CID.parse
+          CID.parse
     end
 
     module Short = struct

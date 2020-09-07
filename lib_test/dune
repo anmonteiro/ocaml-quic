@@ -1,3 +1,9 @@
 (tests
  (names test_server test_packet_protection test_parser)
- (libraries alcotest hex quic tls mirage-crypto-rng.unix fmt.tty logs.fmt))
+ (libraries alcotest hex quic tls mirage-crypto-rng.unix fmt.tty logs.fmt)
+ (deps
+  (source_tree ../certificates))
+ (action
+  (chdir
+   ../
+   (run %{test}))))

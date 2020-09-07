@@ -134,8 +134,7 @@ module Frame = struct
     =
     write_variable_length_integer t sequence_no;
     write_variable_length_integer t retire_prior_to;
-    Faraday.write_uint8 t cid.CID.length;
-    Faraday.write_string t cid.id;
+    CID.serialize t cid;
     Faraday.write_string t stateless_reset_token
 
   let write_retire_connection_id t ~sequence_no =
@@ -220,10 +219,8 @@ end
 module Pkt = struct
   module Header = struct
     let write_connection_ids t ~source_cid ~dest_cid =
-      Faraday.write_uint8 t dest_cid.CID.length;
-      Faraday.write_string t dest_cid.id;
-      Faraday.write_uint8 t source_cid.CID.length;
-      Faraday.write_string t source_cid.id
+      CID.serialize t dest_cid;
+      CID.serialize t source_cid
 
     let write_packet_number t ~pn_length ~packet_number =
       let packet_number =
