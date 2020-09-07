@@ -106,7 +106,7 @@ module Client_initial = struct
     let data = Cstruct.of_string unprotected_payload in
     let header = Cstruct.of_string unprotected_header in
     let sealed_payload =
-      encrypter.encrypt_payload ~packet_number ~header data
+      AEAD.encrypt_payload encrypter ~packet_number ~header data
     in
     let sample = Cstruct.sub sealed_payload 0 16 in
     Alcotest.check
@@ -114,7 +114,7 @@ module Client_initial = struct
       "sample"
       (`Hex "fb66bc5f93032b7ddd89fe0ff15d9c4f")
       (Hex.of_cstruct sample);
-    let header = encrypter.encrypt_header ~sample header in
+    let header = AEAD.encrypt_header encrypter ~sample header in
     Alcotest.check
       hex
       "header"
@@ -157,7 +157,7 @@ module Server_initial = struct
     let data = Cstruct.of_string unprotected_payload in
     let header = Cstruct.of_string unprotected_header in
     let sealed_payload =
-      encrypter.encrypt_payload ~packet_number ~header data
+      AEAD.encrypt_payload encrypter ~packet_number ~header data
     in
     let sample = Cstruct.sub sealed_payload 2 16 in
     Alcotest.check
@@ -165,7 +165,7 @@ module Server_initial = struct
       "sample"
       (`Hex "823a5d3a1207c86ee49132824f046524")
       (Hex.of_cstruct sample);
-    let header = encrypter.encrypt_header ~sample header in
+    let header = AEAD.encrypt_header encrypter ~sample header in
     Alcotest.check
       hex
       "header"
@@ -255,7 +255,8 @@ module ChaCha = struct
     let packet_number = 654360564L in
     let encrypter = AEAD.make ~ciphersuite:`CHACHA20_POLY1305_SHA256 secret in
     let sealed_payload =
-      encrypter.encrypt_payload
+      AEAD.encrypt_payload
+        encrypter
         ~packet_number
         ~header:(Hex.to_cstruct unprotected_header)
         unprotected_payload
@@ -267,7 +268,7 @@ module ChaCha = struct
       (Hex.of_cstruct sealed_payload);
     let sample = Cstruct.sub sealed_payload 1 16 in
     let header =
-      encrypter.encrypt_header ~sample (Hex.to_cstruct unprotected_header)
+      AEAD.encrypt_header encrypter ~sample (Hex.to_cstruct unprotected_header)
     in
     Alcotest.check
       hex
@@ -307,7 +308,8 @@ module InitialAEAD_encryption = struct
     assert (Cstruct.len sample = 16);
     let header =
       (* the first byte and the last 4 bytes should be encrypted *)
-      client_encrypter.encrypt_header
+      AEAD.encrypt_header
+        client_encrypter
         ~sample
         (Cstruct.of_string unprotected_header)
     in
@@ -354,7 +356,9 @@ module InitialAEAD_encryption = struct
            unprotected_header
            (Cstruct.len header - pn_length)
            pn_length);
-    let decrypted_header = client_encrypter.decrypt_header ~sample header in
+    let decrypted_header =
+      AEAD.decrypt_header client_encrypter ~sample header
+    in
     Alcotest.check
       hex
       "decrypted_header matches unprotected_header"
@@ -363,7 +367,8 @@ module InitialAEAD_encryption = struct
     let server_encrypter = InitialAEAD.make ~mode:Server conn_id in
     let header =
       (* the first byte and the last 4 bytes should be encrypted *)
-      server_encrypter.encrypt_header
+      AEAD.encrypt_header
+        server_encrypter
         ~sample
         (Cstruct.of_string unprotected_header)
     in
@@ -386,7 +391,9 @@ module InitialAEAD_encryption = struct
            unprotected_header
            (Cstruct.len header - pn_length)
            pn_length);
-    let decrypted_header = server_encrypter.decrypt_header ~sample header in
+    let decrypted_header =
+      AEAD.decrypt_header server_encrypter ~sample header
+    in
     Alcotest.check
       hex
       "decrypted_header matches unprotected_header"
@@ -555,17 +562,17 @@ end
 module ChaCha20_encryption = struct
   let test_chacha20_header_encryption_decryption () =
     let client_encrypter =
-      AEAD.make
-        ~conn_id_len:0
-        ~ciphersuite:`CHACHA20_POLY1305_SHA256
-        ChaCha.secret
+      { (AEAD.make ~ciphersuite:`CHACHA20_POLY1305_SHA256 ChaCha.secret) with
+        conn_id_len = 0
+      }
     in
     let unprotected_header = Client_initial.unprotected_header in
     let sample = Cstruct.of_hex "655e5cd55c41f69080575d7999c25a5b" in
     assert (Cstruct.len sample = 16);
     let header =
       (* the first byte and the last 4 bytes should be encrypted *)
-      client_encrypter.encrypt_header
+      AEAD.encrypt_header
+        client_encrypter
         ~sample
         (Cstruct.of_string unprotected_header)
     in
@@ -591,7 +598,9 @@ module ChaCha20_encryption = struct
            unprotected_header
            (Cstruct.len header - pn_length)
            pn_length);
-    let decrypted_header = client_encrypter.decrypt_header ~sample header in
+    let decrypted_header =
+      AEAD.decrypt_header client_encrypter ~sample header
+    in
     Alcotest.check
       hex
       "decrypted_header matches unprotected_header"
@@ -601,10 +610,9 @@ module ChaCha20_encryption = struct
   let test_chacha20_packet_encryption_decryption () =
     let packet_number = 654360564L in
     let encrypter =
-      AEAD.make
-        ~conn_id_len:0
-        ~ciphersuite:`CHACHA20_POLY1305_SHA256
-        ChaCha.secret
+      { (AEAD.make ~ciphersuite:`CHACHA20_POLY1305_SHA256 ChaCha.secret) with
+        conn_id_len = 0
+      }
     in
     let unprotected_header = Hex.to_cstruct ChaCha.unprotected_header in
     let protected_packet =

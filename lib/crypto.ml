@@ -170,19 +170,17 @@ module AEAD = struct
   type t =
     { conn_id_len : int
     ; cipher : cipher_st
-    ; encrypt_payload :
-        packet_number:int64 -> header:Cstruct.t -> Cstruct.t -> Cstruct.t
-    ; decrypt_payload :
-        packet_number:int64 -> header:Cstruct.t -> Cstruct.t -> Cstruct.t option
-    ; encrypt_header : sample:Cstruct.t -> Cstruct.t -> Cstruct.t
-    ; decrypt_header : sample:Cstruct.t -> Cstruct.t -> Cstruct.t
+    ; ciphersuite : Tls.Ciphersuite.aead_cipher
+    ; hp_key : Cstruct.t
+    ; iv : Cstruct.t
     }
 
   let tag_len t =
     let (AEAD { cipher; _ }) = t.cipher in
     Tls.Crypto.tag_len cipher
 
-  let encrypt_payload (AEAD { cipher; key }) ~iv ~packet_number ~header data =
+  let encrypt_payload t ~packet_number ~header data =
+    let { cipher = AEAD { cipher; key }; iv; _ } = t in
     (* From RFC<QUIC-TLS-RFC>§5.3:
      *   The nonce, N, is formed by combining the packet protection IV with the
      *   packet number. The 62 bits of the reconstructed QUIC packet number in
@@ -201,9 +199,8 @@ module AEAD = struct
       ~adata:header
       data
 
-  let decrypt_payload
-      (AEAD { cipher; key }) ~iv ~packet_number ~header ciphertext
-    =
+  let decrypt_payload t ~packet_number ~header ciphertext =
+    let { cipher = AEAD { cipher; key }; iv; _ } = t in
     (* From RFC<QUIC-TLS-RFC>§5.3:
      *   The nonce, N, is formed by combining the packet protection IV with the
      *   packet number. The 62 bits of the reconstructed QUIC packet number in
@@ -350,7 +347,7 @@ module AEAD = struct
        *)
       1 + conn_id_len + 4
 
-  let decrypt_header ?(conn_id_len = CID.length) ~mask header =
+  let decrypt_header ~conn_id_len ~mask header =
     (* From RFC<QUIC-TLS-RFC>§5.4.1:
      *   The output of this algorithm is a 5 byte mask which is applied to the
      *   protected header fields using exclusive OR. *)
@@ -384,8 +381,50 @@ module AEAD = struct
     done;
     header
 
+  module AES_ECB = Mirage_crypto.Cipher_block.AES.ECB
+
+  let encrypt_or_decrypt_header_ecb t f ~sample header =
+    (* From RFC<QUIC-TLS-RFC>§5.4.3:
+     *   mask = AES-ECB(hp_key, sample) *)
+    let mask = AES_ECB.encrypt ~key:(AES_ECB.of_secret t.hp_key) sample in
+    f ~mask header
+
+  let encrypt_or_decrypt_header_chacha20 t f ~sample header =
+    let module Chacha20 = Mirage_crypto.Chacha20 in
+    (* From RFC<QUIC-TLS-RFC>§5.4.3:
+     *   counter = sample[0..3]
+     *   nonce = sample[4..15]
+     *   mask = ChaCha20(hp_key, counter, nonce, {0,0,0,0,0}) *)
+    let counter = Cstruct.sub sample 0 4 in
+    let nonce = Cstruct.sub sample 4 12 in
+    let ctr =
+      Int64.logand
+        (Int64.of_int32 (Cstruct.LE.get_uint32 counter 0))
+        0x00000000FFFFFFFFL
+    in
+    let mask =
+      Chacha20.crypt
+        ~key:(Chacha20.of_secret t.hp_key)
+        ~nonce
+        ~ctr
+        (Cstruct.create 5)
+    in
+    f ~mask header
+
+  let encrypt_or_decrypt_header t f =
+    match t.ciphersuite with
+    | Tls.Ciphersuite.AES_128_GCM | AES_256_GCM | AES_128_CCM | AES_256_CCM ->
+      encrypt_or_decrypt_header_ecb t f
+    | CHACHA20_POLY1305 ->
+      encrypt_or_decrypt_header_chacha20 t f
+
+  let encrypt_header t = encrypt_or_decrypt_header t encrypt_header
+
+  let decrypt_header t =
+    encrypt_or_decrypt_header t (decrypt_header ~conn_id_len:t.conn_id_len)
+
   let encrypt_packet t ~packet_number ~header data =
-    let sealed_payload = t.encrypt_payload ~packet_number ~header data in
+    let sealed_payload = encrypt_payload t ~packet_number ~header data in
     let offset =
       (* From RFC<QUIC-TLS-RFC>§5.4.2:
        *  This results in needing at least 3 bytes of frames in the unprotected
@@ -394,7 +433,7 @@ module AEAD = struct
       4 - packet_number_length header
     in
     let sample = Cstruct.sub sealed_payload offset 16 in
-    let header = t.encrypt_header ~sample header in
+    let header = encrypt_header t ~sample header in
     Cstruct.append header sealed_payload
 
   type ret =
@@ -406,10 +445,9 @@ module AEAD = struct
 
   (* Ciphertext includes header + payload *)
   let decrypt_packet t ~largest_pn ciphertext =
-    let conn_id_len = t.conn_id_len in
-    let offset = sample_offset ~conn_id_len ciphertext in
+    let offset = sample_offset ~conn_id_len:t.conn_id_len ciphertext in
     let sample = Cstruct.sub ciphertext offset 16 in
-    let header = t.decrypt_header ~sample ciphertext in
+    let header = decrypt_header t ~sample ciphertext in
     let pn_length = packet_number_length header in
     let off = offset - 4 in
     let truncated_pn =
@@ -435,50 +473,13 @@ module AEAD = struct
       Cstruct.split ciphertext ~start:0 (offset - 4 + pn_length)
     in
     let plaintext_payload =
-      t.decrypt_payload ~packet_number:pn ~header ciphertext
+      decrypt_payload t ~packet_number:pn ~header ciphertext
     in
     match plaintext_payload with
     | Some plaintext ->
       Some { pn_length; packet_number = pn; header; plaintext }
     | None ->
       None
-
-  module AES_ECB = Mirage_crypto.Cipher_block.AES.ECB
-
-  let encrypt_or_decrypt_header_ecb ~hp_key f ~sample header =
-    (* From RFC<QUIC-TLS-RFC>§5.4.3:
-     *   mask = AES-ECB(hp_key, sample) *)
-    let mask = AES_ECB.encrypt ~key:(AES_ECB.of_secret hp_key) sample in
-    f ~mask header
-
-  let encrypt_or_decrypt_header_chacha20 ~hp_key f ~sample header =
-    let module Chacha20 = Mirage_crypto.Chacha20 in
-    (* From RFC<QUIC-TLS-RFC>§5.4.3:
-     *   counter = sample[0..3]
-     *   nonce = sample[4..15]
-     *   mask = ChaCha20(hp_key, counter, nonce, {0,0,0,0,0}) *)
-    let counter = Cstruct.sub sample 0 4 in
-    let nonce = Cstruct.sub sample 4 12 in
-    let ctr =
-      Int64.logand
-        (Int64.of_int32 (Cstruct.LE.get_uint32 counter 0))
-        0x00000000FFFFFFFFL
-    in
-    let mask =
-      Chacha20.crypt
-        ~key:(Chacha20.of_secret hp_key)
-        ~nonce
-        ~ctr
-        (Cstruct.create 5)
-    in
-    f ~mask header
-
-  let encrypt_or_decrypt_header ~ciphersuite ~hp_key f =
-    match ciphersuite with
-    | Tls.Ciphersuite.AES_128_GCM | AES_256_GCM | AES_128_CCM | AES_256_CCM ->
-      encrypt_or_decrypt_header_ecb ~hp_key f
-    | CHACHA20_POLY1305 ->
-      encrypt_or_decrypt_header_chacha20 ~hp_key f
 
   let get_cipher_st : Tls.Ciphersuite.aead_cipher -> Cstruct.t -> cipher_st =
    fun ciphersuite secret ->
@@ -490,28 +491,15 @@ module AEAD = struct
     | CBC _ ->
       assert false
 
-  let make ?(conn_id_len = CID.length) ~ciphersuite secret =
+  let make ~ciphersuite secret =
     let ciphersuite13 = Tls.Ciphersuite.privprot13 ciphersuite in
     let hash = Tls.Ciphersuite.hash13 ciphersuite in
     let kn, ivn = Tls.Ciphersuite.kn_13 ciphersuite13 in
     let key, iv = Kdf.get_key_and_iv ~hash ~kn ~ivn secret in
     let hp_key = Kdf.get_header_protection_key ~hash ~kn secret in
     let cipher = get_cipher_st ciphersuite13 key in
-    { conn_id_len
-    ; cipher
-    ; encrypt_payload = encrypt_payload cipher ~iv
-    ; decrypt_payload = decrypt_payload cipher ~iv
-    ; encrypt_header =
-        encrypt_or_decrypt_header
-          ~ciphersuite:ciphersuite13
-          ~hp_key
-          encrypt_header
-    ; decrypt_header =
-        encrypt_or_decrypt_header
-          ~ciphersuite:ciphersuite13
-          ~hp_key
-          (decrypt_header ~conn_id_len)
-    }
+    let conn_id_len = CID.length in
+    { conn_id_len; cipher; ciphersuite = ciphersuite13; iv; hp_key }
 end
 
 module InitialAEAD = struct
@@ -559,9 +547,9 @@ module InitialAEAD = struct
    *   Prior to establishing a shared secret, packets are protected with
    *   AEAD_AES_128_GCM and a key derived from the Destination Connection ID in
    *   the client's first Initial packet (see Section 5.2). *)
-  let make ?(conn_id_len = CID.length) ~mode dest_cid =
+  let make ~mode dest_cid =
     let secret = get_secret ~mode dest_cid in
-    AEAD.make ~conn_id_len ~ciphersuite:`AES_128_GCM_SHA256 secret
+    AEAD.make ~ciphersuite:`AES_128_GCM_SHA256 secret
 end
 
 module Retry = struct
