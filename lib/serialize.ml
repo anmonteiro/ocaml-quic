@@ -70,21 +70,20 @@ module Frame = struct
     let range_len = List.length ranges in
     let range_count = range_len - 1 in
     assert (range_len > 0);
-    let ranges = List.rev ranges in
     let first, rest = List.hd ranges, List.tl ranges in
-    let first_range = first.Frame.Range.last - first.first in
+    let first_range = Int64.sub first.Frame.Range.last first.first in
     let largest = first.Frame.Range.last in
-    write_variable_length_integer t largest;
+    write_variable_length_integer t (Int64.to_int largest);
     write_variable_length_integer t delay;
     write_variable_length_integer t range_count;
-    write_variable_length_integer t first_range;
-    let (_ : int) =
+    write_variable_length_integer t (Int64.to_int first_range);
+    let (_ : int64) =
       List.fold_left
         (fun smallest_ack { Frame.Range.first; last } ->
-          let gap = smallest_ack - last in
-          let len = last - first in
-          write_variable_length_integer t gap;
-          write_variable_length_integer t len;
+          let gap = Int64.sub smallest_ack last in
+          let len = Int64.sub last first in
+          write_variable_length_integer t (Int64.to_int gap);
+          write_variable_length_integer t (Int64.to_int len);
           first)
         first.first
         rest
@@ -244,14 +243,13 @@ module Pkt = struct
     let write_payload_length t ~pn_length ~header len =
       match header with
       | Packet.Header.Initial _
-      | Long { packet_type = Initial | Zero_RTT | Handshake; _ }
-      | Short _ ->
+      | Long { packet_type = Initial | Zero_RTT | Handshake; _ } ->
         (* From RFC<QUIC-RFC>§17.2:
          * Length: The length of the remainder of the packet (that is, the
          *         Packet Number and Payload fields) in bytes, encoded as a
          *         variable-length integer (Section 16). *)
         write_variable_length_integer t (pn_length + len)
-      | Long { packet_type = Retry; _ } ->
+      | Short _ | Long { packet_type = Retry; _ } ->
         ()
 
     let write_long_header t ~pn_length ~header =
@@ -313,13 +311,14 @@ module Pkt = struct
        *              packets in this version and MUST be discarded. *)
       let form_and_fixed_bits = 0b01000000 in
       (* TODO: spin bit, key phase *)
-      let first_byte = form_and_fixed_bits lor (pn_length land 0b11) in
+      let first_byte = form_and_fixed_bits lor ((pn_length - 1) land 0b11) in
       (* From RFC<QUIC-RFC>§17.2:
        *   Reserved Bits: The next two bits (those with a mask of 0x18) of byte
        *                  0 are reserved. These bits are protected using header
        *                  protection; see Section 5.4 of [QUIC-TLS]. The value
        *                  included prior to protection MUST be set to 0. *)
       assert (first_byte land 0b00011000 = 0);
+      Faraday.write_uint8 t first_byte;
       Faraday.write_string t dest_cid.CID.id
 
     let write_packet_header t ~header =

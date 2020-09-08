@@ -80,9 +80,33 @@ let test_quic_transport_parameters () =
   | Error e ->
     Alcotest.fail e
 
+let test_short_header () =
+  let dest_cid = Quic.CID.{ length; id = String.make length 'a' } in
+  let f = Faraday.create 20 in
+  Quic.Serialize.Pkt.Header.write_short_header f ~pn_length:4 ~dest_cid;
+  (* Asserts that we don't write it for short headers *)
+  Quic.Serialize.Pkt.Header.write_payload_length
+    f
+    ~pn_length:4
+    ~header:(Quic.Packet.Header.Short { dest_cid })
+    0;
+  Quic.Serialize.Pkt.Header.write_packet_number
+    f
+    ~pn_length:4
+    ~packet_number:12L;
+  let hdr = Faraday.serialize_to_string f in
+  match
+    Angstrom.parse_string ~consume:Prefix Quic.Parse.Packet.protected_header hdr
+  with
+  | Ok _ ->
+    ()
+  | Error e ->
+    Alcotest.fail e
+
 let suite =
   [ "parser", `Quick, test_parser
   ; "quic transport parameters", `Quick, test_quic_transport_parameters
+  ; "short header", `Quick, test_short_header
   ]
 
 let () = Alcotest.run "parsing" [ "parser", suite ]

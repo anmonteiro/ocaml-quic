@@ -71,6 +71,10 @@ in
           # TLS tests
           ounit
           cstruct-unix
+          # TLS Mirage
+          mirage-clock
+          mirage-flow
+          mirage-kv
         ];
       };
 

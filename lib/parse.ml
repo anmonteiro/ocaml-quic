@@ -68,7 +68,7 @@ module Frame = struct
     count
       ack_range_count
       (lift2
-         (fun gap len -> gap, len)
+         (fun gap len -> Int64.of_int gap, Int64.of_int len)
          variable_length_integer
          variable_length_integer)
     >>= fun ranges ->
@@ -89,7 +89,9 @@ module Frame = struct
      *)
     let smallest_ack = largest_ack - first_ack_range in
     let first_range =
-      { Frame.Range.first = smallest_ack; last = largest_ack }
+      { Frame.Range.first = Int64.of_int smallest_ack
+      ; last = Int64.of_int largest_ack
+      }
     in
     let ranges =
       List.fold_left
@@ -107,8 +109,8 @@ module Frame = struct
            *
            *     largest = previous_smallest - gap - 2
            *)
-          let largest_ack = smallest_ack - gap - 2 in
-          let smallest_ack = largest_ack - len in
+          let largest_ack = Int64.(sub (sub smallest_ack gap) 2L) in
+          let smallest_ack = Int64.sub largest_ack len in
           { Frame.Range.first = smallest_ack; last = largest_ack } :: acc)
         [ first_range ]
         ranges

@@ -265,8 +265,8 @@ module Range = struct
    *   An ACK Range acknowledges all packets between the smallest packet number
    *   and the largest, inclusive. *)
   type t =
-    { first : int
-    ; last : int
+    { first : int64
+    ; last : int64
     }
 end
 

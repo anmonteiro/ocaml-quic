@@ -35,22 +35,53 @@ module Reader = Parse.Reader
 module Writer = Serialize.Writer
 
 module Packet_number = struct
+  module PSet = Set.Make (Int64)
+
   type t =
     { mutable sent : int64
     ; mutable received : int64
+    ; mutable received_need_ack : PSet.t
+    ; mutable ack_elicited : bool
     }
 
-  let create () = { sent = -1L; received = -1L }
+  let create () =
+    { sent = -1L
+    ; received = -1L
+    ; received_need_ack = PSet.empty
+    ; ack_elicited = false
+    }
 
   let send_next t =
     let next = Int64.add t.sent 1L in
     t.sent <- next;
     next
+
+  let insert_for_acking t packet_number =
+    t.received_need_ack <- PSet.add packet_number t.received_need_ack
+
+  let compose_ranges t =
+    (* list is sorted *)
+    let packets = PSet.elements t.received_need_ack in
+    (* don't empty the set, the packet containg the ACK frame could be lost. *)
+    assert (List.length packets > 0);
+    let first = List.hd packets in
+    List.fold_left
+      (fun acc pn ->
+        let cur_range = List.hd acc in
+        if Int64.compare (Int64.add cur_range.Frame.Range.last 1L) pn = 0 then
+          { cur_range with last = pn } :: List.tl acc
+        else (* start a new range, ther's a gap. *)
+          { Frame.Range.first = pn; last = pn } :: acc)
+      [ { Frame.Range.first; last = first } ]
+      (List.tl packets)
+
+  let compose_ack_frame t =
+    let ranges = compose_ranges t in
+    Frame.Ack { delay = 0; ranges; ecn_counts = None }
 end
 
 type packet_info =
-  { mutable ack_eliciting : bool
-  ; packet_number : int64
+  { packet_number : int64
   ; header : Packet.Header.t
   ; outgoing_frames : Frame.t list Encryption_level.t
   ; encryption_level : Encryption_level.level
@@ -61,7 +92,7 @@ type 'a t =
   ; writer : Writer.t
   ; encdec : Crypto.encdec Encryption_level.t
   ; mutable tls_state : Qtls.t
-  ; packet_numbers : Packet_number.t Spaces.t
+  ; packet_number_spaces : Packet_number.t Spaces.t
   ; mutable source_cid : CID.t
   ; mutable original_dest_cid : CID.t
   ; mutable dest_cid : CID.t
@@ -72,8 +103,6 @@ type 'a t =
      *   data. *)
     crypto_streams : Ordered_stream.t Spaces.t
   ; mutable client_address : 'a option
-  ; mutable ae_pkts_since_last_ack : int
-        (* ack-eliciting packets since we last acknowledged *)
   ; mutable client_transport_params : Transport_parameters.t
   ; recovery : Recovery.t
   }
@@ -94,7 +123,7 @@ let send_packet t ~encryption_level frames =
   in
   let packet_number =
     Packet_number.send_next
-      (Spaces.of_encryption_level t.packet_numbers encryption_level)
+      (Spaces.of_encryption_level t.packet_number_spaces encryption_level)
   in
   Writer.write_frames_packet
     t.writer
@@ -106,14 +135,7 @@ let send_packet t ~encryption_level frames =
   on_packet_sent t ~encryption_level ~packet_number frames
 
 let send_packets t ~packet_info =
-  let { outgoing_frames
-      ; packet_number
-      ; encryption_level = incoming_packet_enclevel
-      ; _
-      }
-    =
-    packet_info
-  in
+  let { outgoing_frames; _ } = packet_info in
   (* From RFC<QUIC-RFC>§12.2:
    *   Coalescing packets in order of increasing encryption levels (Initial,
    *   0-RTT, Handshake, 1-RTT; see Section 4.1.4 of [QUIC-TLS]) makes it more
@@ -121,23 +143,12 @@ let send_packets t ~packet_info =
    *   pass. *)
   Encryption_level.ordered_iter
     (fun encryption_level frames ->
+      let pn_space =
+        Spaces.of_encryption_level t.packet_number_spaces encryption_level
+      in
       let frames =
-        if
-          packet_info.ack_eliciting
-          && Encryption_level.Ord.equal
-               incoming_packet_enclevel
-               encryption_level
-        then
-          Frame.Ack
-            { delay = 0
-            ; ranges =
-                [ { Frame.Range.first = Int64.to_int packet_number
-                  ; last = Int64.to_int packet_number
-                  }
-                ]
-            ; ecn_counts = None
-            }
-          :: frames
+        if pn_space.ack_elicited then
+          Packet_number.compose_ack_frame pn_space :: frames
         else
           frames
       in
@@ -149,7 +160,7 @@ let process_ack_frame t ~packet_info ~ranges =
   let { header; encryption_level; _ } = packet_info in
   Recovery.on_ack_received t.recovery ~encryption_level ~ranges;
   Format.eprintf
-    "got ack %a %d %d %d@."
+    "got ack %a %Ld %Ld %d@."
     Encryption_level.pp_hum
     (Encryption_level.of_header header)
     (List.hd ranges).Frame.Range.last
@@ -314,7 +325,6 @@ let rec exhaust_crypto_stream t ~packet_info ~stream =
       assert false);
     exhaust_crypto_stream t ~packet_info ~stream
   | None ->
-    Format.eprintf "NOPE@.";
     ()
 
 let process_crypto_frame t ~packet_info fragment =
@@ -327,7 +337,11 @@ let process_crypto_frame t ~packet_info fragment =
 
 let frame_handler ~packet_info t frame =
   (* TODO: validate that frame can appear at current encryption level. *)
-  if Frame.is_ack_eliciting frame then packet_info.ack_eliciting <- true;
+  if Frame.is_ack_eliciting frame then
+    (Spaces.of_encryption_level
+       t.packet_number_spaces
+       packet_info.encryption_level).ack_elicited <-
+      true;
   match frame with
   | Frame.Padding _n ->
     (* From RFC<QUIC-RFC>§19.1:
@@ -398,7 +412,6 @@ let packet_handler t packet =
       { header
       ; encryption_level = Encryption_level.of_header header
       ; packet_number
-      ; ack_eliciting = false
       ; outgoing_frames = Encryption_level.create ~current:t.encdec.current ()
       }
     in
@@ -428,8 +441,17 @@ let packet_handler t packet =
           | _other ->
             ())
         acked_frames;
+      (* This packet has been processed, mark it for acknowledgement. *)
+      let pn_space =
+        Spaces.of_encryption_level
+          t.packet_number_spaces
+          packet_info.encryption_level
+      in
+      Packet_number.insert_for_acking pn_space packet_number;
       (* packet_info should now contain frames we need to send in response. *)
-      send_packets t ~packet_info
+      send_packets t ~packet_info;
+      (* Reset for the next packet. *)
+      pn_space.ack_elicited <- false
     | Error e ->
       failwith ("Err: " ^ e))
   | Retry _ ->
@@ -475,14 +497,14 @@ let create () =
             (Encryption_level.of_header header)
             t.encdec)
            .decrypter)
-      ~largest_pn:t.packet_numbers.initial.received
+      ~largest_pn:t.packet_number_spaces.initial.received
       cs
   and t =
     lazy
       { reader = Reader.packets ~decrypt:(decrypt t) (handler t)
       ; writer = Writer.create 0x1000
       ; encdec = Encryption_level.create ()
-      ; packet_numbers =
+      ; packet_number_spaces =
           Spaces.create
             ~initial:(Packet_number.create ())
             ~handshake:(Packet_number.create ())
@@ -498,7 +520,6 @@ let create () =
       ; original_dest_cid = CID.empty
       ; dest_cid = CID.empty
       ; client_address = None
-      ; ae_pkts_since_last_ack = 0
       ; client_transport_params = Transport_parameters.default
       ; recovery = Recovery.create ()
       }

@@ -73,8 +73,8 @@ let on_ack_received t ~encryption_level ~ranges =
   let info = Spaces.of_encryption_level t encryption_level in
   List.iter
     (fun { Frame.Range.first; last } ->
-      let lowest_acked = Int64.of_int first in
-      let largest_acked = Int64.of_int last in
+      let lowest_acked = first in
+      let largest_acked = last in
       let q' =
         Q.fold
           (fun pkt_num sent q ->
