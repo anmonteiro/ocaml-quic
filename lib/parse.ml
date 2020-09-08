@@ -81,13 +81,39 @@ module Frame = struct
         variable_length_integer
         variable_length_integer)
     >>| fun ecn_counts ->
-    Frame.Ack
-      { largest = largest_ack
-      ; delay = ack_delay
-      ; first_range = first_ack_range
-      ; ranges
-      ; ecn_counts
-      }
+    (* From RFC<QUIC-RFC>§19.3.1:
+     *   Thus, given a largest packet number for the range, the smallest value
+     *   is determined by the formula:
+     *
+     *     smallest = largest - ack_range
+     *)
+    let smallest_ack = largest_ack - first_ack_range in
+    let first_range =
+      { Frame.Range.first = smallest_ack; last = largest_ack }
+    in
+    let ranges =
+      List.fold_left
+        (fun acc (gap, len) ->
+          (* TODO: validate smallest < gap + 2 *)
+          (* From RFC<QUIC-RFC>§19.3.1:
+           *   Gap and ACK Range value use a relative integer encoding for
+           *   efficiency. Though each encoded value is positive, the values are
+           *   subtracted, so that each ACK Range describes progressively
+           *   lower-numbered packets. *)
+          let smallest_ack = (List.hd acc).Frame.Range.first in
+          (* From RFC<QUIC-RFC>§19.3.1:
+           *   The value of the Gap field establishes the largest packet number
+           *   value for the subsequent ACK Range using the following formula:
+           *
+           *     largest = previous_smallest - gap - 2
+           *)
+          let largest_ack = smallest_ack - gap - 2 in
+          let smallest_ack = largest_ack - len in
+          { Frame.Range.first = smallest_ack; last = largest_ack } :: acc)
+        [ first_range ]
+        ranges
+    in
+    Frame.Ack { delay = ack_delay; ranges; ecn_counts }
 
   let parse_reset_stream_frame =
     lift3

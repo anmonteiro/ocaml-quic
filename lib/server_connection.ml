@@ -99,6 +99,7 @@ type 'a t =
   ; mutable client_address : 'a option
   ; mutable ae_pkts_since_last_ack : int
         (* ack-eliciting packets since we last acknowledged *)
+  ; mutable client_transport_params : Transport_parameters.t
   }
 
 let wakeup_writer t = Writer.wakeup t.writer
@@ -109,9 +110,12 @@ let send_packet t ~encryption_level frames =
     (List.length frames)
     Encryption_level.pp_hum
     encryption_level;
+  let { Crypto.encrypter; _ } =
+    Encryption_level.find_exn encryption_level t.encdec
+  in
   Writer.write_frames_packet
     t.writer
-    ~encdec:(Encryption_level.find_exn encryption_level t.encdec)
+    ~encrypter
     ~encryption_level
     ~header_info:(Writer.make_header_info ~source_cid:t.source_cid t.dest_cid)
     ~packet_number:
@@ -133,10 +137,12 @@ let send_packets t ~packet_info =
                encryption_level
         then
           Frame.Ack
-            { largest = Int64.to_int packet_number
-            ; delay = 0
-            ; first_range = 0
-            ; ranges = []
+            { delay = 0
+            ; ranges =
+                [ { Frame.Range.first = Int64.to_int packet_number
+                  ; last = Int64.to_int packet_number
+                  }
+                ]
             ; ecn_counts = None
             }
           :: frames
@@ -146,14 +152,14 @@ let send_packets t ~packet_info =
       send_packet t ~encryption_level (List.rev frames))
     outgoing_frames
 
-let process_ack_frame _t ~packet_info ~largest ~first_range ~ranges =
+let process_ack_frame _t ~packet_info ~ranges =
   let { header; _ } = packet_info in
   Format.eprintf
     "got ack %a %d %d %d@."
     Encryption_level.pp_hum
     (Encryption_level.of_header header)
-    largest
-    first_range
+    (List.hd ranges).Frame.Range.last
+    (List.hd ranges).Frame.Range.first
     (List.length ranges);
   ()
 
@@ -233,8 +239,6 @@ let process_crypto_frame t ~packet_info fragment =
       (match
          Qtls.handle_raw_record
            ~embed_quic_transport_params:(fun _raw_transport_params ->
-             (* We're gonna validate and act on these later. Just need to
-                extract the client's *)
              (* From RFC<QUIC-RFC>§7.3:
               *   When the handshake does not include a Retry (Figure 6), the
               *   server sets original_destination_connection_id to S1 and
@@ -247,6 +251,13 @@ let process_crypto_frame t ~packet_info fragment =
                    [ Encoding.Original_destination_connection_id
                        t.original_dest_cid
                    ; Initial_source_connection_id t.source_cid
+                   ; (* TODO: get these from configuration *)
+                     Initial_max_data (1 lsl 27)
+                   ; Initial_max_stream_data_bidi_local (1 lsl 27)
+                   ; Initial_max_stream_data_bidi_remote (1 lsl 27)
+                   ; Initial_max_stream_data_uni (1 lsl 27)
+                   ; Initial_max_streams_bidi (1 lsl 8)
+                   ; Initial_max_streams_uni (1 lsl 8)
                    ]))
            t.tls_state
            fragment_cstruct
@@ -263,7 +274,8 @@ let process_crypto_frame t ~packet_info fragment =
                ~perspective:Server
                quic_transport_params
            with
-          | Ok _ ->
+          | Ok transport_params ->
+            t.client_transport_params <- transport_params;
             process_tls_result
               t
               ~packet_info
@@ -309,8 +321,8 @@ let frame_handler ~packet_info t frame =
      *   The receiver of a PING frame simply needs to acknowledge the packet
      *   containing this frame. *)
     ()
-  | Ack { largest; first_range; ranges; _ } ->
-    process_ack_frame t ~packet_info ~largest ~first_range ~ranges
+  | Ack { ranges; _ } ->
+    process_ack_frame t ~packet_info ~ranges
   | Reset_stream _ ->
     failwith
       (Format.asprintf
@@ -446,6 +458,7 @@ let create () =
       ; dest_cid = CID.empty
       ; client_address = None
       ; ae_pkts_since_last_ack = 0
+      ; client_transport_params = Transport_parameters.default
       }
   in
   Lazy.force t

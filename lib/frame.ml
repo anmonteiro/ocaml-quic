@@ -260,14 +260,22 @@ module Type = struct
       Unknown x
 end
 
+module Range = struct
+  (* From RFC<QUIC-RFC>§19.3.1:
+   *   An ACK Range acknowledges all packets between the smallest packet number
+   *   and the largest, inclusive. *)
+  type t =
+    { first : int
+    ; last : int
+    }
+end
+
 type t =
   | Padding of int
   | Ping
   | Ack of
-      { largest : int
-      ; delay : int
-      ; first_range : int
-      ; ranges : (int * int) list
+      { delay : int
+      ; ranges : Range.t list
       ; ecn_counts : (int * int * int) option
       }
   | Reset_stream of

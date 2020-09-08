@@ -66,17 +66,29 @@ module Frame = struct
       Faraday.schedule_bigstring t padding
     done
 
-  let write_ack t ~largest ~delay ~first_range ~ranges ~ecn_counts =
-    let range_count = List.length ranges in
+  let write_ack t ~delay ~ranges ~ecn_counts =
+    let range_len = List.length ranges in
+    let range_count = range_len - 1 in
+    assert (range_len > 0);
+    let ranges = List.rev ranges in
+    let first, rest = List.hd ranges, List.tl ranges in
+    let first_range = first.Frame.Range.last - first.first in
+    let largest = first.Frame.Range.last in
     write_variable_length_integer t largest;
     write_variable_length_integer t delay;
     write_variable_length_integer t range_count;
     write_variable_length_integer t first_range;
-    List.iter
-      (fun (gap, len) ->
-        write_variable_length_integer t gap;
-        write_variable_length_integer t len)
-      ranges;
+    let (_ : int) =
+      List.fold_left
+        (fun smallest_ack { Frame.Range.first; last } ->
+          let gap = smallest_ack - last in
+          let len = last - first in
+          write_variable_length_integer t gap;
+          write_variable_length_integer t len;
+          first)
+        first.first
+        rest
+    in
     match ecn_counts with
     | Some (ect0, ect1, cn) ->
       write_variable_length_integer t ect0;
@@ -168,8 +180,8 @@ module Frame = struct
       write_padding t n
     | Ping ->
       ()
-    | Ack { largest; delay; first_range; ranges; ecn_counts } ->
-      write_ack t ~largest ~delay ~first_range ~ranges ~ecn_counts
+    | Ack { delay; ranges; ecn_counts } ->
+      write_ack t ~delay ~ranges ~ecn_counts
     | Reset_stream { stream_id; application_protocol_error; final_size } ->
       write_reset_stream t ~stream_id ~application_protocol_error ~final_size
     | Stop_sending { stream_id; application_protocol_error } ->
@@ -440,7 +452,7 @@ module Writer = struct
       Short { dest_cid }
 
   let write_frames_packet
-      t ~encdec ~encryption_level ~header_info ~packet_number frames
+      t ~encrypter ~encryption_level ~header_info ~packet_number frames
     =
     let tmpf = Faraday.create 0x400 in
     List.iter (Frame.write_frame tmpf) frames;
@@ -450,7 +462,7 @@ module Writer = struct
     let plaintext = Cstruct.of_bigarray (Faraday.serialize_to_bigstring tmpf) in
     (* AEAD ciphertext length is the same as the plaintext length (+ tag). *)
     let payload_length =
-      Cstruct.len plaintext + Crypto.AEAD.tag_len encdec.Crypto.encrypter
+      Cstruct.len plaintext + Crypto.AEAD.tag_len encrypter
     in
     let header = header_of_encryption_level ~encryption_level header_info in
     let hf = Faraday.create 0x100 in
@@ -466,7 +478,7 @@ module Writer = struct
     in
     let protected =
       Crypto.AEAD.encrypt_packet
-        encdec.encrypter
+        encrypter
         ~packet_number
         ~header:unprotected_header
         plaintext
