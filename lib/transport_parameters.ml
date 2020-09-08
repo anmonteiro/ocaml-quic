@@ -226,16 +226,6 @@ module Encoding = struct
         0x10
   end
 
-  let varint_encoding_length n =
-    if n < 1 lsl 6 then
-      1
-    else if n < 1 lsl 14 then
-      2
-    else if n < 1 lsl 30 then
-      4
-    else
-      8
-
   let serialize f t =
     let varint = Serialize.write_variable_length_integer f in
     varint (Type.serialize t);
@@ -244,7 +234,7 @@ module Encoding = struct
       varint length;
       Faraday.write_string f id
     | Max_idle_timeout timeout ->
-      varint (varint_encoding_length timeout);
+      varint (Serialize.varint_encoding_length timeout);
       varint timeout
     | Stateless_reset_token token ->
       varint (String.length token);
@@ -256,13 +246,13 @@ module Encoding = struct
     | Initial_max_stream_data_uni max
     | Initial_max_streams_bidi max
     | Initial_max_streams_uni max ->
-      varint (varint_encoding_length max);
+      varint (Serialize.varint_encoding_length max);
       varint max
     | Ack_delay_exponent exp ->
-      varint (varint_encoding_length exp);
+      varint (Serialize.varint_encoding_length exp);
       varint exp
     | Max_ack_delay max ->
-      varint (varint_encoding_length max);
+      varint (Serialize.varint_encoding_length max);
       varint max
     | Disable_active_migration true ->
       (* From RFC<QUIC-RFC>§18.2:
@@ -275,7 +265,7 @@ module Encoding = struct
       varint (Preferred_address.serialized_length addr);
       Preferred_address.serialize f addr
     | Active_connection_id_limit max ->
-      varint (varint_encoding_length max);
+      varint (Serialize.varint_encoding_length max);
       varint max
     | Initial_source_connection_id { CID.id; length }
     | Retry_source_connection_id { CID.id; length } ->

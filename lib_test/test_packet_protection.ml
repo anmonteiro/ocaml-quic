@@ -519,15 +519,15 @@ module InitialAEAD_encryption = struct
     let writer = Writer.create 0x1000 in
     Writer.write_frames_packet
       writer
-      ~encdec:{ Crypto.encrypter; decrypter = Some encrypter }
-      ~encryption_level:Initial
-      ~header_info:(Writer.make_header_info { Quic.CID.id = "abc"; length = 3 })
-      ~packet_number:1L
+      ~encrypter
+      ~header_info:
+        (Writer.make_header_info
+           ~encryption_level:Initial
+           ~packet_number:1L
+           { Quic.CID.id = "abc"; length = 3 })
       [ Ack
-          { largest = Int64.to_int 1L
-          ; delay = 0
-          ; first_range = 0
-          ; ranges = []
+          { delay = 0
+          ; ranges = [ { Quic.Frame.Range.first = 1L; last = 1L } ]
           ; ecn_counts = None
           }
       ];
@@ -540,7 +540,7 @@ module InitialAEAD_encryption = struct
     match ret with
     | Some { Crypto.AEAD.packet_number; pn_length; _ } ->
       Alcotest.(check int64) "packet number" 1L packet_number;
-      Alcotest.(check int) "packet number length" 4 pn_length
+      Alcotest.(check int) "packet number length" 1 pn_length
     | None ->
       Alcotest.fail "expected packet to decrypt successfully"
 

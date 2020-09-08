@@ -105,6 +105,7 @@ type 'a t =
   ; mutable client_address : 'a option
   ; mutable client_transport_params : Transport_parameters.t
   ; recovery : Recovery.t
+  ; queued_packets : (Writer.header_info * Frame.t list) Queue.t
   }
 
 let wakeup_writer t = Writer.wakeup t.writer
@@ -113,26 +114,18 @@ let on_packet_sent t ~encryption_level ~packet_number frames =
   Recovery.on_packet_sent t.recovery ~encryption_level ~packet_number frames
 
 let send_packet t ~encryption_level frames =
-  Format.eprintf
-    "Sending %d frames at encryption level: %a@."
-    (List.length frames)
-    Encryption_level.pp_hum
-    encryption_level;
-  let { Crypto.encrypter; _ } =
-    Encryption_level.find_exn encryption_level t.encdec
-  in
   let packet_number =
     Packet_number.send_next
       (Spaces.of_encryption_level t.packet_number_spaces encryption_level)
   in
-  Writer.write_frames_packet
-    t.writer
-    ~encrypter
-    ~encryption_level
-    ~header_info:(Writer.make_header_info ~source_cid:t.source_cid t.dest_cid)
-    ~packet_number
-    frames;
-  on_packet_sent t ~encryption_level ~packet_number frames
+  let header_info =
+    Writer.make_header_info
+      ~packet_number
+      ~encryption_level
+      ~source_cid:t.source_cid
+      t.dest_cid
+  in
+  Queue.add (header_info, frames) t.queued_packets
 
 let send_packets t ~packet_info =
   let { outgoing_frames; _ } = packet_info in
@@ -522,6 +515,7 @@ let create () =
       ; client_address = None
       ; client_transport_params = Transport_parameters.default
       ; recovery = Recovery.create ()
+      ; queued_packets = Queue.create ()
       }
   in
   Lazy.force t
@@ -532,7 +526,31 @@ let is_closed _t = false
 
 let report_exn _t _exn = ()
 
+(* Flushes packets into one datagram *)
+let rec flush_pending_packets t =
+  match Queue.take_opt t.queued_packets with
+  | Some (({ Writer.encryption_level; packet_number; _ } as header_info), frames)
+    ->
+    Format.eprintf
+      "Sending %d frames at encryption level: %a@."
+      (List.length frames)
+      Encryption_level.pp_hum
+      encryption_level;
+    let { Crypto.encrypter; _ } =
+      Encryption_level.find_exn encryption_level t.encdec
+    in
+    Writer.write_frames_packet t.writer ~encrypter ~header_info frames;
+    on_packet_sent t ~encryption_level ~packet_number frames;
+    let can_be_followed_by_other_packets =
+      encryption_level <> Application_data
+    in
+    if can_be_followed_by_other_packets then
+      flush_pending_packets t
+  | None ->
+    ()
+
 let next_write_operation t =
+  flush_pending_packets t;
   match Writer.next t.writer with
   | `Write iovecs ->
     `Write (iovecs, Option.get t.client_address)

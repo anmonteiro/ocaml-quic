@@ -30,6 +30,30 @@
  *  POSSIBILITY OF SUCH DAMAGE.
  *---------------------------------------------------------------------------*)
 
+let packet_number_length pn =
+  (* From RFC<QUIC-RFC>§17.1:
+   *   Packet numbers are integers in the range 0 to 2^62-1 (Section 12.3).
+   *   When present in long or short packet headers, they are encoded in 1 to 4
+   *   bytes. *)
+  if Int64.compare pn (Int64.shift_left 1L 8) < 0 then
+    1
+  else if Int64.compare pn (Int64.shift_left 1L 16) < 0 then
+    2
+  else if Int64.compare pn (Int64.shift_left 1L 32) < 0 then
+    3
+  else
+    4
+
+let varint_encoding_length n =
+  if n < 1 lsl 6 then
+    1
+  else if n < 1 lsl 14 then
+    2
+  else if n < 1 lsl 30 then
+    4
+  else
+    8
+
 let rec decomp n acc x =
   if n = 0 then
     acc
@@ -321,13 +345,13 @@ module Pkt = struct
       Faraday.write_uint8 t first_byte;
       Faraday.write_string t dest_cid.CID.id
 
-    let write_packet_header t ~header =
+    let write_packet_header t ~pn_length ~header =
       (* TODO: proper packet number length *)
       match header with
       | Packet.Header.Initial _ | Long _ ->
-        write_long_header t ~pn_length:4 ~header
+        write_long_header t ~pn_length ~header
       | Short { dest_cid } ->
-        write_short_header t ~pn_length:4 ~dest_cid
+        write_short_header t ~pn_length ~dest_cid
   end
 
   let write_version_negotiation_packet t ~versions ~source_cid ~dest_cid =
@@ -364,12 +388,16 @@ module Pkt = struct
     | Packet.VersionNegotiation { source_cid; dest_cid; versions } ->
       write_version_negotiation_packet t ~source_cid ~dest_cid ~versions
     | Frames { header; payload_length; payload; packet_number; _ } ->
-      Header.write_packet_header t ~header;
-      Header.write_payload_length t ~pn_length:4 ~header payload_length;
-      Header.write_packet_number t ~pn_length:4 ~packet_number;
+      let pn_length = packet_number_length packet_number in
+      Header.write_packet_header t ~pn_length ~header;
+      Header.write_payload_length t ~pn_length ~header payload_length;
+      Header.write_packet_number t ~pn_length ~packet_number;
       write_packet_payload t payload
     | Retry { header; token; tag; _ } ->
-      Header.write_long_header t ~pn_length:4 ~header;
+      (* PN Length doesn't matter here, retry packets don't have a packet
+       * number.
+       * TODO: make this better *)
+      Header.write_long_header t ~pn_length:0 ~header;
       write_retry_payload t ~token ~tag
 end
 
@@ -381,6 +409,8 @@ module Writer = struct
     ; source_cid : CID.t
     ; dest_cid : CID.t
     ; token : string
+    ; encryption_level : Encryption_level.level
+    ; packet_number : int64
     }
 
   type t =
@@ -411,9 +441,14 @@ module Writer = struct
    *
    * 0xff000000 + 0x1d = 0xff00001d *)
   let make_header_info
-      ?(source_cid = CID.empty) ?(version = 0xFF00001Dl) ?(token = "") dest_cid
+      ~packet_number
+      ~encryption_level
+      ?(source_cid = CID.empty)
+      ?(version = 0xFF00001Dl)
+      ?(token = "")
+      dest_cid
     =
-    { version; source_cid; dest_cid; token }
+    { version; source_cid; dest_cid; token; packet_number; encryption_level }
 
   (* From RFC<QUIC-TLS-RFC>§4:
    *
@@ -436,7 +471,7 @@ module Writer = struct
    *               Table 1: Encryption Keys by Packet Type
    *)
   let header_of_encryption_level
-      ~encryption_level { version; source_cid; dest_cid; token }
+      { version; source_cid; dest_cid; token; encryption_level; _ }
     =
     match encryption_level with
     | Encryption_level.Initial ->
@@ -448,9 +483,8 @@ module Writer = struct
     | Application_data ->
       Short { dest_cid }
 
-  let write_frames_packet
-      t ~encrypter ~encryption_level ~header_info ~packet_number frames
-    =
+  let write_frames_packet t ~encrypter ~header_info frames =
+    let pn_length = packet_number_length header_info.packet_number in
     let tmpf = Faraday.create 0x400 in
     List.iter (Frame.write_frame tmpf) frames;
     let frames = Faraday.serialize_to_bigstring tmpf in
@@ -461,25 +495,25 @@ module Writer = struct
     let payload_length =
       Cstruct.len plaintext + Crypto.AEAD.tag_len encrypter
     in
-    let header = header_of_encryption_level ~encryption_level header_info in
+    let header = header_of_encryption_level header_info in
     let hf = Faraday.create 0x100 in
-    Pkt.Header.write_packet_header hf ~header;
-    Pkt.Header.write_payload_length hf ~pn_length:4 ~header payload_length;
-    Pkt.Header.write_packet_number hf ~pn_length:4 ~packet_number;
+    Pkt.Header.write_packet_header hf ~pn_length ~header;
+    Pkt.Header.write_payload_length hf ~pn_length ~header payload_length;
+    Pkt.Header.write_packet_number
+      hf
+      ~pn_length
+      ~packet_number:header_info.packet_number;
     let unprotected_header =
       Cstruct.of_bigarray (Faraday.serialize_to_bigstring hf)
     in
     let protected =
       Crypto.AEAD.encrypt_packet
         encrypter
-        ~packet_number
+        ~packet_number:header_info.packet_number
         ~header:unprotected_header
         plaintext
     in
-    Faraday.schedule_bigstring t.encoder (Cstruct.to_bigarray protected);
-    if not (Packet.Header.can_be_followed_by_other_packets header) then
-      (* If this needs to be the last packet in the datagram, flush it. *)
-      Faraday.flush t.encoder ignore
+    Faraday.schedule_bigstring t.encoder (Cstruct.to_bigarray protected)
 
   let faraday t = t.encoder
 
