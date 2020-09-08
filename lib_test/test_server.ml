@@ -1,13 +1,77 @@
 module Quic = Quic__
 open Quic
 
+module Read_operation = struct
+  type t =
+    [ `Read
+    | `Close
+    | `Error of Error.t
+    ]
+
+  let pp_hum fmt t =
+    let str = match t with `Read -> "Read" | `Close -> "Close" in
+    Format.pp_print_string fmt str
+end
+
+module Write_operation = struct
+  type t =
+    [ `Write of Bigstringaf.t IOVec.t list
+    | `Yield
+    | `Close of int
+    ]
+
+  let iovecs_to_string iovecs =
+    let len = IOVec.lengthv iovecs in
+    let bytes = Bytes.create len in
+    let dst_off = ref 0 in
+    List.iter
+      (fun { IOVec.buffer; off = src_off; len } ->
+        Bigstringaf.unsafe_blit_to_bytes
+          buffer
+          ~src_off
+          bytes
+          ~dst_off:!dst_off
+          ~len;
+        dst_off := !dst_off + len)
+      iovecs;
+    Bytes.unsafe_to_string bytes
+
+  let hex_of_string s =
+    let (`Hex hex) = Hex.of_string s in
+    String.uppercase_ascii hex
+
+  let pp_hum fmt t =
+    match t with
+    | `Write iovecs ->
+      Format.fprintf fmt "Write %S" (iovecs_to_string iovecs |> hex_of_string)
+    | `Yield ->
+      Format.pp_print_string fmt "Yield"
+    | `Close len ->
+      Format.fprintf fmt "Close %i" len
+
+  let to_write_as_string t =
+    match t with
+    | `Write iovecs ->
+      Some (iovecs_to_string iovecs)
+    | `Close _ | `Yield ->
+      None
+end
+
+(* let read_operation = Alcotest.of_pp Read_operation.pp_hum *)
+
+(* let write_operation = Alcotest.of_pp Write_operation.pp_hum *)
+
+let dest_cid = Hex.to_string (`Hex "1a62e7da4450e266238c715d3a779620")
+
 let protected_packet =
   Hex.to_string
     (`Hex
-      "c5babababa10ba3277447bcd7d52f000dbd01a9036d214ee486210a44ac02365ac618b2deaff628b23b15500448248d5d15e9dd1560fc7a98125a72459d81aa0b05a474359d30158428c2a21b9d8e7832bb3876bb92919d35ca529d94ba590a3a00d749092bb8bc34ad602fa567dc0a252dd46f4345af617f1761d8eddc12fea7d25ff8576dab200ce8597e1a7352a2b9206a115c179ec188108fa04748e4a6ec683e7ef9b0407de7b8fe0361a26945812b67ade453dea1b19b1658defaa5057b3489ae01c5930785040d90dbc4758a5a51192a8d9e3ea243315a64bc9b369b9e327499565a01acb001e958aa740332183a7216474cf99e7ae30a292e8c5c094b8adbe363f11736d7efb0d8396965f0cafd59222635d17ae1873d7c086e6530290c8a11998d9d774e96e134cc458b41ddb1789d31642114a551ba559b9e03993a85c2bdcad7ea9ed34ffde0983572a1f6fa851fd67605894f0be9fa00f9139c9a23be6becf10860656b4ba39e34c5b9388497dabc0585870dcc47d2e425099d9a0559dfe362f4c0702fcfdd39429625bc4210dd2ecbf8e6775fcd728b0688f9a3993eba471fc2f6a3b35746f35a74b3c9f116162d0c813ac050d70499bd7f36d2b42135fe18888f2209fbc879e267281b4aaca0803ac9b09bf22b4caf7415a5845cf00ebd0b7c3c5d5afe18539e44119aac4e8e9b7815bdec0937ce39d48d1cf618bc67aca69801f1df22267f4d61dbe7dafce33763cc0534dcef15730493e80a13f93063192a8cb37498cde0228ab2fae27339058ac89e4872b3e6e437720248201c771fc037306535b90b3fd5a7d0b9e7d4d202c47fa9769b970d05318be726c46955e5ae5649f1dfa9d4a98720d67af43b203a2885ec8ab1d5d609bc20d2ca894e3aa84d02fbcc5a3ba8107e2910b43602c185745b1cb02a83900d375d4a12a1d83646eca037bfe10c5ef8bc9b2601662dbfca8195388d36a6af8450325a9849346a22dc9eefcddd0e45d09c64ab41eb5c83df805ae38bbcb03f39602a1762129ae1e2286356a7e2214584d5935a09d1c82bbb7cf7e5f9b2af93ba030ded13af08fec811141d92d3c07d23aa5a23f9412801f2abc0437fa39ff1183d10a8d93a426a0432afc93773a9600af5fac8bb1a8b3e00b5711c99a6179dc31e876f1c04442f6a19955e0e71cdf0366e655e0df769165ee1923be7726a3eadbd709fe4d5a02ffbcbf4052fcb68c39013fba4e441f1be57c8eb5a274609cd6340103dd488654cba9752675e908c16b32652fbc8d956069c4797c2dc722cda71c9914eeaed20f72619bbf5b85381daaacac997703f05da8292f16365f73fbe3ba2ffdbbf1175bc8b94c43c7aa7fba069a6b508a6af27e61bf887cef6415a76c071160418a2c0fed71aa340ea065509724b97a69b33eea623becda9c1e3434d6807153905df46fafd1f0b875a0ecb4a8fcff5852d4f07312355a6fe5ebf6bb0c390157d4aba2abbf1373ae806141fd8dc9e18905104b31dd1bff24e553d3670ce152c4f405d6b962b118a267442be61cd34c0dbc340b536718de0fb1e2f577020726644e3fd9b91245fa327904c826bf74fb60cecf687275ea6fcaee9db30ee688e5d24860824745fc651ef887530a7c53040979440d0bd2900e86f5fd3eabaa044a6a56e4cecf4938aaf27367cd0b79778a4bc9")
+      "c8ff00001d101a62e7da4450e266238c715d3a779620147aa9d9db36ecf47946506282abffc83805f1000f004482893691606fa3d8e6ead667b736131cd1f2002260557a831873dc63266b5426312208fb44f208e3694639dbcfd106f193a5ba87cf13b4b56f5af461962569f6e3b301953de490f90503675084c9614e85dff281334bedabe5f27c0a55e51a566ee3918031efc88f0022519a9007fe1daada1cf22613a7e5ab1dcc975cf255ccc22c459991fa9a332fafa10fcf01a3217709a734d3e9b6d943f1acde66f9a1fd9480f0eb3bd719a448bfca56e9580568dcadfbc1edfd28feafa157a0ee3540c1edfe6b50452f820e6bab2de31694e38f0cecba005b09f50c8d07a15df74302d91c277bd6746b4e4d0aab702b857e4105d21f5aa9046126d38dc8ac26884cc4332553840bbc3345182bfb74e79b3537920456d82003d2d56f3032b37e73e527583f36392a8f6e5ce47fa6a60a7eacc27a2ed87d2c1e10d4f57b3e02dfac0e852df34da68d6e0f01a58e6c36d33428a6c421cc4d44224190099f0dd13db7fb313e047d06dd85ab64eb184711e6b9681f0cfedaa8b2f0aa50810ffa22d60c0211374f257564441cc8360cfd61b947355b700845c5415fd409748c928c0dc5f18855298fed22dd10f7f01548458b686e691802a95f643aff8ef9550fd31e6fb607e529182a3db2bef6aae1d05143b5b49f5c4eb37a0943fee87f17787a8bd9601bdbf086b99af7c381e12998e4fce36de1ce05f9436eb1aaa861f86409eb941eadeb3574dcd8d9c2532352740200b3b9d9a505bec4d0f2a30ffc9411e902969b1fa3514b961dd857c8c10191377ce1e3e231461f48d77a292a5828999d3a69425687fd032e321839568861598472eee85ccb06d174dee25578bbc219c9ba8c549593dc508a0205d1e3e77035d70347eb62c1102e5ead2fd3beb3e06a2f616c30f8f8543b45ad68d5f6d919f9914ffbeaac39e4ac546486aae7adf90418390a99a5ddf041077fbda5f80e7ac387a41b2899eac0c1846f08f0e7693b0f329a3d4cb8ac12b609cea01fac474c75089c5f994cb53d2d08b11554bb3c9d7e7ff9ba13847603b7a6d19ec22d38f231f6c0bc2100a52ee44c8050b02f02df82df8d593a66924d93ae2cb8b433fae27e567484fe76f0de017ec7ceac94800538be4fc7341a827bd326ccb4886faa4f869b5991b77841b74a33a3c6203d8b74df3403786bcca845bb347b8ca6345e1d014502a44c7313af2ef07c09a579d394da8e49a9dae1ae7b57339adfb723d59af3989177e8edd9d37c98b9426ed5129168e01276f435476a72a7baeab11266c40645f4fdc142420775e52611416a6c424bea1412d39fad7102fea7b20c26d75fdbe21597b155c66a3536e2572152680406b82dc3ae37f88f494d62bccb2e6cce01ac40ae4c7c327157b6e78c9819b2d3808c33ffd1afd7087ed842034bb1d396a7bcfaa9abf9979d73cffe6275f107f849f3cfc7439f779a10efb8864b6450a1579b9780484e1892b5439ce076364ef44e5486eaec03dc23ff0c279d300eb86d0f1570c67059cdb155d5bac34f122491014494e59d2cc09b288823b63a85feeff01d61b5ea8cf2eca4d0d6e5df8355582986ac34c89b436782f7cc7e49849d947fe71f40ec9dccd6f7aac7ff4258bb1fb61e8b9bb2024fecb849")
 
-(* let protected_packet = Hex.to_string (`Hex
-   "c5ff00001d088394c8f03e5157080000449e4a95245bfb66bc5f93032b7ddd89fe0ff15d9c4f7050fccdb71c1cd80512d4431643a53aafa1b0b518b44968b18b8d3e7a4d04c30b3ed9410325b2abb2dafb1c12f8b70479eb8df98abcaf95dd8f3d1c78660fbc719f88b23c8aef6771f3d50e10fdfb4c9d92386d44481b6c52d59e5538d3d3942de9f13a7f8b702dc31724180da9df22714d01003fc5e3d165c950e630b8540fbd81c9df0ee63f94997026c4f2e1887a2def79050ac2d86ba318e0b3adc4c5aa18bcf63c7cf8e85f569249813a2236a7e72269447cd1c755e451f5e77470eb3de64c8849d292820698029cfa18e5d66176fe6e5ba4ed18026f90900a5b4980e2f58e39151d5cd685b10929636d4f02e7fad2a5a458249f5c0298a6d53acbe41a7fc83fa7cc01973f7a74d1237a51974e097636b6203997f921d07bc1940a6f2d0de9f5a11432946159ed6cc21df65c4ddd1115f86427259a196c7148b25b6478b0dc7766e1c4d1b1f5159f90eabc61636226244642ee148b464c9e619ee50a5e3ddc836227cad938987c4ea3c1fa7c75bbf88d89e9ada642b2b88fe8107b7ea375b1b64889a4e9e5c38a1c896ce275a5658d250e2d76e1ed3a34ce7e3a3f383d0c996d0bed106c2899ca6fc263ef0455e74bb6ac1640ea7bfedc59f03fee0e1725ea150ff4d69a7660c5542119c71de270ae7c3ecfd1af2c4ce551986949cc34a66b3e216bfe18b347e6c05fd050f85912db303a8f054ec23e38f44d1c725ab641ae929fecc8e3cefa5619df4231f5b4c009fa0c0bbc60bc75f76d06ef154fc8577077d9d6a1d2bd9bf081dc783ece60111bea7da9e5a9748069d078b2bef48de04cabe3755b197d52b32046949ecaa310274b4aac0d008b1948c1082cdfe2083e386d4fd84c0ed0666d3ee26c4515c4fee73433ac703b690a9f7bf278a77486ace44c489a0c7ac8dfe4d1a58fb3a730b993ff0f0d61b4d89557831eb4c752ffd39c10f6b9f46d8db278da624fd800e4af85548a294c1518893a8778c4f6d6d73c93df200960104e062b388ea97dcf4016bced7f62b4f062cb6c04c20693d9a0e3b74ba8fe74cc01237884f40d765ae56a51688d985cf0ceaef43045ed8c3f0c33bced08537f6882613acd3b08d665fce9dd8aa73171e2d3771a61dba2790e491d413d93d987e2745af29418e428be34941485c93447520ffe231da2304d6a0fd5d07d0837220236966159bef3cf904d722324dd852513df39ae030d8173908da6364786d3c1bfcb19ea77a63b25f1e7fc661def480c5d00d44456269ebd84efd8e3a8b2c257eec76060682848cbf5194bc99e49ee75e4d0d254bad4bfd74970c30e44b65511d4ad0e6ec7398e08e01307eeeea14e46ccd87cf36b285221254d8fc6a6765c524ded0085dca5bd688ddf722e2c0faf9d0fb2ce7a0c3f2cee19ca0ffba461ca8dc5d2c8178b0762cf67135558494d2a96f1a139f0edb42d2af89a9c9122b07acbc29e5e722df8615c343702491098478a389c9872a10b0c9875125e257c7bfdf27eef4060bd3d00f4c14fd3e3496c38d3c5d1a5668c39350effbc2d16ca17be4ce29f02ed969504dda2a8c6b9ff919e693ee79e09089316e7d1d89ec099db3b2b268725d888536a4b8bf9aee8fb43e82a4d919d4843b1ca70a2d8d3f725ead1391377dcc0") *)
+let second_protected_packet =
+  Hex.to_string
+    (`Hex
+      "caff00001d147aa9d9db36ecf47946506282abffc83805f1000f101a62e7da4450e266238c715d3a779620004077491b214c376c0043173c542cc6ad28812619e5e386051a03187168bcff1063306990679a8831c0e264b50d89155eb8952fa01b6ab57f742a2bd4348f0bfc124c27fa25292fe961fbdb87e85a408c26c3e78d8dc703c35f65b131b294d0136ad4e81cea000d6848fdc426a58eb9c115b1c16cc60237fc46")
 
 let read_string t s =
   let len = String.length s in
@@ -21,7 +85,29 @@ let test_initial () =
     "reads the whole packet"
     (String.length protected_packet)
     read;
-  assert false
+  match Server_connection.next_write_operation t with
+  | `Write (iovecs, _) ->
+    let packet_hex = Write_operation.iovecs_to_string iovecs in
+    Format.eprintf "serialized: %a@." Hex.pp (Hex.of_string packet_hex);
+    let client_decrypter = Crypto.InitialAEAD.make ~mode:Server dest_cid in
+    let decrypted =
+      Crypto.AEAD.decrypt_packet
+        client_decrypter
+        ~largest_pn:0L
+        (Cstruct.of_string packet_hex)
+    in
+    Alcotest.(check bool)
+      "decrypts successfully using initial secrets"
+      true
+      (decrypted <> None)
+    (* Check our serialization. *)
+    (* let iovec_len = IOVec.lengthv iovecs in *)
+    (* report_write_result conn (`Ok iovec_len); *)
+    (* writer_yields conn; *)
+    (* ready_to_read conn *)
+  | _ ->
+    Alcotest.fail
+      "Expected state machine to issue a write operation after seeing headers."
 
 (* match *)
 (* Angstrom.parse_string ~consume:All Quic.Parse.Packet.parser protected_packet *)
@@ -67,6 +153,12 @@ let test_initial () =
 
 let suites = [ "initial", `Quick, test_initial ]
 
+let setup_logging ?style_renderer level =
+  Fmt_tty.setup_std_outputs ?style_renderer ();
+  Logs.set_reporter (Logs_fmt.reporter ());
+  Logs.set_level level
+
 let () =
+  (* setup_logging (Some Debug); *)
   Mirage_crypto_rng_unix.initialize ();
   Alcotest.run "packets" [ "packets", suites ]

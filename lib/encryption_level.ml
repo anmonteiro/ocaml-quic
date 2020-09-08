@@ -138,7 +138,9 @@ let find k t = LMap.find_opt k t.vals
 
 let find_exn k t = LMap.find k t.vals
 
-let find_current t = LMap.find t.current t.vals
+let find_current t = LMap.find_opt t.current t.vals
+
+let find_current_exn t = LMap.find t.current t.vals
 
 let update_current f t =
   let vals' = LMap.update t.current f t.vals in
@@ -157,3 +159,5 @@ let ordered_iter f t =
    *
    * NOTE: Map.iter guarantees increasing ordering over the type of the keys. *)
   LMap.iter f t.vals
+
+let fold f t a = LMap.fold f t.vals a

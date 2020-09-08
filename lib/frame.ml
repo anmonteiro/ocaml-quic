@@ -293,7 +293,7 @@ type t =
       ; data : Bigstringaf.t
       }
   | Stream of
-      { stream_id : int
+      { id : int
       ; fragment : Ordered_stream.fragment
       ; is_fin : bool
       }

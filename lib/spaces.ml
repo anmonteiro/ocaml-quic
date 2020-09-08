@@ -30,47 +30,29 @@
  *  POSSIBILITY OF SUCH DAMAGE.
  *---------------------------------------------------------------------------*)
 
-(* From RFC<QUIC-RFC>§2.2:
- *   Endpoints MUST be able to deliver stream data to an application as an
- *   ordered byte-stream. Delivering an ordered byte-stream requires that an
- *   endpoint buffer any data that is received out of order, up to the
- *   advertised flow control limit. *)
-
-type fragment = Bigstringaf.t IOVec.t
-
-module Q : Psq.S with type k = int and type p = fragment =
-  Psq.Make
-    (Int)
-    (struct
-      type t = fragment
-
-      let compare { IOVec.off = off1; _ } { IOVec.off = off2; _ } =
-        compare off1 off2
-    end)
-
-type t =
-  { mutable q : Q.t
-  ; mutable offset : int (* TODO: int64? *)
+(* From RFC<QUIC-RFC>§12.3:
+ *   Packet numbers are divided into 3 spaces in QUIC:
+ *
+ *   Initial space: All Initial packets (Section 17.2.2) are in this space.
+ *
+ *   Handshake space: All Handshake packets (Section 17.2.4) are in this
+ *                    space.
+ *
+ *   Application data space: All 0-RTT and 1-RTT encrypted packets (Section
+ *                           12.1) are in this space. *)
+type 'a t =
+  { initial : 'a
+  ; handshake : 'a
+  ; application_data : 'a
   }
 
-let create () = { q = Q.empty; offset = 0 }
+let create ~initial ~handshake ~application_data =
+  { initial; handshake; application_data }
 
-let add ({ IOVec.off; len; _ } as fragment) t =
-  (* From RFC<QUIC-RFC>§2.2:
-   *   An endpoint could receive data for a stream at the same stream offset
-   *   multiple times. Data that has already been received can be discarded. *)
-  if t.offset < off + len then
-    let q' = Q.add off fragment t.q in
-    t.q <- q'
-
-let pop t =
-  match Q.pop t.q with
-  | Some ((off, fragment), q') ->
-    if off = t.offset then (
-      t.offset <- t.offset + fragment.len;
-      t.q <- q';
-      Some fragment)
-    else
-      None
-  | None ->
-    None
+let of_encryption_level t = function
+  | Encryption_level.Initial ->
+    t.initial
+  | Handshake ->
+    t.handshake
+  | Zero_RTT | Application_data ->
+    t.application_data

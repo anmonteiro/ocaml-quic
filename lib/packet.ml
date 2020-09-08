@@ -125,6 +125,17 @@ module Header = struct
        *   byte) is set to 1 for long headers. *)
       if Bits.test first_byte 7 then Long else Short
   end
+
+  (* From RFC<QUIC-RFC>§18.2:
+   *   Retry packets (Section 17.2.5), Version Negotiation packets (Section
+   *   17.2.1), and packets with a short header (Section 17.3) do not contain a
+   *   Length field and so cannot be followed by other packets in the same UDP
+   *   datagram. *)
+  let can_be_followed_by_other_packets = function
+    | Long { packet_type = Retry; _ } | Short _ ->
+      false
+    | Initial _ | Long _ ->
+      true
 end
 
 let parse_type first_byte =
@@ -165,3 +176,14 @@ let source_cid = function
     Some source_cid
   | Frames { header; _ } | Retry { header; _ } ->
     Header.source_cid header
+
+(* From RFC<QUIC-RFC>§18.2:
+ *   Retry packets (Section 17.2.5), Version Negotiation packets (Section
+ *   17.2.1), and packets with a short header (Section 17.3) do not contain a
+ *   Length field and so cannot be followed by other packets in the same UDP
+ *   datagram. *)
+let can_be_followed_by_other_packets = function
+  | VersionNegotiation _ | Retry _ | Frames { header = Short _; _ } ->
+    false
+  | Frames _ ->
+    true

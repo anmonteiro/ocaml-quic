@@ -151,7 +151,10 @@ module Frame = struct
     lift
       (fun buffer ->
         Frame.Stream
-          { stream_id; fragment = { IOVec.off; len; buffer }; is_fin = fin })
+          { id = stream_id
+          ; fragment = { IOVec.off; len; buffer }
+          ; is_fin = fin
+          })
       (take_bigstring len)
 
   let parse_max_data_frame =
@@ -411,6 +414,12 @@ module Packet = struct
         variable_length_integer >>= fun token_length ->
         lift2
           (fun token payload_length ->
+            Format.eprintf
+              "AHOY \"%a\" \"%a\"@."
+              Hex.pp
+              (Hex.of_string source_cid.id)
+              Hex.pp
+              (Hex.of_string dest_cid.id);
             ( Packet.Header.Initial { version; source_cid; dest_cid; token }
             , payload_length ))
           (take token_length)

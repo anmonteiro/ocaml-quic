@@ -48,37 +48,12 @@ module Packet_number = struct
     next
 end
 
-module Spaces = struct
-  (* From RFC<QUIC-RFC>§12.3:
-   *   Packet numbers are divided into 3 spaces in QUIC:
-   *
-   *   Initial space: All Initial packets (Section 17.2.2) are in this space.
-   *
-   *   Handshake space: All Handshake packets (Section 17.2.4) are in this
-   *                    space.
-   *
-   *   Application data space: All 0-RTT and 1-RTT encrypted packets (Section
-   *                           12.1) are in this space. *)
-  type 'a t =
-    { initial : 'a
-    ; handshake : 'a
-    ; application_data : 'a
-    }
-
-  let of_encryption_level t = function
-    | Encryption_level.Initial ->
-      t.initial
-    | Handshake ->
-      t.handshake
-    | Zero_RTT | Application_data ->
-      t.application_data
-end
-
 type packet_info =
   { mutable ack_eliciting : bool
   ; packet_number : int64
   ; header : Packet.Header.t
   ; outgoing_frames : Frame.t list Encryption_level.t
+  ; encryption_level : Encryption_level.level
   }
 
 type 'a t =
@@ -95,14 +70,18 @@ type 'a t =
      *   encryption level, each of which starts at an offset of 0. This implies
      *   that each encryption level is treated as a separate CRYPTO stream of
      *   data. *)
-    crypto_streams : Ordered_stream.t Encryption_level.t
+    crypto_streams : Ordered_stream.t Spaces.t
   ; mutable client_address : 'a option
   ; mutable ae_pkts_since_last_ack : int
         (* ack-eliciting packets since we last acknowledged *)
   ; mutable client_transport_params : Transport_parameters.t
+  ; recovery : Recovery.t
   }
 
 let wakeup_writer t = Writer.wakeup t.writer
+
+let on_packet_sent t ~encryption_level ~packet_number frames =
+  Recovery.on_packet_sent t.recovery ~encryption_level ~packet_number frames
 
 let send_packet t ~encryption_level frames =
   Format.eprintf
@@ -113,20 +92,33 @@ let send_packet t ~encryption_level frames =
   let { Crypto.encrypter; _ } =
     Encryption_level.find_exn encryption_level t.encdec
   in
+  let packet_number =
+    Packet_number.send_next
+      (Spaces.of_encryption_level t.packet_numbers encryption_level)
+  in
   Writer.write_frames_packet
     t.writer
     ~encrypter
     ~encryption_level
     ~header_info:(Writer.make_header_info ~source_cid:t.source_cid t.dest_cid)
-    ~packet_number:
-      (Packet_number.send_next
-         (Spaces.of_encryption_level t.packet_numbers encryption_level))
+    ~packet_number
     frames;
-  wakeup_writer t
+  on_packet_sent t ~encryption_level ~packet_number frames
 
 let send_packets t ~packet_info =
-  let { outgoing_frames; packet_number; header; _ } = packet_info in
-  let incoming_packet_enclevel = Encryption_level.of_header header in
+  let { outgoing_frames
+      ; packet_number
+      ; encryption_level = incoming_packet_enclevel
+      ; _
+      }
+    =
+    packet_info
+  in
+  (* From RFC<QUIC-RFC>§12.2:
+   *   Coalescing packets in order of increasing encryption levels (Initial,
+   *   0-RTT, Handshake, 1-RTT; see Section 4.1.4 of [QUIC-TLS]) makes it more
+   *   likely the receiver will be able to process all the packets in a single
+   *   pass. *)
   Encryption_level.ordered_iter
     (fun encryption_level frames ->
       let frames =
@@ -150,10 +142,12 @@ let send_packets t ~packet_info =
           frames
       in
       send_packet t ~encryption_level (List.rev frames))
-    outgoing_frames
+    outgoing_frames;
+  wakeup_writer t
 
-let process_ack_frame _t ~packet_info ~ranges =
-  let { header; _ } = packet_info in
+let process_ack_frame t ~packet_info ~ranges =
+  let { header; encryption_level; _ } = packet_info in
+  Recovery.on_ack_received t.recovery ~encryption_level ~ranges;
   Format.eprintf
     "got ack %a %d %d %d@."
     Encryption_level.pp_hum
@@ -166,7 +160,6 @@ let process_ack_frame _t ~packet_info ~ranges =
 let process_tls_result t ~packet_info ~new_tls_state ~tls_packets =
   let { outgoing_frames; _ } = packet_info in
   let current_cipher = Qtls.current_cipher new_tls_state in
-  (* TODO: send alert as quic error *)
   let (_ : Encryption_level.level * int) =
     List.fold_left
       (fun (cur_encryption_level, off) item ->
@@ -184,6 +177,7 @@ let process_tls_result t ~packet_info ~new_tls_state ~tls_packets =
         | `Change_dec { Tls.State.traffic_secret; _ } ->
           (* decryption change signals switching to a new encryption level *)
           let next = Encryption_level.next outgoing_frames.current in
+          outgoing_frames.current <- next;
           t.encdec.current <- next;
           Encryption_level.update_current
             (function
@@ -221,20 +215,32 @@ let process_tls_result t ~packet_info ~new_tls_state ~tls_packets =
       (outgoing_frames.current, 0)
       tls_packets
   in
+  if
+    Tls.Engine.handshake_in_progress t.tls_state
+    && not (Tls.Engine.handshake_in_progress new_tls_state)
+  then (
+    (* send the HANDSHAKE_DONE frame if we just completed the handshake.
+     *
+     * From RFC<QUIC-RFC>§7.3:
+     *   The server uses the HANDSHAKE_DONE frame (type=0x1e) to signal
+     *   confirmation of the handshake to the client. *)
+    assert (t.encdec.current = Application_data);
+    assert (outgoing_frames.current = Application_data);
+    assert (Option.is_none (Encryption_level.find_current outgoing_frames));
+    let frame = Frame.Handshake_done in
+    Encryption_level.update_current
+      (function None -> Some [ frame ] | Some xs -> Some (frame :: xs))
+      outgoing_frames);
   t.tls_state <- new_tls_state
 
-let process_crypto_frame t ~packet_info fragment =
-  let { header; _ } = packet_info in
-  let enclevel = Encryption_level.of_header header in
-  let crypto_stream = Encryption_level.find_exn enclevel t.crypto_streams in
-  Ordered_stream.add fragment crypto_stream;
-  (* TODO: there might be many fragments *)
-  match Ordered_stream.pop crypto_stream with
+let rec exhaust_crypto_stream t ~packet_info ~stream =
+  let { encryption_level; _ } = packet_info in
+  match Ordered_stream.pop stream with
   | Some { buffer; _ } ->
     let fragment_cstruct = Cstruct.of_bigarray buffer in
     (match t.tls_state.handshake.machina with
     | Server Tls.State.AwaitClientHello | Server13 AwaitClientHelloHRR13 ->
-      assert (Encryption_level.of_header header = Initial);
+      assert (encryption_level = Initial);
       assert (t.encdec.current = Initial);
       (match
          Qtls.handle_raw_record
@@ -267,6 +273,7 @@ let process_crypto_frame t ~packet_info fragment =
         failwith
           (Format.asprintf "Crypto failure: %a@." Sexplib.Sexp.pp_hum sexp)
       | Ok (tls_state', tls_packets, (`Alert _ | `Eof | `No_err)) ->
+        (* TODO: send alerts as quic error *)
         match Qtls.transport_params tls_state' with
         | Some quic_transport_params ->
           (match
@@ -289,7 +296,7 @@ let process_crypto_frame t ~packet_info fragment =
         ( AwaitClientCertificate13 _
         | AwaitClientCertificateVerify13 _
         | AwaitClientFinished13 _ ) ->
-      assert (Encryption_level.of_header header = Handshake);
+      assert (encryption_level = Handshake);
       assert (t.encdec.current = Handshake);
       (match Qtls.handle_raw_record t.tls_state fragment_cstruct with
       | Error e ->
@@ -297,18 +304,29 @@ let process_crypto_frame t ~packet_info fragment =
         failwith
           (Format.asprintf "Crypto failure: %a@." Sexplib.Sexp.pp_hum sexp)
       | Ok (tls_state', tls_packets, (`Alert _ | `Eof | `No_err)) ->
+        (* TODO: send alerts as quic error *)
         process_tls_result t ~packet_info ~new_tls_state:tls_state' ~tls_packets)
     | Server13 Established13 ->
       failwith "handle key updates here"
     | Server Established ->
       failwith "expected tls 1.3"
     | Client _ | Client13 _ | Server _ | Server13 _ ->
-      assert false)
+      assert false);
+    exhaust_crypto_stream t ~packet_info ~stream
   | None ->
     Format.eprintf "NOPE@.";
     ()
 
+let process_crypto_frame t ~packet_info fragment =
+  let { encryption_level; _ } = packet_info in
+  let crypto_stream =
+    Spaces.of_encryption_level t.crypto_streams encryption_level
+  in
+  Ordered_stream.add fragment crypto_stream;
+  exhaust_crypto_stream t ~packet_info ~stream:crypto_stream
+
 let frame_handler ~packet_info t frame =
+  (* TODO: validate that frame can appear at current encryption level. *)
   if Frame.is_ack_eliciting frame then packet_info.ack_eliciting <- true;
   match frame with
   | Frame.Padding _n ->
@@ -378,6 +396,7 @@ let packet_handler t packet =
   | Frames { header; payload; packet_number; _ } ->
     let packet_info =
       { header
+      ; encryption_level = Encryption_level.of_header header
       ; packet_number
       ; ack_eliciting = false
       ; outgoing_frames = Encryption_level.create ~current:t.encdec.current ()
@@ -390,6 +409,25 @@ let packet_handler t packet =
          payload
      with
     | Ok () ->
+      (* process streams for packets that have been acknowledged. *)
+      let acked_frames =
+        Recovery.drain_acknowledged
+          t.recovery
+          ~encryption_level:packet_info.encryption_level
+      in
+      List.iter
+        (function
+          | Frame.Crypto { IOVec.off = _; _ } ->
+            ()
+          | Stream { id = _; fragment = _; _ } ->
+            ()
+          | Ack { ranges = _; _ } ->
+            (* TODO: when we track packets that need acknowledgement, update the
+               largest acknowledged here. *)
+            ()
+          | _other ->
+            ())
+        acked_frames;
       (* packet_info should now contain frames we need to send in response. *)
       send_packets t ~packet_info
     | Error e ->
@@ -398,12 +436,13 @@ let packet_handler t packet =
     failwith "NYI: retry"
 
 let initialize_crypto_streams () =
-  let streams = Encryption_level.create () in
-  Encryption_level.add Initial (Ordered_stream.create ()) streams;
-  Encryption_level.add Zero_RTT (Ordered_stream.create ()) streams;
-  Encryption_level.add Handshake (Ordered_stream.create ()) streams;
-  Encryption_level.add Application_data (Ordered_stream.create ()) streams;
-  streams
+  (* From RFC<QUIC-RFC>§19.6:
+   *   The CRYPTO frame (type=0x06) is used to transmit cryptographic handshake
+   *   messages. It can be sent in all packet types except 0-RTT. *)
+  Spaces.create
+    ~initial:(Ordered_stream.create ())
+    ~handshake:(Ordered_stream.create ())
+    ~application_data:(Ordered_stream.create ())
 
 let create () =
   let cert = "./certificates/server.pem" in
@@ -427,7 +466,9 @@ let create () =
         ())
     | _ ->
       ());
-    Format.eprintf "decrypt me @.";
+    Format.eprintf
+      "decrypt me %d@."
+      (Encryption_level.of_header header |> Encryption_level.Ord.to_int);
     Crypto.AEAD.decrypt_packet
       (Option.get
          (Encryption_level.find_exn
@@ -442,10 +483,10 @@ let create () =
       ; writer = Writer.create 0x1000
       ; encdec = Encryption_level.create ()
       ; packet_numbers =
-          { initial = Packet_number.create ()
-          ; handshake = Packet_number.create ()
-          ; application_data = Packet_number.create ()
-          }
+          Spaces.create
+            ~initial:(Packet_number.create ())
+            ~handshake:(Packet_number.create ())
+            ~application_data:(Packet_number.create ())
       ; crypto_streams
       ; tls_state = Qtls.server ~cert ~priv_key
       ; source_cid =
@@ -459,6 +500,7 @@ let create () =
       ; client_address = None
       ; ae_pkts_since_last_ack = 0
       ; client_transport_params = Transport_parameters.default
+      ; recovery = Recovery.create ()
       }
   in
   Lazy.force t
@@ -488,8 +530,8 @@ let read_with_more t ?client_address bs ~off ~len more =
   consumed
 
 let read t ?client_address bs ~off ~len =
-  let hex = Hex.of_string (Bigstringaf.substring bs ~off ~len) in
-  Format.eprintf "wtf: %a@." Hex.pp hex;
+  (* let hex = Hex.of_string (Bigstringaf.substring bs ~off ~len) in *)
+  (* Format.eprintf "wtf: %a@." Hex.pp hex; *)
   read_with_more t ?client_address bs ~off ~len Incomplete
 
 let read_eof t bs ~off ~len = read_with_more t bs ~off ~len Complete
