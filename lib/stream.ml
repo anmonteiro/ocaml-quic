@@ -48,29 +48,71 @@ module Q : Psq.S with type k = int and type p = fragment =
         compare off1 off2
     end)
 
-type t =
-  { mutable q : Q.t
-  ; mutable offset : int (* TODO: int64? *)
-  }
+module Recv = struct
+  type t =
+    { mutable q : Q.t
+    ; mutable offset : int (* TODO: int64? *)
+    }
 
-let create () = { q = Q.empty; offset = 0 }
+  let push ({ IOVec.off; len; _ } as fragment) t =
+    (* From RFC<QUIC-RFC>§2.2:
+     *   An endpoint could receive data for a stream at the same stream offset
+     *   multiple times. Data that has already been received can be discarded. *)
+    if t.offset < off + len then
+      let q' = Q.add off fragment t.q in
+      t.q <- q'
 
-let add ({ IOVec.off; len; _ } as fragment) t =
-  (* From RFC<QUIC-RFC>§2.2:
-   *   An endpoint could receive data for a stream at the same stream offset
-   *   multiple times. Data that has already been received can be discarded. *)
-  if t.offset < off + len then
-    let q' = Q.add off fragment t.q in
+  let pop t =
+    match Q.pop t.q with
+    | Some ((off, fragment), q') ->
+      if off = t.offset then (
+        t.offset <- t.offset + fragment.len;
+        t.q <- q';
+        Some fragment)
+      else
+        None
+    | None ->
+      None
+
+  let remove off t =
+    let q' = Q.remove off t.q in
     t.q <- q'
 
-let pop t =
-  match Q.pop t.q with
-  | Some ((off, fragment), q') ->
-    if off = t.offset then (
-      t.offset <- t.offset + fragment.len;
+  let create () = { q = Q.empty; offset = 0 }
+end
+
+module Send = struct
+  type t =
+    { mutable q : Q.t
+    ; mutable offset : int (* TODO: int64? *)
+    }
+
+  let push buffer t =
+    let len = Bigstringaf.length buffer in
+    let fragment = { IOVec.off = t.offset; len; buffer } in
+    let q' = Q.add t.offset fragment t.q in
+    t.q <- q';
+    t.offset <- t.offset + len;
+    fragment
+
+  let pop t =
+    match Q.pop t.q with
+    | Some ((_, fragment), q') ->
       t.q <- q';
-      Some fragment)
-    else
+      Some fragment
+    | None ->
       None
-  | None ->
-    None
+
+  let remove off t =
+    let q' = Q.remove off t.q in
+    t.q <- q'
+
+  let create () = { q = Q.empty; offset = 0 }
+end
+
+type bidi =
+  { send : Send.t
+  ; recv : Recv.t
+  }
+
+let create_bidi () = { send = Send.create (); recv = Recv.create () }

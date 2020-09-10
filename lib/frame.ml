@@ -287,14 +287,14 @@ type t =
       { stream_id : int
       ; application_protocol_error : int
       }
-  | Crypto of Ordered_stream.fragment
+  | Crypto of Stream.fragment
   | New_token of
       { length : int
       ; data : Bigstringaf.t
       }
   | Stream of
       { id : int
-      ; fragment : Ordered_stream.fragment
+      ; fragment : Stream.fragment
       ; is_fin : bool
       }
   | Max_data of int

@@ -100,7 +100,7 @@ type 'a connection =
      *   encryption level, each of which starts at an offset of 0. This implies
      *   that each encryption level is treated as a separate CRYPTO stream of
      *   data. *)
-    crypto_streams : Ordered_stream.t Spaces.t
+    crypto_streams : Stream.bidi Spaces.t
   ; mutable client_address : 'a
   ; mutable client_transport_params : Transport_parameters.t
   ; recovery : Recovery.t
@@ -191,9 +191,9 @@ let process_ack_frame t ~packet_info ~ranges =
 let process_tls_result t ~packet_info ~new_tls_state ~tls_packets =
   let { outgoing_frames; _ } = packet_info in
   let current_cipher = Qtls.current_cipher new_tls_state in
-  let (_ : Encryption_level.level * int) =
+  let (_ : Encryption_level.level) =
     List.fold_left
-      (fun (cur_encryption_level, off) item ->
+      (fun cur_encryption_level item ->
         match item with
         | `Change_enc { Tls.State.traffic_secret; _ } ->
           let next = Encryption_level.next cur_encryption_level in
@@ -204,7 +204,7 @@ let process_tls_result t ~packet_info ~new_tls_state ~tls_packets =
             ; decrypter = None
             }
             t.encdec;
-          cur_encryption_level, off
+          cur_encryption_level
         | `Change_dec { Tls.State.traffic_secret; _ } ->
           (* decryption change signals switching to a new encryption level *)
           let next = Encryption_level.next outgoing_frames.current in
@@ -228,22 +228,24 @@ let process_tls_result t ~packet_info ~new_tls_state ~tls_packets =
            *   The offsets used by CRYPTO frames to ensure ordered delivery
            *   of cryptographic handshake data start from zero in each
            *   packet number space. *)
-          next, 0
+          next
         | `Record ((ct : Tls.Packet.content_type), cs) ->
           assert (ct = HANDSHAKE);
-          let len = Cstruct.len cs in
-          let off' = off + len in
-          let frame =
-            Frame.Crypto { IOVec.off; len; buffer = Cstruct.to_bigarray cs }
+          let crypto_stream =
+            Spaces.of_encryption_level t.crypto_streams cur_encryption_level
           in
+          let fragment =
+            Stream.Send.push (Cstruct.to_bigarray cs) crypto_stream.send
+          in
+          let frame = Frame.Crypto fragment in
           Encryption_level.update
             cur_encryption_level
             (function None -> Some [ frame ] | Some xs -> Some (frame :: xs))
             outgoing_frames;
-          cur_encryption_level, off')
+          cur_encryption_level)
       (* TODO: it's wrong to start from 0 everytime. Need to keep track of
        * this stream's offset. *)
-      (outgoing_frames.current, 0)
+      outgoing_frames.current
       tls_packets
   in
   if
@@ -266,7 +268,7 @@ let process_tls_result t ~packet_info ~new_tls_state ~tls_packets =
 
 let rec exhaust_crypto_stream t ~packet_info ~stream =
   let { encryption_level; _ } = packet_info in
-  match Ordered_stream.pop stream with
+  match Stream.Recv.pop stream with
   | Some { buffer; _ } ->
     let fragment_cstruct = Cstruct.of_bigarray buffer in
     (match t.tls_state.handshake.machina with
@@ -352,8 +354,8 @@ let process_crypto_frame t ~packet_info fragment =
   let crypto_stream =
     Spaces.of_encryption_level t.crypto_streams encryption_level
   in
-  Ordered_stream.add fragment crypto_stream;
-  exhaust_crypto_stream t ~packet_info ~stream:crypto_stream
+  Stream.Recv.push fragment crypto_stream.recv;
+  exhaust_crypto_stream t ~packet_info ~stream:crypto_stream.recv
 
 let frame_handler ~packet_info t frame =
   (* TODO: validate that frame can appear at current encryption level. *)
@@ -413,9 +415,9 @@ let initialize_crypto_streams () =
    *   The CRYPTO frame (type=0x06) is used to transmit cryptographic handshake
    *   messages. It can be sent in all packet types except 0-RTT. *)
   Spaces.create
-    ~initial:(Ordered_stream.create ())
-    ~handshake:(Ordered_stream.create ())
-    ~application_data:(Ordered_stream.create ())
+    ~initial:(Stream.create_bidi ())
+    ~handshake:(Stream.create_bidi ())
+    ~application_data:(Stream.create_bidi ())
 
 let new_connection ~client_address ~tls_state =
   let crypto_streams = initialize_crypto_streams () in
@@ -514,8 +516,13 @@ let packet_handler t packet =
       in
       List.iter
         (function
-          | Frame.Crypto { IOVec.off = _; _ } ->
-            ()
+          | Frame.Crypto { IOVec.off; _ } ->
+            let crypto_stream =
+              Spaces.of_encryption_level
+                c.crypto_streams
+                packet_info.encryption_level
+            in
+            Stream.Send.remove off crypto_stream.send
           | Stream { id = _; fragment = _; _ } ->
             ()
           | Ack { ranges = _; _ } ->
