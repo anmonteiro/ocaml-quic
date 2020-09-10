@@ -30,12 +30,6 @@
  *  POSSIBILITY OF SUCH DAMAGE.
  *---------------------------------------------------------------------------*)
 
-module Direction = struct
-  type t =
-    | Unidirectional
-    | Bidirectional
-end
-
 module Type = struct
   type t =
     (* From RFC<QUIC-RFC>§19.1:
@@ -96,7 +90,7 @@ module Type = struct
      *   A MAX_STREAMS frame with a type of 0x12 applies to bidirectional
      *   streams, and a MAX_STREAMS frame with a type of 0x13 applies to
      *   unidirectional streams. *)
-    | Max_streams of Direction.t
+    | Max_streams of Stream.Direction.t
     (* From RFC<QUIC-RFC>§19.1:
      *   A sender SHOULD send a DATA_BLOCKED frame (type=0x14) when it wishes
      *   to send data, but is unable to due to connection-level flow control
@@ -114,7 +108,7 @@ module Type = struct
      *   type 0x16 is used to indicate reaching the bidirectional stream limit,
      *   and a STREAMS_BLOCKED frame of type 0x17 indicates reaching the
      *   unidirectional stream limit. *)
-    | Streams_blocked of Direction.t
+    | Streams_blocked of Stream.Direction.t
     (* From RFC<QUIC-RFC>§19.1:
      *   An endpoint sends a NEW_CONNECTION_ID frame (type=0x18) to provide its
      *   peer with alternative connection IDs that can be used to break
@@ -293,7 +287,7 @@ type t =
       ; data : Bigstringaf.t
       }
   | Stream of
-      { id : int
+      { id : Stream_id.t
       ; fragment : Stream.fragment
       ; is_fin : bool
       }
@@ -302,13 +296,13 @@ type t =
       { stream_id : int
       ; max_data : int
       }
-  | Max_streams of Direction.t * int
+  | Max_streams of Stream.Direction.t * int
   | Data_blocked of int
   | Stream_data_blocked of
-      { stream_id : int
+      { id : Stream_id.t
       ; max_data : int
       }
-  | Streams_blocked of Direction.t * int
+  | Streams_blocked of Stream.Direction.t * int
   | New_connection_id of
       { cid : CID.t
       ; stateless_reset_token : string

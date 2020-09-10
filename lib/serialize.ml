@@ -141,7 +141,7 @@ module Frame = struct
 
   let write_stream t ~stream_id ~fragment =
     let { IOVec.off; len; buffer } = fragment in
-    write_variable_length_integer t stream_id;
+    write_variable_length_integer t (Int64.to_int stream_id);
     if off > 0 then
       write_variable_length_integer t off;
     if len > 0 then
@@ -158,8 +158,8 @@ module Frame = struct
 
   let write_data_blocked t ~max = write_variable_length_integer t max
 
-  let write_stream_data_blocked t ~stream_id ~max =
-    write_variable_length_integer t stream_id;
+  let write_stream_data_blocked t ~id ~max =
+    write_variable_length_integer t (Int64.to_int id);
     write_variable_length_integer t max
 
   let write_streams_blocked t ~max = write_variable_length_integer t max
@@ -223,8 +223,8 @@ module Frame = struct
       write_max_streams t ~max
     | Data_blocked n ->
       write_data_blocked t ~max:n
-    | Stream_data_blocked { stream_id; max_data } ->
-      write_stream_data_blocked t ~stream_id ~max:max_data
+    | Stream_data_blocked { id; max_data } ->
+      write_stream_data_blocked t ~id ~max:max_data
     | Streams_blocked (_, n) ->
       write_streams_blocked t ~max:n
     | New_connection_id

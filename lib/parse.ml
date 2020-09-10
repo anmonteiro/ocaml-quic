@@ -153,7 +153,7 @@ module Frame = struct
     lift
       (fun buffer ->
         Frame.Stream
-          { id = stream_id
+          { id = Int64.of_int stream_id
           ; fragment = { IOVec.off; len; buffer }
           ; is_fin = fin
           })
@@ -176,7 +176,8 @@ module Frame = struct
 
   let parse_stream_data_blocked_frame =
     lift2
-      (fun stream_id n -> Frame.Stream_data_blocked { stream_id; max_data = n })
+      (fun stream_id n ->
+        Frame.Stream_data_blocked { id = Int64.of_int stream_id; max_data = n })
       variable_length_integer
       variable_length_integer
 
@@ -373,15 +374,11 @@ module Packet = struct
 
     let parser ~pn_length ~header ~packet_number ~payload_length plaintext =
       let payload_length =
-        match header with
-        | Packet.Header.Short _ ->
-          payload_length
-        | Initial _ | Long _ ->
-          (* From RFC<QUIC-RFC>§17.2:
-           *   Length: The length of the remainder of the packet (that is, the
-           *   Packet Number and Payload fields) in bytes, encoded as a
-           *   variable-length integer (Section 16). *)
-          payload_length - pn_length
+        (* From RFC<QUIC-RFC>§17.2:
+         *   Length: The length of the remainder of the packet (that is, the
+         *   Packet Number and Payload fields) in bytes, encoded as a
+         *   variable-length integer (Section 16). *)
+        payload_length - pn_length
       in
       payload ~payload_length ~header ~packet_number plaintext
   end
@@ -496,7 +493,6 @@ module Packet = struct
     let first_byte = Char.code first_byte in
     available >>= fun avail ->
     Unsafe.peek avail (fun bs ~off ~len ->
-        (* let first_byte = Char.code (Bigstringaf.unsafe_get bs off) in *)
         if not (Bits.test first_byte 6) then
           (* From RFC<QUIC-RFC>§17.2:
            *   Fixed Bit: The next bit (0x40) of byte 0 is set to 1. Packets
@@ -507,11 +503,16 @@ module Packet = struct
           let has_header_protection = is_protected bs ~off in
           if has_header_protection then
             let header, payload_length =
-              Result.get_ok
-                (Angstrom.parse_bigstring
-                   ~consume:Prefix
-                   protected_header
-                   (Bigstringaf.sub bs ~off ~len))
+              match
+                Angstrom.parse_bigstring
+                  ~consume:Prefix
+                  protected_header
+                  (Bigstringaf.sub bs ~off ~len)
+              with
+              | Ok x ->
+                x
+              | Error e ->
+                failwith e
             in
             Decrypted
               { header

@@ -110,9 +110,17 @@ module Send = struct
   let create () = { q = Q.empty; offset = 0 }
 end
 
-type bidi =
+module Direction = struct
+  type t =
+    | Unidirectional
+    | Bidirectional
+end
+
+type t =
   { send : Send.t
   ; recv : Recv.t
+  ; direction : Direction.t
   }
 
-let create_bidi () = { send = Send.create (); recv = Recv.create () }
+let create ~direction =
+  { send = Send.create (); recv = Recv.create (); direction }

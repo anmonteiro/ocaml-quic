@@ -63,3 +63,9 @@ let is_client_initiated t = Int64.equal (Int64.logand t 0b1L) 0L
  *   of the stream. [...] server-initiated streams have odd-numbered stream IDs
  *   (with the bit set to 1). *)
 let is_server_initiated t = Int64.equal (Int64.logand t 0b1L) 1L
+
+let classify t =
+  if is_bidi t then
+    Stream.Direction.Bidirectional
+  else
+    Unidirectional

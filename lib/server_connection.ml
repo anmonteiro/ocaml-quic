@@ -100,12 +100,13 @@ type 'a connection =
      *   encryption level, each of which starts at an offset of 0. This implies
      *   that each encryption level is treated as a separate CRYPTO stream of
      *   data. *)
-    crypto_streams : Stream.bidi Spaces.t
+    crypto_streams : Stream.t Spaces.t
   ; mutable client_address : 'a
   ; mutable client_transport_params : Transport_parameters.t
   ; recovery : Recovery.t
   ; queued_packets : (Writer.header_info * Frame.t list) Queue.t
   ; writer : Writer.t
+  ; streams : (Stream_id.t, Stream.t) Hashtbl.t
   }
 
 type 'a packet_info =
@@ -357,6 +358,26 @@ let process_crypto_frame t ~packet_info fragment =
   Stream.Recv.push fragment crypto_stream.recv;
   exhaust_crypto_stream t ~packet_info ~stream:crypto_stream.recv
 
+let rec process_stream_data t ~stream =
+  match Stream.Recv.pop stream with
+  | Some fragment ->
+    process_stream_data t ~stream
+  | None ->
+    ()
+
+let process_stream_frame t ~id ~fragment ~is_fin:_ =
+  let stream =
+    match Hashtbl.find_opt t.streams id with
+    | Some stream ->
+      stream
+    | None ->
+      let stream = Stream.create ~direction:(Stream_id.classify id) in
+      Hashtbl.add t.streams id stream;
+      stream
+  in
+  Stream.Recv.push fragment stream.recv;
+  process_stream_data t ~stream:stream.recv
+
 let frame_handler ~packet_info t frame =
   (* TODO: validate that frame can appear at current encryption level. *)
   if Frame.is_ack_eliciting frame then
@@ -389,8 +410,13 @@ let frame_handler ~packet_info t frame =
          (Frame.Type.serialize (Frame.to_frame_type frame)))
   | Crypto fragment ->
     process_crypto_frame t ~packet_info fragment
-  | New_token _
-  | Stream _
+  | New_token _ ->
+    failwith
+      (Format.asprintf
+         "frame NYI: 0x%x"
+         (Frame.Type.serialize (Frame.to_frame_type frame)))
+  | Stream { id; fragment; is_fin } ->
+    process_stream_frame t ~id ~fragment ~is_fin
   | Max_data _
   | Max_stream_data _
   | Max_streams (_, _)
@@ -415,9 +441,9 @@ let initialize_crypto_streams () =
    *   The CRYPTO frame (type=0x06) is used to transmit cryptographic handshake
    *   messages. It can be sent in all packet types except 0-RTT. *)
   Spaces.create
-    ~initial:(Stream.create_bidi ())
-    ~handshake:(Stream.create_bidi ())
-    ~application_data:(Stream.create_bidi ())
+    ~initial:(Stream.create ~direction:Bidirectional)
+    ~handshake:(Stream.create ~direction:Bidirectional)
+    ~application_data:(Stream.create ~direction:Bidirectional)
 
 let new_connection ~client_address ~tls_state =
   let crypto_streams = initialize_crypto_streams () in
@@ -443,6 +469,7 @@ let new_connection ~client_address ~tls_state =
   ; recovery = Recovery.create ()
   ; queued_packets = Queue.create ()
   ; writer = Writer.create 0x1000
+  ; streams = Hashtbl.create ~random:true 1024
   }
 
 let packet_handler t packet =
