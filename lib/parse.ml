@@ -303,7 +303,7 @@ module Packet = struct
     end
 
     module Short = struct
-      let parse = take CID.length
+      let parse = CID.of_string <$> take CID.src_length
     end
   end
 
@@ -372,16 +372,18 @@ module Packet = struct
         { header; payload_length; payload = plaintext; packet_number }
 
     let parser ~pn_length ~header ~packet_number ~payload_length plaintext =
-      match header with
-      | Packet.Header.Short _ ->
-        payload ~payload_length ~header ~packet_number plaintext
-      | Initial _ | Long _ ->
-        (* From RFC<QUIC-RFC>§17.2:
-         *   Length: The length of the remainder of the packet (that is, the
-         *   Packet Number and Payload fields) in bytes, encoded as a
-         *   variable-length integer (Section 16). *)
-        let payload_length = payload_length - pn_length in
-        payload ~payload_length ~header ~packet_number plaintext
+      let payload_length =
+        match header with
+        | Packet.Header.Short _ ->
+          payload_length
+        | Initial _ | Long _ ->
+          (* From RFC<QUIC-RFC>§17.2:
+           *   Length: The length of the remainder of the packet (that is, the
+           *   Packet Number and Payload fields) in bytes, encoded as a
+           *   variable-length integer (Section 16). *)
+          payload_length - pn_length
+      in
+      payload ~payload_length ~header ~packet_number plaintext
   end
 
   let unprotected =
@@ -416,12 +418,6 @@ module Packet = struct
         variable_length_integer >>= fun token_length ->
         lift2
           (fun token payload_length ->
-            Format.eprintf
-              "AHOY \"%a\" \"%a\"@."
-              Hex.pp
-              (Hex.of_string source_cid.id)
-              Hex.pp
-              (Hex.of_string dest_cid.id);
             ( Packet.Header.Initial { version; source_cid; dest_cid; token }
             , payload_length ))
           (take token_length)
@@ -449,10 +445,7 @@ module Packet = struct
    *  }
    *)
   let short_header =
-    lift
-      (fun dest_cid ->
-        Packet.Header.Short { dest_cid = CID.{ id = dest_cid; length } })
-      Header.Short.parse
+    lift (fun dest_cid -> Packet.Header.Short { dest_cid }) Header.Short.parse
 
   let protected_header =
     any_uint8 >>= fun first_byte ->

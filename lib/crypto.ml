@@ -496,10 +496,12 @@ module AEAD = struct
     let hash = Tls.Ciphersuite.hash13 ciphersuite in
     let kn, ivn = Tls.Ciphersuite.kn_13 ciphersuite13 in
     let key, iv = Kdf.get_key_and_iv ~hash ~kn ~ivn secret in
-    let hp_key = Kdf.get_header_protection_key ~hash ~kn secret in
-    let cipher = get_cipher_st ciphersuite13 key in
-    let conn_id_len = CID.length in
-    { conn_id_len; cipher; ciphersuite = ciphersuite13; iv; hp_key }
+    { conn_id_len = CID.src_length
+    ; cipher = get_cipher_st ciphersuite13 key
+    ; ciphersuite = ciphersuite13
+    ; iv
+    ; hp_key = Kdf.get_header_protection_key ~hash ~kn secret
+    }
 end
 
 module InitialAEAD = struct
@@ -548,7 +550,7 @@ module InitialAEAD = struct
    *   AEAD_AES_128_GCM and a key derived from the Destination Connection ID in
    *   the client's first Initial packet (see Section 5.2). *)
   let make ~mode dest_cid =
-    let secret = get_secret ~mode dest_cid in
+    let secret = get_secret ~mode (CID.to_string dest_cid) in
     AEAD.make ~ciphersuite:`AES_128_GCM_SHA256 secret
 end
 
@@ -573,17 +575,19 @@ module Retry = struct
   let nonce =
     Cstruct.of_string "\xe5\x49\x30\xf9\x7f\x21\x36\xf0\x53\x0a\x8c\x1c"
 
-  let calculate_integrity_tag { CID.length; id } pseudo0 =
-    let pseudo_len = length + Bigstringaf.length pseudo0 + 1 in
+  let calculate_integrity_tag cid pseudo0 =
+    let cid_len = CID.length cid in
+    let cid = CID.to_string cid in
+    let pseudo_len = cid_len + Bigstringaf.length pseudo0 + 1 in
     let pseudo = Cstruct.create pseudo_len in
-    Cstruct.set_uint8 pseudo 0 length;
-    for i = 1 to length do
-      Cstruct.set_char pseudo i (String.unsafe_get id (i - 1))
+    Cstruct.set_uint8 pseudo 0 cid_len;
+    for i = 1 to cid_len do
+      Cstruct.set_char pseudo i (String.unsafe_get cid (i - 1))
     done;
     for i = 0 to Bigstringaf.length pseudo0 - 1 do
       Cstruct.set_char
         pseudo
-        (i + length + 1)
+        (i + cid_len + 1)
         (Bigstringaf.unsafe_get pseudo0 i)
     done;
     AES_GCM.authenticate_encrypt ~key ~nonce ~adata:pseudo Cstruct.empty

@@ -343,7 +343,7 @@ module Pkt = struct
        *                  included prior to protection MUST be set to 0. *)
       assert (first_byte land 0b00011000 = 0);
       Faraday.write_uint8 t first_byte;
-      Faraday.write_string t dest_cid.CID.id
+      Faraday.write_string t (CID.to_string dest_cid)
 
     let write_packet_header t ~pn_length ~header =
       (* TODO: proper packet number length *)
@@ -411,6 +411,7 @@ module Writer = struct
     ; token : string
     ; encryption_level : Encryption_level.level
     ; packet_number : int64
+    ; encrypter : Crypto.AEAD.t
     }
 
   type t =
@@ -424,13 +425,12 @@ module Writer = struct
           (* The number of bytes that were not written due to the output stream
            * being closed before all buffered output could be written. Useful
            * for detecting error cases. *)
-    ; mutable wakeup : Optional_thunk.t
     }
 
   let create buffer_size =
     let buffer = Bigstringaf.create buffer_size in
     let encoder = Faraday.of_bigstring buffer in
-    { buffer; encoder; drained_bytes = 0; wakeup = Optional_thunk.none }
+    { buffer; encoder; drained_bytes = 0 }
 
   (* From RFC<QUIC-RFC>§15:
    *   Version numbers used to identify IETF drafts are created by adding the
@@ -441,6 +441,7 @@ module Writer = struct
    *
    * 0xff000000 + 0x1d = 0xff00001d *)
   let make_header_info
+      ~encrypter
       ~packet_number
       ~encryption_level
       ?(source_cid = CID.empty)
@@ -448,7 +449,14 @@ module Writer = struct
       ?(token = "")
       dest_cid
     =
-    { version; source_cid; dest_cid; token; packet_number; encryption_level }
+    { encrypter
+    ; version
+    ; source_cid
+    ; dest_cid
+    ; token
+    ; packet_number
+    ; encryption_level
+    }
 
   (* From RFC<QUIC-TLS-RFC>§4:
    *
@@ -483,18 +491,22 @@ module Writer = struct
     | Application_data ->
       Short { dest_cid }
 
-  let write_frames_packet t ~encrypter ~header_info frames =
+  let write_frames_packet t ~header_info frames =
+    let tag_len = Crypto.AEAD.tag_len header_info.encrypter in
     let pn_length = packet_number_length header_info.packet_number in
     let tmpf = Faraday.create 0x400 in
     List.iter (Frame.write_frame tmpf) frames;
     let frames = Faraday.serialize_to_bigstring tmpf in
     let tmpf = Faraday.create 0x400 in
     Pkt.write_packet_payload tmpf frames;
+    let pn_offset = 4 - pn_length in
+    let cur_size = Bigstringaf.length frames + tag_len in
+    (if pn_offset + (* sample size *) 16 > cur_size then (* needs padding *)
+       let n_padding = pn_offset + 16 - cur_size in
+       Frame.write_padding tmpf n_padding);
     let plaintext = Cstruct.of_bigarray (Faraday.serialize_to_bigstring tmpf) in
     (* AEAD ciphertext length is the same as the plaintext length (+ tag). *)
-    let payload_length =
-      Cstruct.len plaintext + Crypto.AEAD.tag_len encrypter
-    in
+    let payload_length = Cstruct.len plaintext + tag_len in
     let header = header_of_encryption_level header_info in
     let hf = Faraday.create 0x100 in
     Pkt.Header.write_packet_header hf ~pn_length ~header;
@@ -508,7 +520,7 @@ module Writer = struct
     in
     let protected =
       Crypto.AEAD.encrypt_packet
-        encrypter
+        header_info.encrypter
         ~packet_number:header_info.packet_number
         ~header:unprotected_header
         plaintext
@@ -516,19 +528,6 @@ module Writer = struct
     Faraday.schedule_bigstring t.encoder (Cstruct.to_bigarray protected)
 
   let faraday t = t.encoder
-
-  let on_wakeup_writer t k =
-    if Faraday.is_closed t.encoder then
-      failwith "on_wakeup_writer on closed conn"
-    else if Optional_thunk.is_some t.wakeup then
-      failwith "on_wakeup: only one callback can be registered at a time"
-    else
-      t.wakeup <- Optional_thunk.some k
-
-  let wakeup t =
-    let f = t.wakeup in
-    t.wakeup <- Optional_thunk.none;
-    Optional_thunk.call_if_some f
 
   let flush t f = flush t.encoder f
 

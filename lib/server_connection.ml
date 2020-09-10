@@ -34,6 +34,14 @@ module Result = Stdlib.Result
 module Reader = Parse.Reader
 module Writer = Serialize.Writer
 
+module Conntbl = Hashtbl.MakeSeeded (struct
+  type t = CID.t
+
+  let equal = CID.equal
+
+  let hash i k = Hashtbl.seeded_hash i k
+end)
+
 module Packet_number = struct
   module PSet = Set.Make (Int64)
 
@@ -80,17 +88,8 @@ module Packet_number = struct
     Frame.Ack { delay = 0; ranges; ecn_counts = None }
 end
 
-type packet_info =
-  { packet_number : int64
-  ; header : Packet.Header.t
-  ; outgoing_frames : Frame.t list Encryption_level.t
-  ; encryption_level : Encryption_level.level
-  }
-
-type 'a t =
-  { reader : Reader.server
-  ; writer : Writer.t
-  ; encdec : Crypto.encdec Encryption_level.t
+type 'a connection =
+  { encdec : Crypto.encdec Encryption_level.t
   ; mutable tls_state : Qtls.t
   ; packet_number_spaces : Packet_number.t Spaces.t
   ; mutable source_cid : CID.t
@@ -102,33 +101,61 @@ type 'a t =
      *   that each encryption level is treated as a separate CRYPTO stream of
      *   data. *)
     crypto_streams : Ordered_stream.t Spaces.t
-  ; mutable client_address : 'a option
+  ; mutable client_address : 'a
   ; mutable client_transport_params : Transport_parameters.t
   ; recovery : Recovery.t
   ; queued_packets : (Writer.header_info * Frame.t list) Queue.t
+  ; writer : Writer.t
   }
 
-let wakeup_writer t = Writer.wakeup t.writer
+type 'a packet_info =
+  { packet_number : int64
+  ; header : Packet.Header.t
+  ; outgoing_frames : Frame.t list Encryption_level.t
+  ; encryption_level : Encryption_level.level
+  ; connection : 'a connection
+  }
+
+type 'a t =
+  { reader : Reader.server
+  ; connections : 'a connection Conntbl.t
+  ; base_tls_state : Qtls.t
+  ; mutable current_client_address : 'a option
+  ; mutable wakeup_writer : Optional_thunk.t
+  ; mutable closed : bool
+  }
+
+let wakeup_writer t =
+  let f = t.wakeup_writer in
+  t.wakeup_writer <- Optional_thunk.none;
+  Optional_thunk.call_if_some f
 
 let on_packet_sent t ~encryption_level ~packet_number frames =
   Recovery.on_packet_sent t.recovery ~encryption_level ~packet_number frames
 
-let send_packet t ~encryption_level frames =
+let send_packet c ~encryption_level frames =
   let packet_number =
     Packet_number.send_next
-      (Spaces.of_encryption_level t.packet_number_spaces encryption_level)
+      (Spaces.of_encryption_level c.packet_number_spaces encryption_level)
+  in
+  let { Crypto.encrypter; _ } =
+    Encryption_level.find_exn encryption_level c.encdec
   in
   let header_info =
     Writer.make_header_info
+      ~encrypter
       ~packet_number
       ~encryption_level
-      ~source_cid:t.source_cid
-      t.dest_cid
+      ~source_cid:c.source_cid
+      c.dest_cid
   in
-  Queue.add (header_info, frames) t.queued_packets
+  Queue.add (header_info, frames) c.queued_packets
 
+(* FIXME: this is only sending acks for encryption levels present in
+ * `outgoing_frames`. We need to check other encryption levels, e.g. in order
+ * to ACK `Handshake` packets from the client. *)
 let send_packets t ~packet_info =
-  let { outgoing_frames; _ } = packet_info in
+  let { connection = c; outgoing_frames; _ } = packet_info in
   (* From RFC<QUIC-RFC>§12.2:
    *   Coalescing packets in order of increasing encryption levels (Initial,
    *   0-RTT, Handshake, 1-RTT; see Section 4.1.4 of [QUIC-TLS]) makes it more
@@ -137,7 +164,7 @@ let send_packets t ~packet_info =
   Encryption_level.ordered_iter
     (fun encryption_level frames ->
       let pn_space =
-        Spaces.of_encryption_level t.packet_number_spaces encryption_level
+        Spaces.of_encryption_level c.packet_number_spaces encryption_level
       in
       let frames =
         if pn_space.ack_elicited then
@@ -145,7 +172,7 @@ let send_packets t ~packet_info =
         else
           frames
       in
-      send_packet t ~encryption_level (List.rev frames))
+      send_packet c ~encryption_level (List.rev frames))
     outgoing_frames;
   wakeup_writer t
 
@@ -381,22 +408,85 @@ let frame_handler ~packet_info t frame =
          "frame NYI: 0x%x"
          (Frame.Type.serialize (Frame.to_frame_type frame)))
 
+let initialize_crypto_streams () =
+  (* From RFC<QUIC-RFC>§19.6:
+   *   The CRYPTO frame (type=0x06) is used to transmit cryptographic handshake
+   *   messages. It can be sent in all packet types except 0-RTT. *)
+  Spaces.create
+    ~initial:(Ordered_stream.create ())
+    ~handshake:(Ordered_stream.create ())
+    ~application_data:(Ordered_stream.create ())
+
+let new_connection ~client_address ~tls_state =
+  let crypto_streams = initialize_crypto_streams () in
+  { encdec = Encryption_level.create ()
+  ; packet_number_spaces =
+      Spaces.create
+        ~initial:(Packet_number.create ())
+        ~handshake:(Packet_number.create ())
+        ~application_data:(Packet_number.create ())
+  ; crypto_streams
+  ; tls_state
+  ; source_cid =
+      (let id =
+         (* needs to match CID.src_length. *)
+         Hex.to_string (`Hex "c3eaeabd54582a4ee2cb75bff63b8f0a874a51ad")
+       in
+       assert (String.length id = CID.src_length);
+       CID.of_string id)
+  ; original_dest_cid = CID.empty
+  ; dest_cid = CID.empty
+  ; client_address
+  ; client_transport_params = Transport_parameters.default
+  ; recovery = Recovery.create ()
+  ; queued_packets = Queue.create ()
+  ; writer = Writer.create 0x1000
+  }
+
 let packet_handler t packet =
-  if CID.is_empty t.original_dest_cid then
+  let connection_id = Packet.destination_cid packet in
+  let c =
+    match Conntbl.find_opt t.connections connection_id with
+    | Some c ->
+      c
+    | None ->
+      match Conntbl.find_opt t.connections connection_id with
+      | Some connection ->
+        connection
+      | None ->
+        (* Has to be a new connection. TODO: assert that. *)
+        let connection =
+          new_connection
+            ~client_address:(Option.get t.current_client_address)
+            ~tls_state:t.base_tls_state
+        in
+        let encdec =
+          { Crypto.encrypter =
+              Crypto.InitialAEAD.make ~mode:Server connection_id
+          ; decrypter =
+              Some (Crypto.InitialAEAD.make ~mode:Client connection_id)
+          }
+        in
+        Encryption_level.add Initial encdec connection.encdec;
+        assert (not (Conntbl.mem t.connections connection_id));
+        Conntbl.add t.connections connection.source_cid connection;
+        connection
+  in
+  if CID.is_empty c.original_dest_cid then
     (* From RFC<QUIC-RFC>§7.3:
-     *   Each endpoint includes the value of the Source Connection ID field
+        *   Each endpoint includes the value of the Source Connection ID field
      *   from the first Initial packet it sent in the
      *   initial_source_connection_id transport parameter; see Section 18.2. A
      *   server includes the Destination Connection ID field from the first
      *   Initial packet it received from the client in the
      *   original_destination_connection_id transport parameter [...]. *)
-    t.original_dest_cid <- Packet.destination_cid packet;
-  if CID.is_empty t.dest_cid then
+    c.original_dest_cid <- Packet.destination_cid packet;
+  if CID.is_empty c.dest_cid then
     (* From RFC<QUIC-RFC>§19.6:
-     *   Upon receiving a packet, each endpoint sets the Destination Connection
+        *   Upon receiving a packet, each endpoint sets the Destination Connection
      *   ID it sends to match the value of the Source Connection ID that it
      *   receives. *)
-    t.dest_cid <- Option.get (Packet.source_cid packet);
+    c.dest_cid <- Option.get (Packet.source_cid packet);
   match packet with
   | Packet.VersionNegotiation _ ->
     failwith "NYI: version negotiation"
@@ -405,20 +495,21 @@ let packet_handler t packet =
       { header
       ; encryption_level = Encryption_level.of_header header
       ; packet_number
-      ; outgoing_frames = Encryption_level.create ~current:t.encdec.current ()
+      ; outgoing_frames = Encryption_level.create ~current:c.encdec.current ()
+      ; connection = c
       }
     in
     (match
        Angstrom.parse_bigstring
          ~consume:All
-         (Parse.Frame.parser (frame_handler t ~packet_info))
+         (Parse.Frame.parser (frame_handler c ~packet_info))
          payload
      with
     | Ok () ->
       (* process streams for packets that have been acknowledged. *)
       let acked_frames =
         Recovery.drain_acknowledged
-          t.recovery
+          c.recovery
           ~encryption_level:packet_info.encryption_level
       in
       List.iter
@@ -437,7 +528,7 @@ let packet_handler t packet =
       (* This packet has been processed, mark it for acknowledgement. *)
       let pn_space =
         Spaces.of_encryption_level
-          t.packet_number_spaces
+          c.packet_number_spaces
           packet_info.encryption_level
       in
       Packet_number.insert_for_acking pn_space packet_number;
@@ -450,128 +541,127 @@ let packet_handler t packet =
   | Retry _ ->
     failwith "NYI: retry"
 
-let initialize_crypto_streams () =
-  (* From RFC<QUIC-RFC>§19.6:
-   *   The CRYPTO frame (type=0x06) is used to transmit cryptographic handshake
-   *   messages. It can be sent in all packet types except 0-RTT. *)
-  Spaces.create
-    ~initial:(Ordered_stream.create ())
-    ~handshake:(Ordered_stream.create ())
-    ~application_data:(Ordered_stream.create ())
-
 let create () =
   let cert = "./certificates/server.pem" in
   let priv_key = "./certificates/server.key" in
-  let crypto_streams = initialize_crypto_streams () in
   let rec handler t packet = packet_handler (Lazy.force t) packet
   and decrypt t ~header bs ~off ~len =
-    let t = Lazy.force t in
+    let t : 'a t = Lazy.force t in
     let cs = Cstruct.of_bigarray ~off ~len bs in
-    (match header with
-    | Packet.Header.Initial { dest_cid; _ } ->
-      (match Encryption_level.find Initial t.encdec with
-      | None ->
-        let encdec =
-          { Crypto.encrypter = Crypto.InitialAEAD.make ~mode:Server dest_cid.id
-          ; decrypter = Some (Crypto.InitialAEAD.make ~mode:Client dest_cid.id)
-          }
-        in
-        Encryption_level.add Initial encdec t.encdec
-      | Some _ ->
-        ())
-    | _ ->
-      ());
-    Format.eprintf
-      "decrypt me %d@."
-      (Encryption_level.of_header header |> Encryption_level.Ord.to_int);
-    Crypto.AEAD.decrypt_packet
-      (Option.get
-         (Encryption_level.find_exn
-            (Encryption_level.of_header header)
-            t.encdec)
-           .decrypter)
-      ~largest_pn:t.packet_number_spaces.initial.received
-      cs
+    let connection_id = Packet.Header.destination_cid header in
+    if CID.is_empty connection_id then
+      (* TODO: section 5.2 says we should keep track of connections *)
+      failwith "NYI: empty CID"
+    else
+      let decrypter, largest_pn =
+        match Conntbl.find_opt t.connections connection_id with
+        | Some connection ->
+          ( Option.get
+              (Encryption_level.find_exn
+                 (Encryption_level.of_header header)
+                 connection.encdec)
+                .decrypter
+          , connection.packet_number_spaces.initial.received )
+        | None ->
+          assert (Encryption_level.of_header header = Initial);
+          Crypto.InitialAEAD.make ~mode:Client connection_id, 0L
+      in
+      Crypto.AEAD.decrypt_packet decrypter ~largest_pn cs
   and t =
     lazy
       { reader = Reader.packets ~decrypt:(decrypt t) (handler t)
-      ; writer = Writer.create 0x1000
-      ; encdec = Encryption_level.create ()
-      ; packet_number_spaces =
-          Spaces.create
-            ~initial:(Packet_number.create ())
-            ~handshake:(Packet_number.create ())
-            ~application_data:(Packet_number.create ())
-      ; crypto_streams
-      ; tls_state = Qtls.server ~cert ~priv_key
-      ; source_cid =
-          (let id =
-             (* needs to match CID.length. *)
-             Hex.to_string (`Hex "c3eaeabd54582a4ee2cb75bff63b8f0a874a51ad")
-           in
-           { CID.id; length = String.length id })
-      ; original_dest_cid = CID.empty
-      ; dest_cid = CID.empty
-      ; client_address = None
-      ; client_transport_params = Transport_parameters.default
-      ; recovery = Recovery.create ()
-      ; queued_packets = Queue.create ()
+      ; connections = Conntbl.create ~random:true 1024
+      ; base_tls_state = Qtls.server ~cert ~priv_key
+      ; current_client_address = None
+      ; wakeup_writer = Optional_thunk.none
+      ; closed = false
       }
   in
   Lazy.force t
 
-let shutdown _t = ()
+let shutdown t = t.closed <- true
 
 let is_closed _t = false
 
 let report_exn _t _exn = ()
 
 (* Flushes packets into one datagram *)
-let rec flush_pending_packets t =
-  match Queue.take_opt t.queued_packets with
-  | Some (({ Writer.encryption_level; packet_number; _ } as header_info), frames)
-    ->
-    Format.eprintf
-      "Sending %d frames at encryption level: %a@."
-      (List.length frames)
-      Encryption_level.pp_hum
-      encryption_level;
-    let { Crypto.encrypter; _ } =
-      Encryption_level.find_exn encryption_level t.encdec
-    in
-    Writer.write_frames_packet t.writer ~encrypter ~header_info frames;
-    on_packet_sent t ~encryption_level ~packet_number frames;
-    let can_be_followed_by_other_packets =
-      encryption_level <> Application_data
-    in
-    if can_be_followed_by_other_packets then
-      flush_pending_packets t
-  | None ->
-    ()
+let _flush_pending_packets t =
+  let rec inner t acc =
+    match Queue.take_opt t.queued_packets with
+    | Some
+        (({ Writer.encryption_level; packet_number; _ } as header_info), frames)
+      ->
+      Format.eprintf
+        "Sending %d frames at encryption level: %a@."
+        (List.length frames)
+        Encryption_level.pp_hum
+        encryption_level;
+      Writer.write_frames_packet t.writer ~header_info frames;
+      on_packet_sent t ~encryption_level ~packet_number frames;
+      let can_be_followed_by_other_packets =
+        encryption_level <> Application_data
+      in
+      if can_be_followed_by_other_packets then
+        inner t true
+      else
+        true
+    | None ->
+      acc
+  in
+  inner t false
 
-let next_write_operation t =
-  flush_pending_packets t;
-  match Writer.next t.writer with
-  | `Write iovecs ->
-    `Write (iovecs, Option.get t.client_address)
-  | (`Yield | `Close _) as other ->
-    other
+let flush_pending_packets t =
+  let rec inner t = function
+    | Seq.Cons (x, xs) ->
+      let connection = Conntbl.find t.connections x in
+      assert (CID.equal connection.source_cid x);
+      if _flush_pending_packets connection then
+        Some (connection.writer, connection.client_address, CID.to_string x)
+      else
+        inner t (xs ())
+    | Nil ->
+      None
+  in
+  inner t (Conntbl.to_seq_keys t.connections ())
 
-let report_write_result t result = Writer.report_result t.writer result
+let next_write_operation (t : 'a t) =
+  if t.closed then
+    `Close 0
+  else
+    match flush_pending_packets t with
+    | Some (writer, client_address, cid) ->
+      (match Writer.next writer with
+      | `Write iovecs ->
+        `Writev (iovecs, client_address, cid)
+      | (`Yield | `Close _) as other ->
+        other)
+    | None ->
+      `Yield
 
-let yield_writer t k = Writer.on_wakeup_writer t.writer k
+let report_write_result t ~cid result =
+  let conn = Conntbl.find t.connections (CID.of_string cid) in
+  Writer.report_result conn.writer result
+
+let yield_writer t k =
+  if t.closed then
+    failwith "on_wakeup_writer on closed conn"
+  else if Optional_thunk.is_some t.wakeup_writer then
+    failwith "on_wakeup: only one callback can be registered at a time"
+  else
+    t.wakeup_writer <- Optional_thunk.some k
 
 let yield_reader _t _k = ()
 
-let read_with_more t ?client_address bs ~off ~len more =
-  t.client_address <- client_address;
+let read_with_more t bs ~off ~len more =
   let consumed = Reader.read_with_more t.reader bs ~off ~len more in
   consumed
 
-let read t ?client_address bs ~off ~len =
+let read t ~client_address bs ~off ~len =
   (* let hex = Hex.of_string (Bigstringaf.substring bs ~off ~len) in *)
   (* Format.eprintf "wtf: %a@." Hex.pp hex; *)
-  read_with_more t ?client_address bs ~off ~len Incomplete
+  t.current_client_address <- Some client_address;
+  read_with_more t bs ~off ~len Incomplete
 
 let read_eof t bs ~off ~len = read_with_more t bs ~off ~len Complete
 

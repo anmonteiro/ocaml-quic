@@ -101,7 +101,9 @@ module Client_initial = struct
       "c5ff00001d088394c8f03e5157080000449e4a95245bfb66bc5f93032b7ddd89fe0ff15d9c4f7050fccdb71c1cd80512d4431643a53aafa1b0b518b44968b18b8d3e7a4d04c30b3ed9410325b2abb2dafb1c12f8b70479eb8df98abcaf95dd8f3d1c78660fbc719f88b23c8aef6771f3d50e10fdfb4c9d92386d44481b6c52d59e5538d3d3942de9f13a7f8b702dc31724180da9df22714d01003fc5e3d165c950e630b8540fbd81c9df0ee63f94997026c4f2e1887a2def79050ac2d86ba318e0b3adc4c5aa18bcf63c7cf8e85f569249813a2236a7e72269447cd1c755e451f5e77470eb3de64c8849d292820698029cfa18e5d66176fe6e5ba4ed18026f90900a5b4980e2f58e39151d5cd685b10929636d4f02e7fad2a5a458249f5c0298a6d53acbe41a7fc83fa7cc01973f7a74d1237a51974e097636b6203997f921d07bc1940a6f2d0de9f5a11432946159ed6cc21df65c4ddd1115f86427259a196c7148b25b6478b0dc7766e1c4d1b1f5159f90eabc61636226244642ee148b464c9e619ee50a5e3ddc836227cad938987c4ea3c1fa7c75bbf88d89e9ada642b2b88fe8107b7ea375b1b64889a4e9e5c38a1c896ce275a5658d250e2d76e1ed3a34ce7e3a3f383d0c996d0bed106c2899ca6fc263ef0455e74bb6ac1640ea7bfedc59f03fee0e1725ea150ff4d69a7660c5542119c71de270ae7c3ecfd1af2c4ce551986949cc34a66b3e216bfe18b347e6c05fd050f85912db303a8f054ec23e38f44d1c725ab641ae929fecc8e3cefa5619df4231f5b4c009fa0c0bbc60bc75f76d06ef154fc8577077d9d6a1d2bd9bf081dc783ece60111bea7da9e5a9748069d078b2bef48de04cabe3755b197d52b32046949ecaa310274b4aac0d008b1948c1082cdfe2083e386d4fd84c0ed0666d3ee26c4515c4fee73433ac703b690a9f7bf278a77486ace44c489a0c7ac8dfe4d1a58fb3a730b993ff0f0d61b4d89557831eb4c752ffd39c10f6b9f46d8db278da624fd800e4af85548a294c1518893a8778c4f6d6d73c93df200960104e062b388ea97dcf4016bced7f62b4f062cb6c04c20693d9a0e3b74ba8fe74cc01237884f40d765ae56a51688d985cf0ceaef43045ed8c3f0c33bced08537f6882613acd3b08d665fce9dd8aa73171e2d3771a61dba2790e491d413d93d987e2745af29418e428be34941485c93447520ffe231da2304d6a0fd5d07d0837220236966159bef3cf904d722324dd852513df39ae030d8173908da6364786d3c1bfcb19ea77a63b25f1e7fc661def480c5d00d44456269ebd84efd8e3a8b2c257eec76060682848cbf5194bc99e49ee75e4d0d254bad4bfd74970c30e44b65511d4ad0e6ec7398e08e01307eeeea14e46ccd87cf36b285221254d8fc6a6765c524ded0085dca5bd688ddf722e2c0faf9d0fb2ce7a0c3f2cee19ca0ffba461ca8dc5d2c8178b0762cf67135558494d2a96f1a139f0edb42d2af89a9c9122b07acbc29e5e722df8615c343702491098478a389c9872a10b0c9875125e257c7bfdf27eef4060bd3d00f4c14fd3e3496c38d3c5d1a5668c39350effbc2d16ca17be4ce29f02ed969504dda2a8c6b9ff919e693ee79e09089316e7d1d89ec099db3b2b268725d888536a4b8bf9aee8fb43e82a4d919d4843b1ca70a2d8d3f725ead1391377dcc0"
 
   let test_encrypt_client_initial () =
-    let encrypter = InitialAEAD.make ~mode:Client dest_cid in
+    let encrypter =
+      InitialAEAD.make ~mode:Client (Quic.CID.of_string dest_cid)
+    in
     let packet_number = 2L in
     let data = Cstruct.of_string unprotected_payload in
     let header = Cstruct.of_string unprotected_header in
@@ -152,7 +154,9 @@ module Server_initial = struct
       "caff00001d0008f067a5502a4262b5004074aaf2f007823a5d3a1207c86ee49132824f0465243d082d868b107a38092bc80528664cbf9456ebf27673fb5fa5061ab573c9f001b81da028a00d52ab00b15bebaa70640e106cf2acd043e9c6b4411c0a79637134d8993701fe779e58c2fe753d14b0564021565ea92e57bc6faf56dfc7a40870e6"
 
   let test_encrypt_server_initial () =
-    let encrypter = InitialAEAD.make ~mode:Server dest_cid in
+    let encrypter =
+      InitialAEAD.make ~mode:Server (Quic.CID.of_string dest_cid)
+    in
     let packet_number = 1L in
     let data = Cstruct.of_string unprotected_payload in
     let header = Cstruct.of_string unprotected_header in
@@ -198,7 +202,7 @@ module Retry = struct
     in
     let integrity_tag =
       Crypto.Retry.calculate_integrity_tag
-        { Quic.CID.length = String.length dest_cid; id = dest_cid }
+        (Quic.CID.of_string dest_cid)
         (Bigstringaf.of_string ~off:0 ~len:(String.length data - 16) data)
     in
     Alcotest.check
@@ -302,7 +306,9 @@ end
 module InitialAEAD_encryption = struct
   let test_initial_aead_header_encryption_decryption () =
     let conn_id = Hex.to_string (`Hex "decafbad") in
-    let client_encrypter = InitialAEAD.make ~mode:Client conn_id in
+    let client_encrypter =
+      InitialAEAD.make ~mode:Client (Quic.CID.of_string conn_id)
+    in
     let unprotected_header = Client_initial.unprotected_header in
     let sample = Cstruct.of_hex "655e5cd55c41f69080575d7999c25a5b" in
     assert (Cstruct.len sample = 16);
@@ -364,7 +370,9 @@ module InitialAEAD_encryption = struct
       "decrypted_header matches unprotected_header"
       (Hex.of_string unprotected_header)
       (Hex.of_cstruct decrypted_header);
-    let server_encrypter = InitialAEAD.make ~mode:Server conn_id in
+    let server_encrypter =
+      InitialAEAD.make ~mode:Server (Quic.CID.of_string conn_id)
+    in
     let header =
       (* the first byte and the last 4 bytes should be encrypted *)
       AEAD.encrypt_header
@@ -401,7 +409,9 @@ module InitialAEAD_encryption = struct
       (Hex.of_cstruct decrypted_header)
 
   let test_client_initial_aead_packet_encryption_decryption () =
-    let client_encrypter = InitialAEAD.make ~mode:Client dest_cid in
+    let client_encrypter =
+      InitialAEAD.make ~mode:Client (Quic.CID.of_string dest_cid)
+    in
     let unprotected_header =
       Cstruct.of_string Client_initial.unprotected_header
     in
@@ -442,7 +452,9 @@ module InitialAEAD_encryption = struct
       (Hex.of_cstruct decrypted_packet)
 
   let test_server_initial_aead_packet_encryption_decryption () =
-    let server_encrypter = InitialAEAD.make ~mode:Server dest_cid in
+    let server_encrypter =
+      InitialAEAD.make ~mode:Server (Quic.CID.of_string dest_cid)
+    in
     let unprotected_header =
       Cstruct.of_string Server_initial.unprotected_header
     in
@@ -486,7 +498,9 @@ module InitialAEAD_encryption = struct
     let module Writer = Quic.Serialize.Writer in
     let unprotected_header = `Hex "c3ff00001d0361626300001900000001" in
     let plaintext_payload = `Hex "0201000000" in
-    let encrypter = InitialAEAD.make ~mode:Server dest_cid in
+    let encrypter =
+      InitialAEAD.make ~mode:Server (Quic.CID.of_string dest_cid)
+    in
     let protected_packet =
       Crypto.AEAD.encrypt_packet
         encrypter
@@ -515,16 +529,16 @@ module InitialAEAD_encryption = struct
 
   let test_ocaml_quic_decrypt_serialized () =
     let module Writer = Quic.Serialize.Writer in
-    let encrypter = InitialAEAD.make ~mode:Server "abc" in
+    let encrypter = InitialAEAD.make ~mode:Server (Quic.CID.of_string "abc") in
     let writer = Writer.create 0x1000 in
     Writer.write_frames_packet
       writer
-      ~encrypter
       ~header_info:
         (Writer.make_header_info
+           ~encrypter
            ~encryption_level:Initial
            ~packet_number:1L
-           { Quic.CID.id = "abc"; length = 3 })
+           (Quic.CID.of_string "abc"))
       [ Ack
           { delay = 0
           ; ranges = [ { Quic.Frame.Range.first = 1L; last = 1L } ]

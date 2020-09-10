@@ -44,12 +44,12 @@ let test_parser () =
         hex
         "source connection id"
         (`Hex "c78d00d671c14508476004fd071c9227")
-        (Hex.of_string source_cid.id);
+        (Hex.of_string (CID.to_string source_cid));
       Alcotest.check
         hex
         "destination connection id"
         expected_dest_cid
-        (Hex.of_string dest_cid.id);
+        (Hex.of_string (CID.to_string dest_cid));
       Alcotest.(check string) "token is empty" "" token
     | _ ->
       Alcotest.fail "expected an initial packet with frames")
@@ -81,7 +81,7 @@ let test_quic_transport_parameters () =
     Alcotest.fail e
 
 let test_short_header () =
-  let dest_cid = Quic.CID.{ length; id = String.make length 'a' } in
+  let dest_cid = Quic.CID.(of_string (String.make src_length 'a')) in
   let f = Faraday.create 20 in
   Quic.Serialize.Pkt.Header.write_short_header f ~pn_length:4 ~dest_cid;
   (* Asserts that we don't write it for short headers *)

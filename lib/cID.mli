@@ -30,36 +30,26 @@
  *  POSSIBILITY OF SUCH DAMAGE.
  *---------------------------------------------------------------------------*)
 
-type t = string
+type t
 
-let empty = Sys.opaque_identity ""
+val empty : t
 
-let[@inline] length t = String.length t
+val length : t -> int
 
-let src_length = 20
+val src_length : int
 
-let is_empty t = t == empty
+val is_unset : t -> bool
 
-let is_unset t = t = empty
+val is_empty : t -> bool
 
-let parse =
-  let open Angstrom in
-  (* From RFC<QUIC-RFC>§17.2:
-   *   This length is encoded as an 8-bit unsigned integer. In QUIC version 1,
-   *   this value MUST NOT exceed 20. Endpoints that receive a version 1 long
-   *   header with a value larger than 20 MUST drop the packet.  Servers SHOULD
-   *   be able to read longer connection IDs from other QUIC versions in order
-   *   to properly form a version negotiation packet. *)
-  any_uint8 >>= take
+val parse : t Angstrom.t
 
-let serialize f t =
-  Faraday.write_uint8 f (length t);
-  Faraday.write_string f t
+val serialize : Faraday.t -> t -> unit
 
-let to_string t = t
+val to_string : t -> string
 
-let of_string t = t
+val of_string : string -> t
 
-let compare = String.compare
+val compare : t -> t -> int
 
-let equal = String.equal
+val equal : t -> t -> bool

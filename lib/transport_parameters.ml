@@ -51,7 +51,7 @@ module Preferred_address = struct
     ; stateless_reset_token : string
     }
 
-  let serialized_length t = 4 + 2 + 8 + 2 + 1 + t.cid.length + 8
+  let serialized_length t = 4 + 2 + 8 + 2 + 1 + CID.length t.cid + 8
 
   let parse =
     let open Angstrom in
@@ -59,17 +59,16 @@ module Preferred_address = struct
     BE.any_uint16 >>= fun ipv4_port ->
     take 8 >>= fun ipv6_addr ->
     BE.any_uint16 >>= fun ipv6_port ->
-    any_uint8 >>= fun cid_length ->
     lift2
       (fun cid token ->
         { ipv4_addr
         ; ipv4_port
         ; ipv6_addr
         ; ipv6_port
-        ; cid = { CID.length = cid_length; id = cid }
+        ; cid
         ; stateless_reset_token = token
         })
-      (take cid_length)
+      CID.parse
       (take 16)
 
   let serialize
@@ -109,7 +108,7 @@ module Encoding = struct
     match type_ with
     | 0x00 ->
       lift
-        (fun id -> Original_destination_connection_id { CID.length; id })
+        (fun cid -> Original_destination_connection_id (CID.of_string cid))
         (take length)
     | 0x01 ->
       lift
@@ -163,11 +162,11 @@ module Encoding = struct
         Parse.variable_length_integer
     | 0x0f ->
       lift
-        (fun id -> Initial_source_connection_id { CID.length; id })
+        (fun cid -> Initial_source_connection_id (CID.of_string cid))
         (take length)
     | 0x10 ->
       lift
-        (fun id -> Retry_source_connection_id { CID.length; id })
+        (fun cid -> Retry_source_connection_id (CID.of_string cid))
         (take length)
     | _other ->
       fail "other"
@@ -230,9 +229,9 @@ module Encoding = struct
     let varint = Serialize.write_variable_length_integer f in
     varint (Type.serialize t);
     match t with
-    | Original_destination_connection_id { CID.id; length } ->
-      varint length;
-      Faraday.write_string f id
+    | Original_destination_connection_id cid ->
+      varint (CID.length cid);
+      Faraday.write_string f (CID.to_string cid)
     | Max_idle_timeout timeout ->
       varint (Serialize.varint_encoding_length timeout);
       varint timeout
@@ -267,10 +266,9 @@ module Encoding = struct
     | Active_connection_id_limit max ->
       varint (Serialize.varint_encoding_length max);
       varint max
-    | Initial_source_connection_id { CID.id; length }
-    | Retry_source_connection_id { CID.id; length } ->
-      varint length;
-      Faraday.write_string f id
+    | Initial_source_connection_id cid | Retry_source_connection_id cid ->
+      varint (CID.length cid);
+      Faraday.write_string f (CID.to_string cid)
 
   let serialize f = List.iter (serialize f)
 end
