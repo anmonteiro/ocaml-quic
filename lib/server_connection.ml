@@ -152,9 +152,6 @@ let send_packet c ~encryption_level frames =
   in
   Queue.add (header_info, frames) c.queued_packets
 
-(* FIXME: this is only sending acks for encryption levels present in
- * `outgoing_frames`. We need to check other encryption levels, e.g. in order
- * to ACK `Handshake` packets from the client. *)
 let send_packets t ~packet_info =
   let { connection = c; outgoing_frames; _ } = packet_info in
   (* From RFC<QUIC-RFC>§12.2:
@@ -164,16 +161,28 @@ let send_packets t ~packet_info =
    *   pass. *)
   Encryption_level.ordered_iter
     (fun encryption_level frames ->
-      let pn_space =
-        Spaces.of_encryption_level c.packet_number_spaces encryption_level
-      in
-      let frames =
-        if pn_space.ack_elicited then
-          Packet_number.compose_ack_frame pn_space :: frames
-        else
-          frames
-      in
-      send_packet c ~encryption_level (List.rev frames))
+      match Encryption_level.mem encryption_level c.encdec with
+      | false ->
+        (* Don't attempt to send packets if we can't encrypt them yet. *)
+        ()
+      | true ->
+        let pn_space =
+          Spaces.of_encryption_level c.packet_number_spaces encryption_level
+        in
+        let frames =
+          if pn_space.ack_elicited then
+            Packet_number.compose_ack_frame pn_space :: frames
+          else
+            frames
+        in
+        (* TODO: bundle e.g. a PING frame with a packet that only contains ACK
+           frames. *)
+        (match frames with
+        | [] ->
+          (* Don't send invalid (payload-less) frames *)
+          ()
+        | frames ->
+          send_packet c ~encryption_level (List.rev frames)))
     outgoing_frames;
   wakeup_writer t
 
@@ -239,13 +248,11 @@ let process_tls_result t ~packet_info ~new_tls_state ~tls_packets =
             Stream.Send.push (Cstruct.to_bigarray cs) crypto_stream.send
           in
           let frame = Frame.Crypto fragment in
-          Encryption_level.update
+          Encryption_level.update_exn
             cur_encryption_level
-            (function None -> Some [ frame ] | Some xs -> Some (frame :: xs))
+            (fun xs -> Some (frame :: xs))
             outgoing_frames;
           cur_encryption_level)
-      (* TODO: it's wrong to start from 0 everytime. Need to keep track of
-       * this stream's offset. *)
       outgoing_frames.current
       tls_packets
   in
@@ -260,10 +267,10 @@ let process_tls_result t ~packet_info ~new_tls_state ~tls_packets =
      *   confirmation of the handshake to the client. *)
     assert (t.encdec.current = Application_data);
     assert (outgoing_frames.current = Application_data);
-    assert (Option.is_none (Encryption_level.find_current outgoing_frames));
+    assert (Encryption_level.find_current_exn outgoing_frames = []);
     let frame = Frame.Handshake_done in
-    Encryption_level.update_current
-      (function None -> Some [ frame ] | Some xs -> Some (frame :: xs))
+    Encryption_level.update_current_exn
+      (fun xs -> Some (frame :: xs))
       outgoing_frames);
   t.tls_state <- new_tls_state
 
@@ -447,7 +454,7 @@ let initialize_crypto_streams () =
 
 let new_connection ~client_address ~tls_state =
   let crypto_streams = initialize_crypto_streams () in
-  { encdec = Encryption_level.create ()
+  { encdec = Encryption_level.create ~current:Initial
   ; packet_number_spaces =
       Spaces.create
         ~initial:(Packet_number.create ())
@@ -471,6 +478,11 @@ let new_connection ~client_address ~tls_state =
   ; writer = Writer.create 0x1000
   ; streams = Hashtbl.create ~random:true 1024
   }
+
+let create_outgoing_frames ~current =
+  let r = Encryption_level.create ~current in
+  List.iter (fun lvl -> Encryption_level.add lvl [] r) Encryption_level.all;
+  r
 
 let packet_handler t packet =
   let connection_id = Packet.destination_cid packet in
@@ -524,7 +536,7 @@ let packet_handler t packet =
       { header
       ; encryption_level = Encryption_level.of_header header
       ; packet_number
-      ; outgoing_frames = Encryption_level.create ~current:c.encdec.current ()
+      ; outgoing_frames = create_outgoing_frames ~current:c.encdec.current
       ; connection = c
       }
     in
@@ -693,7 +705,7 @@ let read_with_more t bs ~off ~len more =
 
 let read t ~client_address bs ~off ~len =
   (* let hex = Hex.of_string (Bigstringaf.substring bs ~off ~len) in *)
-  (* Format.eprintf "wtf: %a@." Hex.pp hex; *)
+  (* Format.eprintf "wtf(%d): %a@." len Hex.pp hex; *)
   t.current_client_address <- Some client_address;
   read_with_more t bs ~off ~len Incomplete
 

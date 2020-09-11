@@ -492,6 +492,7 @@ module Writer = struct
       Short { dest_cid }
 
   let write_frames_packet t ~header_info frames =
+    assert (frames <> []);
     let tag_len = Crypto.AEAD.tag_len header_info.encrypter in
     let pn_length = packet_number_length header_info.packet_number in
     let tmpf = Faraday.create 0x400 in

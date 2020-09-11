@@ -43,6 +43,8 @@ type level =
   | Handshake
   | Application_data
 
+let all = [ Initial; Zero_RTT; Handshake; Application_data ]
+
 (* From RFC<QUIC-TLS-RFC>§4:
  *
  *     +---------------------+-----------------+------------------+
@@ -128,7 +130,7 @@ type 'a t =
   ; mutable vals : 'a LMap.t
   }
 
-let create ?(current = Initial) () = { current; vals = LMap.empty }
+let create ~current = { current; vals = LMap.empty }
 
 let add k v t = t.vals <- LMap.add k v t.vals
 
@@ -142,13 +144,23 @@ let find_current t = LMap.find_opt t.current t.vals
 
 let find_current_exn t = LMap.find t.current t.vals
 
-let update_current f t =
-  let vals' = LMap.update t.current f t.vals in
-  t.vals <- vals'
-
 let update level f t =
   let vals' = LMap.update level f t.vals in
   t.vals <- vals'
+
+let update_exn level f t =
+  update
+    level
+    (function
+      | None ->
+        failwith "Encryption_level.update_exn: expected binding to exist."
+      | Some x ->
+        f x)
+    t
+
+let update_current f t = update t.current f t
+
+let update_current_exn f t = update_exn t.current f t
 
 let ordered_iter f t =
   (* From RFC<QUIC-RFC>§12.2:
@@ -161,3 +173,5 @@ let ordered_iter f t =
   LMap.iter f t.vals
 
 let fold f t a = LMap.fold f t.vals a
+
+let mem lvl t = LMap.mem lvl t.vals
