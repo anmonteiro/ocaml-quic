@@ -30,6 +30,85 @@
  *  POSSIBILITY OF SUCH DAMAGE.
  *---------------------------------------------------------------------------*)
 
-module Server_connection = Server_connection
-module IOVec = IOVec
-module Stream = Stream
+module IOVec : sig
+  type 'a t = 'a Faraday.iovec =
+    { buffer : 'a
+    ; off : int
+    ; len : int
+    }
+
+  val length : _ t -> int
+
+  val lengthv : _ t list -> int
+
+  val shift : 'a t -> int -> 'a t
+
+  val shiftv : 'a t list -> int -> 'a t list
+
+  val pp_hum : Format.formatter -> _ t -> unit [@@ocaml.toplevel_printer]
+end
+
+module Stream : sig
+  type t
+
+  val schedule_read
+    :  t
+    -> on_eof:(unit -> unit)
+    -> on_read:(Bigstringaf.t -> off:int -> len:int -> unit)
+    -> unit
+
+  val write_char : t -> char -> unit
+
+  val write_string : t -> ?off:int -> ?len:int -> string -> unit
+
+  val write_bigstring : t -> ?off:int -> ?len:int -> Bigstringaf.t -> unit
+
+  val schedule_bigstring : t -> ?off:int -> ?len:int -> Bigstringaf.t -> unit
+
+  val flush : t -> (unit -> unit) -> unit
+
+  val close_reader : t -> unit
+
+  val close_writer : t -> unit
+
+  val is_closed : t -> bool
+end
+
+module Server_connection : sig
+  type 'a t
+
+  val create : (Stream.t -> unit) -> _ t
+
+  val next_read_operation : _ t -> [ `Read | `Yield | `Close ]
+
+  val read
+    :  'a t
+    -> client_address:'a
+    -> Bigstringaf.t
+    -> off:int
+    -> len:int
+    -> int
+
+  val read_eof : _ t -> Bigstringaf.t -> off:int -> len:int -> int
+
+  val yield_reader : _ t -> (unit -> unit) -> unit
+
+  val next_write_operation
+    :  'a t
+    -> [ `Writev of Faraday.bigstring Faraday.iovec list * 'a * string
+       | `Yield
+       | `Close of int
+       ]
+
+  val report_write_result
+    :  _ t
+    -> cid:string
+    -> [ `Ok of int | `Closed ]
+    -> unit
+
+  val yield_writer : _ t -> (unit -> unit) -> unit
+
+  val report_exn : _ t -> exn -> unit
+
+  val is_closed : _ t -> bool
+end

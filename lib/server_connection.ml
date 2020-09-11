@@ -107,7 +107,7 @@ type 'a connection =
   ; queued_packets : (Writer.header_info * Frame.t list) Queue.t
   ; writer : Writer.t
   ; streams : (Stream_id.t, Stream.t) Hashtbl.t
-  ; handler : Streamd.rdwr Streamd.t -> unit
+  ; handler : Stream.t -> unit
   }
 
 type 'a packet_info =
@@ -125,7 +125,7 @@ type 'a t =
   ; mutable current_client_address : 'a option
   ; mutable wakeup_writer : Optional_thunk.t
   ; mutable closed : bool
-  ; stream_handler : Streamd.rdwr Streamd.t -> unit
+  ; stream_handler : Stream.t -> unit
   }
 
 let wakeup_writer t =
@@ -364,19 +364,22 @@ let process_crypto_frame t ~packet_info fragment =
   let crypto_stream =
     Spaces.of_encryption_level t.crypto_streams encryption_level
   in
-  Stream.Recv.push fragment crypto_stream.recv;
+  (* From RFC<QUIC-RFC>§19.6:
+   *   The stream does not have an explicit end, so CRYPTO frames do not have a
+   *   FIN bit. *)
+  Stream.Recv.push fragment ~is_fin:false crypto_stream.recv;
   exhaust_crypto_stream t ~packet_info ~stream:crypto_stream.recv
 
 let rec process_stream_data t ~stream =
   match Stream.Recv.pop stream with
-  | Some { IOVec.buffer; _ } ->
-    Streamd.schedule_bigstring stream.consumer buffer;
-    Stream.Recv.flush_recv stream;
+  | Some _ ->
+    (* Stream.Buffer.schedule_bigstring stream.consumer buffer; *)
+    (* Stream.Recv.flush_recv stream; *)
     process_stream_data t ~stream
   | None ->
     ()
 
-let process_stream_frame t ~id ~fragment ~is_fin:_ =
+let process_stream_frame t ~id ~fragment ~is_fin =
   let stream =
     match Hashtbl.find_opt t.streams id with
     | Some stream ->
@@ -384,10 +387,10 @@ let process_stream_frame t ~id ~fragment ~is_fin:_ =
     | None ->
       let stream = Stream.create ~direction:(Stream_id.classify id) in
       Hashtbl.add t.streams id stream;
-      t.handler stream.recv.consumer;
+      t.handler stream;
       stream
   in
-  Stream.Recv.push fragment stream.recv;
+  Stream.Recv.push fragment ~is_fin stream.recv;
   process_stream_data t ~stream:stream.recv
 
 let frame_handler ~packet_info t frame =
@@ -453,9 +456,9 @@ let initialize_crypto_streams () =
    *   The CRYPTO frame (type=0x06) is used to transmit cryptographic handshake
    *   messages. It can be sent in all packet types except 0-RTT. *)
   Spaces.create
-    ~initial:(Stream.create ~direction:Bidirectional)
-    ~handshake:(Stream.create ~direction:Bidirectional)
-    ~application_data:(Stream.create ~direction:Bidirectional)
+    ~initial:(Stream.create_crypto ())
+    ~handshake:(Stream.create_crypto ())
+    ~application_data:(Stream.create_crypto ())
 
 let create_connection ~client_address ~tls_state handler =
   let crypto_streams = initialize_crypto_streams () in

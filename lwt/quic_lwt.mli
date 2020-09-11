@@ -33,8 +33,5 @@
 module Server : sig
   (* XXX: Alternative: ~conn_handler:(conn -> stream_handler) called for each
    * connection. *)
-  val establish_server
-    :  Unix.sockaddr
-    -> (Quic.Stream.rdwr Quic.Stream.t -> unit)
-    -> unit Lwt.t
+  val establish_server : Unix.sockaddr -> (Quic.Stream.t -> unit) -> unit Lwt.t
 end

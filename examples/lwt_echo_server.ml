@@ -4,7 +4,7 @@ let stream_handler stream =
   let rec on_read bs ~off ~len =
     Format.eprintf "GOT DATA: %S@." (Bigstringaf.substring bs ~off ~len);
     Quic.Stream.schedule_read stream ~on_read ~on_eof
-  and on_eof () = () in
+  and on_eof () = Format.eprintf "Got EOF@." in
   Quic.Stream.schedule_read stream ~on_read ~on_eof
 
 let () =
