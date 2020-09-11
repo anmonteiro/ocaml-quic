@@ -52,6 +52,7 @@ module Recv = struct
   type t =
     { mutable q : Q.t
     ; mutable offset : int (* TODO: int64? *)
+    ; consumer : Streamd.rdwr Streamd.t
     }
 
   let push ({ IOVec.off; len; _ } as fragment) t =
@@ -78,7 +79,18 @@ module Recv = struct
     let q' = Q.remove off t.q in
     t.q <- q'
 
-  let create () = { q = Q.empty; offset = 0 }
+  let flush_recv t =
+    if Streamd.has_pending_output t.consumer then
+      try Streamd.execute_read t.consumer with
+      | _exn ->
+        (* report_exn t exn *)
+        failwith "NYI: Streamd.flush_recv / report_exn"
+
+  let create () =
+    { q = Q.empty
+    ; offset = 0
+    ; consumer = Streamd.create Bigstringaf.empty Optional_thunk.none
+    }
 end
 
 module Send = struct

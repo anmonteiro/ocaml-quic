@@ -107,6 +107,7 @@ type 'a connection =
   ; queued_packets : (Writer.header_info * Frame.t list) Queue.t
   ; writer : Writer.t
   ; streams : (Stream_id.t, Stream.t) Hashtbl.t
+  ; handler : Streamd.rdwr Streamd.t -> unit
   }
 
 type 'a packet_info =
@@ -124,6 +125,7 @@ type 'a t =
   ; mutable current_client_address : 'a option
   ; mutable wakeup_writer : Optional_thunk.t
   ; mutable closed : bool
+  ; stream_handler : Streamd.rdwr Streamd.t -> unit
   }
 
 let wakeup_writer t =
@@ -367,7 +369,9 @@ let process_crypto_frame t ~packet_info fragment =
 
 let rec process_stream_data t ~stream =
   match Stream.Recv.pop stream with
-  | Some fragment ->
+  | Some { IOVec.buffer; _ } ->
+    Streamd.schedule_bigstring stream.consumer buffer;
+    Stream.Recv.flush_recv stream;
     process_stream_data t ~stream
   | None ->
     ()
@@ -380,6 +384,7 @@ let process_stream_frame t ~id ~fragment ~is_fin:_ =
     | None ->
       let stream = Stream.create ~direction:(Stream_id.classify id) in
       Hashtbl.add t.streams id stream;
+      t.handler stream.recv.consumer;
       stream
   in
   Stream.Recv.push fragment stream.recv;
@@ -452,7 +457,7 @@ let initialize_crypto_streams () =
     ~handshake:(Stream.create ~direction:Bidirectional)
     ~application_data:(Stream.create ~direction:Bidirectional)
 
-let new_connection ~client_address ~tls_state =
+let create_connection ~client_address ~tls_state handler =
   let crypto_streams = initialize_crypto_streams () in
   { encdec = Encryption_level.create ~current:Initial
   ; packet_number_spaces =
@@ -477,6 +482,7 @@ let new_connection ~client_address ~tls_state =
   ; queued_packets = Queue.create ()
   ; writer = Writer.create 0x1000
   ; streams = Hashtbl.create ~random:true 1024
+  ; handler
   }
 
 let create_outgoing_frames ~current =
@@ -485,6 +491,7 @@ let create_outgoing_frames ~current =
   r
 
 let packet_handler t packet =
+  (* TODO: track received packet number. *)
   let connection_id = Packet.destination_cid packet in
   let c =
     match Conntbl.find_opt t.connections connection_id with
@@ -497,9 +504,10 @@ let packet_handler t packet =
       | None ->
         (* Has to be a new connection. TODO: assert that. *)
         let connection =
-          new_connection
+          create_connection
             ~client_address:(Option.get t.current_client_address)
             ~tls_state:t.base_tls_state
+            t.stream_handler
         in
         let encdec =
           { Crypto.encrypter =
@@ -587,7 +595,7 @@ let packet_handler t packet =
   | Retry _ ->
     failwith "NYI: retry"
 
-let create () =
+let create stream_handler =
   let cert = "./certificates/server.pem" in
   let priv_key = "./certificates/server.key" in
   let rec handler t packet = packet_handler (Lazy.force t) packet
@@ -621,6 +629,7 @@ let create () =
       ; current_client_address = None
       ; wakeup_writer = Optional_thunk.none
       ; closed = false
+      ; stream_handler
       }
   in
   Lazy.force t

@@ -1,0 +1,4 @@
+(library
+ (name quic_lwt)
+ (public_name quic-lwt)
+ (libraries hex lwt lwt.unix quic gluten))

@@ -30,6 +30,11 @@
  *  POSSIBILITY OF SUCH DAMAGE.
  *---------------------------------------------------------------------------*)
 
-module Server_connection = Server_connection
-module IOVec = IOVec
-module Stream = Streamd
+module Server : sig
+  (* XXX: Alternative: ~conn_handler:(conn -> stream_handler) called for each
+   * connection. *)
+  val establish_server
+    :  Unix.sockaddr
+    -> (Quic.Stream.rdwr Quic.Stream.t -> unit)
+    -> unit Lwt.t
+end

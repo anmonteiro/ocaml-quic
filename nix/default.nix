@@ -67,6 +67,7 @@ in
           fiat-p256
           logs
           hkdf
+          ke
 
           # TLS tests
           ounit
@@ -75,32 +76,6 @@ in
           mirage-clock
           mirage-flow
           mirage-kv
-        ];
-      };
-
-      # These two don't have tests
-      h2-lwt = buildH2 {
-        pname = "h2-lwt";
-        src = genSrc {
-          dirs = [ "lwt" ];
-          files = [ "h2-lwt.opam" ];
-        };
-        doCheck = false;
-        propagatedBuildInputs = [ h2 lwt gluten-lwt ];
-      };
-
-      h2-lwt-unix = buildH2 {
-        pname = "h2-lwt-unix";
-        src = genSrc {
-          dirs = [ "lwt-unix" ];
-          files = [ "h2-lwt-unix.opam" ];
-        };
-        doCheck = false;
-        propagatedBuildInputs = [
-          h2-lwt
-          gluten-lwt-unix
-          faraday-lwt-unix
-          lwt_ssl
         ];
       };
     };
