@@ -30,14 +30,15 @@
  *  POSSIBILITY OF SUCH DAMAGE.
  *---------------------------------------------------------------------------*)
 
+module Writer = Serialize.Writer
+
 module Buffer = struct
   type t =
     { faraday : Faraday.t
     ; mutable read_scheduled : bool
     ; mutable on_eof : unit -> unit
     ; mutable on_read : Bigstringaf.t -> off:int -> len:int -> unit
-    ; mutable when_ready : Optional_thunk.t
-    ; buffered_bytes : int ref
+    ; when_ready : unit -> unit
     }
 
   let default_on_eof = Sys.opaque_identity (fun () -> ())
@@ -50,14 +51,13 @@ module Buffer = struct
     ; on_eof = default_on_eof
     ; on_read = default_on_read
     ; when_ready
-    ; buffered_bytes = ref 0
     }
 
   let create buffer when_ready =
     of_faraday (Faraday.of_bigstring buffer) when_ready
 
   let create_empty () =
-    let t = create Bigstringaf.empty Optional_thunk.none in
+    let t = create Bigstringaf.empty ignore in
     Faraday.close t.faraday;
     t
 
@@ -73,7 +73,7 @@ module Buffer = struct
   let schedule_bigstring t ?off ?len (b : Bigstringaf.t) =
     Faraday.schedule_bigstring ?off ?len t.faraday b
 
-  let ready t = Optional_thunk.call_if_some t.when_ready
+  let ready t = t.when_ready ()
 
   let flush t kontinue =
     Faraday.flush t.faraday kontinue;
@@ -137,13 +137,11 @@ end
  *   endpoint buffer any data that is received out of order, up to the
  *   advertised flow control limit. *)
 
-type fragment = Bigstringaf.t IOVec.t
-
-module Q : Psq.S with type k = int and type p = fragment =
+module Q : Psq.S with type k = int and type p = Frame.fragment =
   Psq.Make
     (Int)
     (struct
-      type t = fragment
+      type t = Frame.fragment
 
       let compare { IOVec.off = off1; _ } { IOVec.off = off2; _ } =
         compare off1 off2
@@ -160,7 +158,7 @@ module Recv = struct
   let create () =
     { q = Q.empty
     ; offset = 0
-    ; consumer = Buffer.create Bigstringaf.empty Optional_thunk.none
+    ; consumer = Buffer.create Bigstringaf.empty ignore
     ; fin_offset = None
     }
 
@@ -216,6 +214,7 @@ module Send = struct
     { mutable q : Q.t
     ; mutable offset : int (* TODO: int64? *)
     ; producer : Buffer.t
+    ; mutable fin_offset : int option
     }
 
   let push buffer t =
@@ -230,41 +229,83 @@ module Send = struct
     match Q.pop t.q with
     | Some ((_, fragment), q') ->
       t.q <- q';
-      Some fragment
+      let is_fin =
+        match t.fin_offset with
+        | None ->
+          false
+        | Some fin_offset ->
+          assert (fin_offset = t.offset);
+          fin_offset = t.offset
+      in
+      Some (fragment, is_fin)
     | None ->
       None
+
+  let pop_exn t =
+    match pop t with
+    | Some ret ->
+      ret
+    | None ->
+      failwith "Quic.Stream.Send.pop_exn"
 
   let remove off t =
     let q' = Q.remove off t.q in
     t.q <- q'
 
-  let create () =
+  let create when_ready =
     { q = Q.empty
     ; offset = 0
-    ; producer = Buffer.create Bigstringaf.empty Optional_thunk.none
+    ; producer = Buffer.create Bigstringaf.empty when_ready
+    ; fin_offset = None
     }
-end
 
-module Direction = struct
-  type t =
-    | Unidirectional
-    | Bidirectional
+  let has_pending_output t =
+    (* Force another write poll to make sure that a frame with the fin bit set
+       is sent. *)
+    (not (Q.is_empty t.q)) || Option.is_none t.fin_offset
+
+  let flush ?(max_bytes = Int.max_int) t =
+    let faraday = t.producer.faraday in
+    match Faraday.operation faraday with
+    | `Yield ->
+      0
+    | `Close ->
+      (match t.fin_offset with
+      | None ->
+        t.fin_offset <- Some t.offset;
+        ignore (push Bigstringaf.empty t : Frame.fragment)
+      | Some _ ->
+        ());
+      0
+    | `Writev iovecs ->
+      let lengthv = IOVec.lengthv iovecs in
+      let writev_len = if max_bytes < lengthv then max_bytes else lengthv in
+      List.iter
+        (fun { IOVec.buffer; off; len } ->
+          (* XXX(anmonteiro): we might have to copy here since we're shifting
+             below. *)
+          let fragment = Bigstringaf.sub buffer ~off ~len in
+          ignore (push fragment t : Frame.fragment))
+        iovecs;
+      Faraday.shift faraday writev_len;
+      writev_len
 end
 
 type t =
   { send : Send.t
   ; recv : Recv.t
-  ; direction : Direction.t
+  ; direction : Frame.Direction.t
+  ; id : int64
   }
 
-let create ~direction =
-  { send = Send.create (); recv = Recv.create (); direction }
+let create ~direction ~id when_ready =
+  { send = Send.create when_ready; recv = Recv.create (); direction; id }
 
 (* These are not consumed by the application, so the `recv` consumer starts out
  * closed. *)
 let create_crypto () =
   let recv = { (Recv.create ()) with consumer = Buffer.empty } in
-  { send = Send.create (); recv; direction = Bidirectional }
+  { send = Send.create ignore; recv; direction = Bidirectional; id = -1L }
 
 (* Public (application layer) API *)
 let write_char t c = Buffer.write_char t.send.producer c

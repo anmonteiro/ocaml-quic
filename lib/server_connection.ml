@@ -108,6 +108,7 @@ type 'a connection =
   ; writer : Writer.t
   ; streams : (Stream_id.t, Stream.t) Hashtbl.t
   ; handler : Stream.t -> unit
+  ; wakeup_writer : unit -> unit
   }
 
 type 'a packet_info =
@@ -132,6 +133,8 @@ let wakeup_writer t =
   let f = t.wakeup_writer in
   t.wakeup_writer <- Optional_thunk.none;
   Optional_thunk.call_if_some f
+
+let ready_to_write t () = wakeup_writer t
 
 let on_packet_sent t ~encryption_level ~packet_number frames =
   Recovery.on_packet_sent t.recovery ~encryption_level ~packet_number frames
@@ -249,10 +252,9 @@ let process_tls_result t ~packet_info ~new_tls_state ~tls_packets =
           let fragment =
             Stream.Send.push (Cstruct.to_bigarray cs) crypto_stream.send
           in
-          let frame = Frame.Crypto fragment in
           Encryption_level.update_exn
             cur_encryption_level
-            (fun xs -> Some (frame :: xs))
+            (fun xs -> Some (Frame.Crypto fragment :: xs))
             outgoing_frames;
           cur_encryption_level)
       outgoing_frames.current
@@ -270,9 +272,8 @@ let process_tls_result t ~packet_info ~new_tls_state ~tls_packets =
     assert (t.encdec.current = Application_data);
     assert (outgoing_frames.current = Application_data);
     assert (Encryption_level.find_current_exn outgoing_frames = []);
-    let frame = Frame.Handshake_done in
     Encryption_level.update_current_exn
-      (fun xs -> Some (frame :: xs))
+      (fun xs -> Some (Frame.Handshake_done :: xs))
       outgoing_frames);
   t.tls_state <- new_tls_state
 
@@ -379,19 +380,24 @@ let rec process_stream_data t ~stream =
   | None ->
     ()
 
-let process_stream_frame t ~id ~fragment ~is_fin =
+let process_stream_frame c ~id ~fragment ~is_fin =
   let stream =
-    match Hashtbl.find_opt t.streams id with
+    match Hashtbl.find_opt c.streams id with
     | Some stream ->
       stream
     | None ->
-      let stream = Stream.create ~direction:(Stream_id.classify id) in
-      Hashtbl.add t.streams id stream;
-      t.handler stream;
+      let stream =
+        Stream.create
+          ~direction:(Frame.Direction.classify id)
+          ~id
+          c.wakeup_writer
+      in
+      Hashtbl.add c.streams id stream;
+      c.handler stream;
       stream
   in
   Stream.Recv.push fragment ~is_fin stream.recv;
-  process_stream_data t ~stream:stream.recv
+  process_stream_data c ~stream:stream.recv
 
 let frame_handler ~packet_info t frame =
   (* TODO: validate that frame can appear at current encryption level. *)
@@ -460,7 +466,7 @@ let initialize_crypto_streams () =
     ~handshake:(Stream.create_crypto ())
     ~application_data:(Stream.create_crypto ())
 
-let create_connection ~client_address ~tls_state handler =
+let create_connection ~client_address ~tls_state ~wakeup_writer handler =
   let crypto_streams = initialize_crypto_streams () in
   { encdec = Encryption_level.create ~current:Initial
   ; packet_number_spaces =
@@ -486,6 +492,7 @@ let create_connection ~client_address ~tls_state handler =
   ; writer = Writer.create 0x1000
   ; streams = Hashtbl.create ~random:true 1024
   ; handler
+  ; wakeup_writer
   }
 
 let create_outgoing_frames ~current =
@@ -510,6 +517,7 @@ let packet_handler t packet =
           create_connection
             ~client_address:(Option.get t.current_client_address)
             ~tls_state:t.base_tls_state
+            ~wakeup_writer:(ready_to_write t)
             t.stream_handler
         in
         let encdec =
@@ -643,6 +651,11 @@ let is_closed _t = false
 
 let report_exn _t _exn = ()
 
+type flush_ret =
+  | Didnt_write
+  | Wrote
+  | Wrote_app_data
+
 (* Flushes packets into one datagram *)
 let _flush_pending_packets t =
   let rec inner t acc =
@@ -661,27 +674,74 @@ let _flush_pending_packets t =
         encryption_level <> Application_data
       in
       if can_be_followed_by_other_packets then
-        inner t true
+        inner t Wrote
       else
-        true
+        Wrote_app_data
     | None ->
       acc
   in
-  inner t false
+  inner t Didnt_write
+
+module Streams = struct
+  let flush t streams =
+    let rec inner acc = function
+      | Seq.Cons (stream, xs) ->
+        let _flushed = Stream.Send.flush stream.Stream.send in
+        if Stream.Send.has_pending_output stream.send then (
+          let encryption_level = Encryption_level.Application_data in
+          let { Crypto.encrypter; _ } =
+            Encryption_level.find_exn encryption_level t.encdec
+          in
+          let packet_number =
+            Packet_number.send_next
+              (Spaces.of_encryption_level
+                 t.packet_number_spaces
+                 encryption_level)
+          in
+          let header_info =
+            Writer.make_header_info
+              ~encrypter
+              ~packet_number
+              ~encryption_level
+              ~source_cid:t.source_cid
+              t.dest_cid
+          in
+          let fragment, is_fin = Stream.Send.pop_exn stream.send in
+          let frames = [ Frame.Stream { id = stream.id; fragment; is_fin } ] in
+          Writer.write_frames_packet t.writer ~header_info frames;
+          on_packet_sent t ~encryption_level ~packet_number frames;
+          Wrote_app_data)
+        else
+          inner acc (xs ())
+      | Nil ->
+        acc
+    in
+    inner Didnt_write (Hashtbl.to_seq_values streams ())
+end
 
 let flush_pending_packets t =
   let rec inner t = function
-    | Seq.Cons (x, xs) ->
-      let connection = Conntbl.find t.connections x in
-      assert (CID.equal connection.source_cid x);
-      if _flush_pending_packets connection then
-        Some (connection.writer, connection.client_address, CID.to_string x)
-      else
-        inner t (xs ())
+    | Seq.Cons (connection, xs) ->
+      let cid = connection.source_cid in
+      (match _flush_pending_packets connection with
+      | Wrote_app_data ->
+        (* Can't write anything else in this datagram. *)
+        Some (connection.writer, connection.client_address, CID.to_string cid)
+      | Didnt_write ->
+        (match Streams.flush connection connection.streams with
+        | Wrote_app_data ->
+          Some (connection.writer, connection.client_address, CID.to_string cid)
+        | _ ->
+          inner t (xs ()))
+      | Wrote ->
+        (* There might be space in this datagram for some application data
+         * frames. Send them. *)
+        ignore (Streams.flush connection connection.streams : flush_ret);
+        Some (connection.writer, connection.client_address, CID.to_string cid))
     | Nil ->
       None
   in
-  inner t (Conntbl.to_seq_keys t.connections ())
+  inner t (Conntbl.to_seq_values t.connections ())
 
 let next_write_operation (t : 'a t) =
   if t.closed then
