@@ -1,6 +1,6 @@
 (*----------------------------------------------------------------------------
  *  Copyright (c) 2017 Inhabited Type LLC.
- *  Copyright (c) 2019 Antonio N. Monteiro.
+ *  Copyright (c) 2020 Antonio N. Monteiro.
  *
  *  All rights reserved.
  *
