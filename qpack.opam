@@ -1,0 +1,19 @@
+opam-version: "2.0"
+maintainer: "Antonio Nuno Monteiro <anmonteiro@gmail.com>"
+authors: [ "Antonio Nuno Monteiro <anmonteiro@gmail.com>" ]
+license: "BSD-3-clause"
+homepage: "https://github.com/anmonteiro/ocaml-quic"
+bug-reports: "https://github.com/anmonteiro/ocaml-quic/issues"
+dev-repo: "git+https://github.com/anmonteiro/ocaml-quic.git"
+doc: "https://anmonteiro.github.io/ocaml-quic/"
+depends: [
+  "ocaml" {>= "4.04"}
+  "dune" {>= "1.7"}
+  "yojson" {with-test}
+  "hex" {with-test}
+  "angstrom"
+  "faraday"
+]
+build: [
+  ["dune" "build" "-p" name "-j" jobs]
+]

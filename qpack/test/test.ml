@@ -1,3 +1,4 @@
-open Qpack
-
-let () = Alcotest.run "qpack" [ "encoder", Test_encoder.suite ]
+let () =
+  Alcotest.run
+    "qpack"
+    [ "encoder", Test_encoder.suite; "decoder", Test_decoder.suite ]

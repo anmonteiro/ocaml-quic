@@ -98,7 +98,9 @@ module Decoder : sig
       and {{:https://tools.ietf.org/html/rfc7541#section-4.1} RFC7541§4.1} for
       more details. *)
 
-  val decode_headers : t -> (header list, error) result Angstrom.t
+  (* val decode_headers : t -> (header list, error) result Angstrom.t *)
   (** [decode_headers decoder] creates an Angstrom parser that will decode a
       header block and return a list of the decoded headers *)
+
+  val decode_block : t -> (string * string) list Angstrom.t
 end

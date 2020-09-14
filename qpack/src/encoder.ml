@@ -178,7 +178,9 @@ let[@inline] relative_index ~base absolute_index =
 
 let[@inline] post_base_index ~base absolute_index = absolute_index - base
 
-module Instructions = struct
+module Instruction = struct
+  (** Instructions sent to a peer's decoder *)
+
   let encode_set_dynamic_table_capacity t capacity =
     (* From RFC<QPACK-RFC>§4.3.1:
      *   An encoder informs the decoder of a change to the dynamic table
@@ -244,14 +246,46 @@ module Instructions = struct
     else
       encode_insert_without_name_reference t name value
 
-  let encode_duplicate t index =
+  let encode_duplicate t ~base absolute_index =
     (* From RFC<QPACK-RFC>§4.3.4:
      *   An encoder duplicates an existing entry in the dynamic table using an
      *   instruction that begins with the '000' three-bit pattern. This is
      *   followed by the relative index of the existing entry represented as an
      *   integer with a 5-bit prefix; see Section 4.1.1. *)
     let prefix = 0b0000_0000 in
-    Qint.encode t prefix 5 index
+    Qint.encode t prefix 5 (relative_index ~base absolute_index)
+
+  (** Instructions read from a peer's decoder. *)
+
+  type decoder_instruction =
+    | Section_ack of int64
+    | Stream_cancelation of int64
+    | Insert_count_increment of int
+
+  let parser =
+    let open Angstrom in
+    any_uint8 >>= fun b ->
+    if b land 0b1000_0000 = 0b1000_0000 then
+      (* From RFC<QPACK-RFC>§4.4.1:
+       *   The instruction begins with the '1' one-bit pattern, followed by the
+       *   field section's associated stream ID encoded as a 7-bit prefix
+       *   integer; see Section 4.1.1. *)
+      lift
+        (fun stream_id -> Section_ack (Int64.of_int stream_id))
+        (Qint.decode b 7)
+    else if b land 0b0100_0000 = 0b0100_0000 then
+      (* From RFC<QPACK-RFC>§4.4.2:
+       *   The instruction begins with the '01' two-bit pattern, followed by the
+       *   stream ID of the affected stream encoded as a 6-bit prefix integer. *)
+      lift
+        (fun stream_id -> Stream_cancelation (Int64.of_int stream_id))
+        (Qint.decode b 6)
+    else (
+      assert (b land 0b1100_0000 = 0b0000_0000);
+      (* From RFC<QPACK-RFC>§4.4.3:
+       *   The Insert Count Increment instruction begins with the '00' two-bit
+       *   pattern, followed by the Increment encoded as a 6-bit prefix integer. *)
+      lift (fun inc -> Insert_count_increment inc) (Qint.decode b 6))
 end
 
 let encode_index_reference t ~table ~base absolute_index =
@@ -331,21 +365,25 @@ let encode_literal t ~static_name_idx ~dynamic_name_idx ~base name value =
   else
     encode_literal_without_name_reference t name value
 
-(*
- *  static name + value -> static index reference
- *  dynamic name + value -> dynamic index reference
+let encode_section_prefix t f ~required_insert_count ~base =
+  if required_insert_count = 0 then (
+    (* From RFC<QPACK-RFC>§4.5.1:
+     *   The Required Insert Count is encoded as an integer with an 8-bit
+     *   prefix using the encoding described in Section 4.5.1.1. The Base is
+     *   encoded as a sign bit ('S') and a Delta Base value with a 7-bit
+     *   prefix; see Section 4.5.1.2. *)
+    Qint.encode f 0 8 0;
+    Qint.encode f 0 7 0)
+  else
+    let wireRIC =
+      (required_insert_count mod (2 * Dynamic_table.max_entries t.table)) + 1
+    in
+    Qint.encode f 0x00 8 wireRIC;
+    if base >= required_insert_count then
+      Qint.encode f 0 7 (base - required_insert_count)
+    else
+      Qint.encode f 0x80 7 (required_insert_count - base - 1)
 
- *  static name          -> insert with static index reference
- *  dynamic name          -> insert with dynamic index reference
- *  (in both cases add to the dynamic table )
-
- *  couldn't index (if adding wasn't possible) ->
- *    if dynamic name is in the dyntable -> literal with dynamic name reference
- *    if static name in the dyntable -> literal with static name reference
-
- *  if adding was possible:
- *     dynamic index reference
- *)
 let encode_headers t ~prefixBuffer ~encoder_buffer f headers =
   let base = t.next_seq in
   let required_insert_count = ref 0 in
@@ -383,7 +421,7 @@ let encode_headers t ~prefixBuffer ~encoder_buffer f headers =
                *   a given relative index will change while interpreting
                *   instructions on the encoder stream. *)
               if maybe_added <> not_found then
-                Instructions.encode_insert
+                Instruction.encode_insert
                   encoder_buffer
                   ~static_name_idx:name_idx
                   ~dynamic_name_idx:dynamic_name_index
@@ -426,24 +464,11 @@ let encode_headers t ~prefixBuffer ~encoder_buffer f headers =
           required_insert_count := max !required_insert_count dynamic_index;
           encode_index_reference f ~table:Dynamic ~base dynamic_index))
     headers;
-  (* encode the prefix *)
-  if !required_insert_count = 0 then (
-    (* From RFC<QPACK-RFC>§4.5.1:
-     *   The Required Insert Count is encoded as an integer with an 8-bit
-     *   prefix using the encoding described in Section 4.5.1.1. The Base is
-     *   encoded as a sign bit ('S') and a Delta Base value with a 7-bit
-     *   prefix; see Section 4.5.1.2. *)
-    Qint.encode prefixBuffer 0 8 0;
-    Qint.encode prefixBuffer 0 7 0)
-  else
-    let wireRIC =
-      (!required_insert_count mod (2 * Dynamic_table.max_entries t.table)) + 1
-    in
-    Qint.encode prefixBuffer 0x00 8 wireRIC;
-    if base >= !required_insert_count then
-      Qint.encode prefixBuffer 0 7 (base - !required_insert_count)
-    else
-      Qint.encode prefixBuffer 0x80 7 (!required_insert_count - base - 1)
+  encode_section_prefix
+    t
+    prefixBuffer
+    ~required_insert_count:!required_insert_count
+    ~base
 
 (*
  *  base = dynamicTable.getInsertCount()

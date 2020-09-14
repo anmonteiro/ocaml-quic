@@ -36,12 +36,13 @@ open Angstrom
 type t =
   { table : Dynamic_table.t
   ; max_capacity : int
+  ; mutable next_seq : int
   }
 
 let create max_capacity =
-  { table = Dynamic_table.create max_capacity; max_capacity }
+  { table = Dynamic_table.create max_capacity; max_capacity; next_seq = 0 }
 
-let set_capacity { table; max_capacity } capacity =
+let set_capacity { table; max_capacity; _ } capacity =
   if capacity > max_capacity then
     (* From RFC7541§6.3:
      *   The new maximum size MUST be lower than or equal to the limit
@@ -56,7 +57,16 @@ let[@inline] ok x = return (Ok x)
 
 let[@inline] error x = return (Error x)
 
-module Instructions = struct
+let add t name value =
+  let ret = Dynamic_table.add t.table (name, value) in
+  if ret then t.next_seq <- t.next_seq + 1;
+  ret
+
+let[@inline] absolute_of_relative ~base relative = base - 1 - relative
+
+let[@inline] absolute_of_post_base ~base post_base = base + post_base
+
+module Instruction = struct
   let encode_section_acknowledgement t ~stream_id =
     (* From RFC<QPACK-RFC>§4.4.1:
      *   The instruction begins with the '1' one-bit pattern, followed by the
@@ -78,142 +88,198 @@ module Instructions = struct
      *   pattern, followed by the Increment encoded as a 6-bit prefix integer. *)
     let prefix = 0b0000_0000 in
     Qint.encode t prefix 6 increment
+
+  (* Returns the insert count increment for the instruction processed *)
+  let parser t =
+    let open Angstrom in
+    peek_char_fail >>= fun c ->
+    let b = Char.code c in
+    (* From RFC<QPACK-RFC>§4.3.2:
+     *   An encoder adds an entry to the dynamic table where the field name
+     *   matches the field name of an entry stored in the static or the dynamic
+     *   table using an instruction that starts with the '1' one-bit pattern.
+     *   The second ('T') bit indicates whether the reference is to the static
+     *   or dynamic table. *)
+    if b land 0b1100_0000 = 0b1100_0000 then
+      lift2
+        (fun idx value ->
+          (* When T=1, the number represents the static table index *)
+          let name, _ = Static_table.table.(idx) in
+          if add t name (Result.get_ok value) then 1 else 0)
+        (any_uint8 >>= fun b -> Qint.decode b 6)
+        (Qstring.decode 8)
+    else if b land 0b1000_0000 = 0b1000_0000 then
+      (* when T=0,* the number is the relative index of the entry in the dynamic
+         table. *)
+      lift2
+        (fun idx value ->
+          let name, _ =
+            Dynamic_table.get
+              t.table
+              (absolute_of_relative ~base:t.next_seq idx)
+          in
+          if add t name (Result.get_ok value) then 1 else 0)
+        (any_uint8 >>= fun b -> Qint.decode b 6)
+        (Qstring.decode 8)
+    else if b land 0b0100_0000 = 0b0100_0000 then
+      (* From RFC<QPACK-RFC>§4.3.1:
+       *   An encoder adds an entry to the dynamic table where both the field
+       *   name and the field value are represented as string literals using an
+       *   instruction that starts with the '01' two-bit pattern. *)
+      lift2
+        (fun name value ->
+          if add t (Result.get_ok name) (Result.get_ok value) then 1 else 0)
+        (Qstring.decode 6)
+        (Qstring.decode 8)
+    else if b land 0b0010_0000 = 0b0010_0000 then
+      lift
+        (fun max ->
+          Result.get_ok (set_capacity t max);
+          0)
+        (any_uint8 >>= fun b -> Qint.decode b 5)
+    else (
+      assert (b land 0b0001_0000 = 0);
+      lift
+        (fun idx ->
+          let name, value =
+            Dynamic_table.get
+              t.table
+              (absolute_of_relative ~base:t.next_seq idx)
+          in
+          if add t name value then 1 else 0)
+        (any_uint8 >>= fun b -> Qint.decode b 5))
+
+  let manyp ~f p = fix (fun m -> lift2 f p m <|> return 0)
+
+  let many1p ~f p = lift2 f p (manyp ~f p)
+
+  let parser t =
+    let f = Faraday.create 0x100 in
+    let p = many1p ~f:(fun i acc -> acc + i) (parser t) in
+    lift
+      (fun insert_count_increment ->
+        if insert_count_increment > 0 then
+          (* From RFC<QPACK-RFC>§4.4.3:
+           *   An encoder that receives an Increment field equal to zero, or
+           *   one that increases the Known Received Count beyond what the
+           *   encoder has sent MUST treat this as a connection error of type
+           *   QPACK_DECODER_STREAM_ERROR. *)
+          encode_insert_count_increment f insert_count_increment;
+        Faraday.serialize_to_string f)
+      p
 end
 
-let get_indexed_field table index =
-  let static_table_size = Static_table.table_size in
-  let dynamic_table_size = Dynamic_table.table_size table in
-  (* From RFC7541§6.1:
-   *   The index value of 0 is not used. It MUST be treated as a decoding
-   *   error if found in an indexed header field representation. *)
-  if
-    index == 0
-    || (* From RFC7541§2.3.3:
-        *   Indices strictly greater than the sum of the lengths of both tables
-        *   MUST be treated as a decoding error. *)
-    index > static_table_size + dynamic_table_size
-  then
-    Error Decoding_error
-  else if index <= static_table_size then
-    (* From RFC7541§2.3.3:
-     *   Indices between 1 and the length of the static table (inclusive) refer
-     *   to elements in the static table (see Section 2.3.1). *)
-    Ok Static_table.table.(index - 1)
+let reconstruct_required_insert_count t ~encoded_insert_count =
+  let total_inserts = t.next_seq in
+  let max_entries = t.table.max_size / 32 in
+  let full_range = 2 * max_entries in
+  if encoded_insert_count = 0 then
+    0
+  else if encoded_insert_count > full_range then
+    failwith "error"
   else
-    (* From RFC7541§2.3.3:
-     *   Indices strictly greater than the length of the static table refer to
-     *   elements in the dynamic table (see Section 2.3.2). The length of the
-     *   static table is subtracted to find the index into the dynamic
-     *   table. *)
-    Ok (Dynamic_table.get table (index - static_table_size - 1))
-
-let decode_header_field table prefix prefix_length =
-  Qint.decode prefix prefix_length >>= fun index ->
-  lift2
-    (fun name value ->
-      match name, value with
-      | Ok name, Ok value ->
-        Ok (name, value)
-      | Error e, _ | _, Error e ->
-        Error e)
-    (* From RFC7541§6.2.1:
-     *   If the header field name matches the header field name of an entry
-     *   stored in the static table or the dynamic table, the header field
-     *   name can be represented using the index of that entry. In this case,
-     *   [...] This value is always non-zero.
-     *
-     *   Otherwise, the header field name is represented as a string literal
-     *   (see Section 5.2). A value 0 is used in place [...], followed by the
-     *   header field name. *)
-    (if index == 0 then
-       Qstring.decode 8
-    else
-      match get_indexed_field table index with
-      | Ok (name, _) ->
-        ok name
-      | Error e ->
-        error e)
-    (Qstring.decode 8)
-
-let decode_headers ({ table; _ } as t) =
-  let rec loop acc saw_first_header =
-    at_end_of_input >>= fun is_eof ->
-    if is_eof then
-      ok acc
-    else
-      any_uint8 >>= fun b ->
-      if b land 0b1000_0000 != 0 then
-        (* From RFC7541§6.1: Indexed Header Field Representation
-         *   An indexed header field starts with the '1' 1-bit pattern,
-         *   followed by the index of the matching header field, represented as
-         *   an integer with a 7-bit prefix (see Section 5.1). *)
-        Qint.decode b 7 >>= fun index ->
-        match get_indexed_field table index with
-        | Ok (name, value) ->
-          loop ({ name; value; sensitive = false } :: acc) true
-        | Error e ->
-          error e
-      else if b land 0b1100_0000 == 0b0100_0000 then
-        (* From RFC7541§6.2.1: Literal Header Field with Incremental Indexing
-         *   A literal header field with incremental indexing representation
-         *   starts with the '01' 2-bit pattern. In this case, the index of the
-         *   entry is represented as an integer with a 6-bit prefix (see
-         *   Section 5.1). *)
-        decode_header_field table b 6 >>= function
-        | Ok (name, value) ->
-          (* From RFC7541§6.2.1: Literal Header Field with Incremental Indexing
-           *   A literal header field with incremental indexing representation
-           *   results in appending a header field to the decoded header list
-           *   and inserting it as a new entry into the dynamic table. *)
-          ignore @@ Dynamic_table.add table (name, value);
-          loop ({ name; value; sensitive = false } :: acc) true
-        | Error e ->
-          error e
-      else if b land 0b1111_0000 == 0 then
-        (* From RFC7541§6.2.2: Literal Header Field without Indexing
-         *   A literal header field without indexing representation starts with
-         *   the '0000' 4-bit pattern. In this case, the index of the entry is
-         *   represented as an integer with a 4-bit prefix (see Section
-         *   5.1). *)
-        decode_header_field table b 4 >>= function
-        | Ok (name, value) ->
-          loop ({ name; value; sensitive = false } :: acc) true
-        | Error e ->
-          error e
-      else if b land 0b1111_0000 == 0b0001_0000 then
-        (* From RFC7541§6.2.3: Literal Header Field Never Indexed
-         *   A literal header field without indexing representation starts with
-         *   the '0001' 4-bit pattern.
-         *  The encoding of the representation is identical to the literal
-         *  header field without indexing (see Section 6.2.2). *)
-        decode_header_field table b 4 >>= function
-        | Ok (name, value) ->
-          loop ({ name; value; sensitive = true } :: acc) true
-        | Error e ->
-          error e
-      else if b land 0b1110_0000 == 0b0010_0000 then
-        if
-          (* From RFC7541§6.3: Dynamic Table Size Update
-           *   A dynamic table size update signals a change to the size of the
-           *   dynamic table.
-           *   A dynamic table size update starts with the '001' 3-bit
-           *   pattern *)
-          saw_first_header
-        then
-          (* From RFC7541§4.2: Maximum Table Size
-           *   A change in the maximum size of the dynamic table is signaled
-           *   via a dynamic table size update (see Section 6.3). This dynamic
-           *   table size update MUST occur at the beginning of the first
-           *   header block following the change to the dynamic table size. *)
-          error Decoding_error
-        else
-          Qint.decode b 5 >>= fun capacity ->
-          match set_capacity t capacity with
-          | Ok () ->
-            loop acc saw_first_header
-          | Error e ->
-            error e
+    let max_value = total_inserts + max_entries in
+    let max_wrapped = max_value / full_range * full_range in
+    let req_insert_count = max_wrapped + encoded_insert_count - 1 in
+    (* If ReqInsertCount exceeds MaxValue, the Encoder's value must have wrapped
+     * one fewer time *)
+    if req_insert_count > max_value then
+      if req_insert_count <= full_range then
+        failwith "error"
       else
-        error Decoding_error
+        req_insert_count - full_range
+    else if req_insert_count = 0 then
+      failwith "error"
+    else
+      req_insert_count
+
+let section_prefix t =
+  let open Angstrom in
+  any_uint8 >>= fun b ->
+  Qint.decode b 8 >>= fun req_insert_count ->
+  any_uint8 >>= fun b ->
+  Qint.decode b 7 >>| fun delta_base ->
+  let sign = b land 0b1000_0000 = 0b1000_0000 in
+  let req_insert_count =
+    reconstruct_required_insert_count t ~encoded_insert_count:req_insert_count
   in
-  loop [] false
+  let base =
+    if not sign then
+      req_insert_count + delta_base
+    else
+      req_insert_count - delta_base - 1
+  in
+  req_insert_count, base
+
+let parser { table; _ } ~base =
+  let open Angstrom in
+  peek_char_fail >>= fun c ->
+  let b = Char.code c in
+  if b land 0b1100_0000 = 0b1100_0000 then
+    (* From RFC<QPACK-RFC>§4.5.1:
+     *   This representation starts with the '1' 1-bit pattern, followed by the
+     *   'T' bit indicating whether the reference is into the static or dynamic
+     *   table. *)
+    lift
+      (* When T=1, the number represents the static table index; *)
+        (fun index -> Static_table.table.(index))
+      (any_uint8 >>= fun b -> Qint.decode b 6)
+  else if b land 0b1000_0000 = 0b1000_0000 then
+    lift
+      (* when T=0, the number is the relative index of the entry in the dynamic
+         table. *)
+        (fun idx ->
+        let index = absolute_of_relative ~base idx in
+        Dynamic_table.get table index)
+      (any_uint8 >>= fun b -> Qint.decode b 6)
+  else if b land 0b0100_0000 = 0b0100_0000 then
+    (* From RFC<QPACK-RFC>§4.5.4:
+     *   This representation starts with the '01' two-bit pattern. [...] The
+     *   fourth ('T') bit indicates whether the reference is to the static or
+     *   dynamic table. *)
+    lift2
+      (fun index value ->
+        (* When T=1, the number represents the static table index; when T=0, the
+         * number is the relative index of the entry in the dynamic table. *)
+        let is_static = b land 0b0001_0000 = 0b0001_0000 in
+        let name, _ =
+          if is_static then
+            Static_table.table.(index)
+          else
+            Dynamic_table.get table (absolute_of_relative ~base index)
+        in
+        name, Result.get_ok value)
+      (any_uint8 >>= fun b -> Qint.decode b 4)
+      (Qstring.decode 8)
+  else if b land 0b0010_0000 = 0b0010_0000 then
+    (* From RFC<QPACK-RFC>§4.3.1:
+     *   This representation begins with the '001' three-bit pattern. *)
+    lift2
+      (fun name value -> Result.get_ok name, Result.get_ok value)
+      (Qstring.decode 4)
+      (Qstring.decode 8)
+  else if b land 0b0001_0000 = 0b0001_0000 then
+    (* From RFC<QPACK-RFC>§4.5.3:
+     *   This representation starts with the '0001' 4-bit pattern. *)
+    lift
+      (fun idx ->
+        let index = absolute_of_post_base ~base idx in
+        Dynamic_table.get table index)
+      (any_uint8 >>= fun b -> Qint.decode b 4)
+  else (
+    assert (b land 0b1111_0000 = 0b0000_0000);
+    lift2
+      (fun idx value ->
+        let index = absolute_of_post_base ~base idx in
+        let name, _ =
+          Dynamic_table.get table (absolute_of_relative ~base index)
+        in
+        name, Result.get_ok value)
+      (any_uint8 >>= fun b -> Qint.decode b 3)
+      (Qstring.decode 8))
+
+let parser t =
+  section_prefix t >>= fun (_req_insert_count, base) ->
+  Angstrom.many1 (parser t ~base)
+
+let decode_block = parser

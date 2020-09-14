@@ -77,8 +77,9 @@ let max_entries t =
    *   MaxEntries = floor( MaxTableCapacity / 32 ) *)
   t.max_size / 32
 
-let[@inline] _get table i =
-  table.entries.((table.offset + i) mod table.capacity)
+let ( mod ) x y = ((x mod y) + y) mod y
+
+let[@inline] _get t i = t.entries.((t.capacity - 1 - i) mod t.capacity)
 
 let[@inline] get table i =
   let name, value, _ = _get table i in
