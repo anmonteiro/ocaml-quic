@@ -52,113 +52,6 @@ open Test_helpers
  *      assert_eq!(decode_header(&table, &mut read), Err(Error::MissingRefs(8)));
  *  }
 
- *  fn field(n: usize) -> HeaderField {
- *      HeaderField::new(format!("foo{}", n), "bar")
- *  }
-
- *  //      Largest Reference
- *  //        Base Index = 2
- *  //             |
- *  // foo4 foo3  foo2  foo1
- *  // +---+-----+-----+-----+
- *  // | 4 |  3  |  2  |  1  |  Absolute Index
- *  // +---+-----+-----+-----+
- *  //           |  0  |  1  |  Relative Index
- *  // +-----+-----+---+-----+
- *  // | 1 |  0  |              Post-Base Index
- *  // +---+-----+
-
- *  #[test]
- *  fn decode_post_base_indexed() {
- *      let mut buf = vec![];
- *      HeaderPrefix::new(4, 2, 4, TABLE_SIZE).encode(&mut buf);
- *      Indexed::Dynamic(0).encode(&mut buf);
- *      IndexedWithPostBase(0).encode(&mut buf);
- *      IndexedWithPostBase(1).encode(&mut buf);
-
- *      let mut read = Cursor::new(&buf);
- *      let (headers, had_refs) = decode_header(&build_table_with_size(4), &mut read).unwrap();
- *      assert!(had_refs);
- *      assert_eq!(headers, &[field(2), field(3), field(4)])
- *  }
-
- *  #[test]
- *  fn decode_name_ref_header_field() {
- *      let mut buf = vec![];
- *      HeaderPrefix::new(2, 2, 4, TABLE_SIZE).encode(&mut buf);
- *      LiteralWithNameRef::new_dynamic(1, "new bar1")
- *          .encode(&mut buf)
- *          .unwrap();
- *      LiteralWithNameRef::new_static(18, "PUT")
- *          .encode(&mut buf)
- *          .unwrap();
-
- *      let mut read = Cursor::new(&buf);
- *      let (headers, had_refs) = decode_header(&build_table_with_size(4), &mut read).unwrap();
- *      assert!(had_refs);
- *      assert_eq!(
- *          headers,
- *          &[
- *              field(1).with_value("new bar1"),
- *              StaticTable::get(18).unwrap().with_value("PUT")
- *          ]
- *      )
- *  }
-
- *  #[test]
- *  fn decode_post_base_name_ref_header_field() {
- *      let mut buf = vec![];
- *      HeaderPrefix::new(2, 2, 4, TABLE_SIZE).encode(&mut buf);
- *      LiteralWithPostBaseNameRef::new(0, "new bar3")
- *          .encode(&mut buf)
- *          .unwrap();
-
- *      let mut read = Cursor::new(&buf);
- *      let (headers, _) = decode_header(&build_table_with_size(4), &mut read).unwrap();
- *      assert_eq!(headers, &[field(3).with_value("new bar3")]);
- *  }
-
- *  #[test]
- *  fn decode_without_name_ref_header_field() {
- *      let mut buf = vec![];
- *      HeaderPrefix::new(0, 0, 0, TABLE_SIZE).encode(&mut buf);
- *      Literal::new("foo", "bar").encode(&mut buf).unwrap();
-
- *      let mut read = Cursor::new(&buf);
- *      let table = build_table_with_size(0);
- *      let (headers, _) = decode_header(&table, &mut read).unwrap();
- *      assert_eq!(
- *          headers,
- *          &[HeaderField::new(b"foo".to_vec(), b"bar".to_vec())]
- *      );
- *  }
-
- *  // Largest Reference = 4
- *  //  |            Base Index = 0
- *  //  |                |
- *  // foo4 foo3  foo2  foo1
- *  // +---+-----+-----+-----+
- *  // | 4 |  3  |  2  |  1  |  Absolute Index
- *  // +---+-----+-----+-----+
- *  //                          Relative Index
- *  // +---+-----+-----+-----+
- *  // | 2 |   2 |  1  |  0  |  Post-Base Index
- *  // +---+-----+-----+-----+
-
- *  #[test]
- *  fn decode_single_pass_encoded() {
- *      let mut buf = vec![];
- *      HeaderPrefix::new(4, 0, 4, TABLE_SIZE).encode(&mut buf);
- *      IndexedWithPostBase(0).encode(&mut buf);
- *      IndexedWithPostBase(1).encode(&mut buf);
- *      IndexedWithPostBase(2).encode(&mut buf);
- *      IndexedWithPostBase(3).encode(&mut buf);
-
- *      let mut read = Cursor::new(&buf);
- *      let (headers, _) = decode_header(&build_table_with_size(4), &mut read).unwrap();
- *      assert_eq!(headers, &[field(1), field(2), field(3), field(4)]);
- *  }
-
  *  #[test]
  *  fn largest_ref_greater_than_max_entries() {
  *      let max_entries = TABLE_SIZE / 32;
@@ -381,6 +274,13 @@ let test_instruction_too_short () =
   | Error _ ->
     Alcotest.(check pass) "failed decoding a too short instruction" true true
 
+let fill_table t n =
+  for i = 1 to n do
+    let added = Decoder.add t (Format.asprintf "foo%d" i) "bar" in
+    Alcotest.(check bool) "added to the dynamic table" true added
+  done;
+  Alcotest.(check int) "table has n entries" n t.table.length
+
 (*
  *  Largest Reference
  *    Base Index = 2
@@ -394,10 +294,7 @@ let test_instruction_too_short () =
  *)
 let test_decode_indexed_header_field () =
   let t = Decoder.create 4096 in
-  let added1 = Decoder.add t "foo1" "bar" in
-  let added2 = Decoder.add t "foo2" "bar" in
-  Alcotest.(check bool) "added to the dynamic table" true added1;
-  Alcotest.(check bool) "added to the dynamic table" true added2;
+  fill_table t 2;
   let f = Faraday.create 0x1000 in
   Encoder.encode_section_prefix
     (Encoder.create 4096)
@@ -417,6 +314,147 @@ let test_decode_indexed_header_field () =
   | Error e ->
     Alcotest.fail e
 
+(*
+ *       Largest Reference
+ *         Base Index = 2
+ *              |
+ *  foo4 foo3  foo2  foo1
+ *  +---+-----+-----+-----+
+ *  | 3 |  2  |  1  |  0  |  Absolute Index
+ *  +---+-----+-----+-----+
+ *            |  0  |  1  |  Relative Index
+ *  +-----+-----+---+-----+
+ *  | 1 |  0  |              Post-Base Index
+ *  +---+-----+
+ *)
+let test_decode_post_base_indexed () =
+  let t = Decoder.create 4096 in
+  fill_table t 4;
+  let f = Faraday.create 0x1000 in
+  Encoder.encode_section_prefix
+    (Encoder.create 4096)
+    f
+    ~required_insert_count:4
+    ~base:2;
+  Encoder.encode_index_reference f ~table:Dynamic ~base:2 1;
+  Encoder.encode_index_reference f ~table:Dynamic ~base:2 2;
+  Encoder.encode_index_reference f ~table:Dynamic ~base:2 3;
+  let s = Faraday.serialize_to_string f in
+  match decode_header_block t s with
+  | Ok headers ->
+    Alcotest.(check (list (pair qstring qstring)))
+      "expected headers"
+      [ "foo2", "bar"; "foo3", "bar"; "foo4", "bar" ]
+      headers
+  | Error e ->
+    Alcotest.fail e
+
+let test_decode_name_ref () =
+  let t = Decoder.create 4096 in
+  fill_table t 4;
+  let f = Faraday.create 0x1000 in
+  Encoder.encode_section_prefix
+    (Encoder.create 4096)
+    f
+    ~required_insert_count:2
+    ~base:2;
+  Encoder.encode_literal_with_name_reference
+    f
+    ~table:Dynamic
+    ~base:2
+    0
+    "new bar1";
+  Encoder.encode_literal_with_name_reference f ~table:Static ~base:2 18 "PUT";
+  let s = Faraday.serialize_to_string f in
+  match decode_header_block t s with
+  | Ok headers ->
+    Alcotest.(check (list (pair qstring qstring)))
+      "expected headers"
+      [ "foo1", "new bar1"; ":method", "PUT" ]
+      headers
+  | Error e ->
+    Alcotest.fail e
+
+let test_decode_post_base_name_ref () =
+  let t = Decoder.create 4096 in
+  fill_table t 4;
+  let f = Faraday.create 0x1000 in
+  Encoder.encode_section_prefix
+    (Encoder.create 4096)
+    f
+    ~required_insert_count:2
+    ~base:2;
+  Encoder.encode_literal_with_name_reference
+    f
+    ~table:Dynamic
+    ~base:2
+    2
+    "new bar3";
+  let s = Faraday.serialize_to_string f in
+  match decode_header_block t s with
+  | Ok headers ->
+    Alcotest.(check (list (pair qstring qstring)))
+      "expected headers"
+      [ "foo3", "new bar3" ]
+      headers
+  | Error e ->
+    Alcotest.fail e
+
+let test_decode_literal_without_name_ref_header_field () =
+  let t = Decoder.create 4096 in
+  let f = Faraday.create 0x1000 in
+  Encoder.encode_section_prefix
+    (Encoder.create 4096)
+    f
+    ~required_insert_count:0
+    ~base:0;
+  Encoder.encode_literal_without_name_reference f "foo" "bar";
+  let s = Faraday.serialize_to_string f in
+  match decode_header_block t s with
+  | Ok headers ->
+    Alcotest.(check (list (pair qstring qstring)))
+      "expected headers"
+      [ "foo", "bar" ]
+      headers
+  | Error e ->
+    Alcotest.fail e
+
+(*
+ *  Largest Reference = 4
+ *   |            Base Index = 0
+ *   |                |
+ *  foo4 foo3  foo2  foo1
+ *  +---+-----+-----+-----+
+ *  | 3 |  2  |  1  |  0  |  Absolute Index
+ *  +---+-----+-----+-----+
+ *                           Relative Index
+ *  +---+-----+-----+-----+
+ *  | 2 |   2 |  1  |  0  |  Post-Base Index
+ *  +---+-----+-----+-----+
+ *)
+let test_decode_single_pass_encoded () =
+  let t = Decoder.create 4096 in
+  fill_table t 4;
+  let f = Faraday.create 0x1000 in
+  Encoder.encode_section_prefix
+    (Encoder.create 4096)
+    f
+    ~required_insert_count:4
+    ~base:0;
+  Encoder.encode_index_reference f ~table:Dynamic ~base:0 0;
+  Encoder.encode_index_reference f ~table:Dynamic ~base:0 1;
+  Encoder.encode_index_reference f ~table:Dynamic ~base:0 2;
+  Encoder.encode_index_reference f ~table:Dynamic ~base:0 3;
+  let s = Faraday.serialize_to_string f in
+  match decode_header_block t s with
+  | Ok headers ->
+    Alcotest.(check (list (pair qstring qstring)))
+      "expected headers"
+      [ "foo1", "bar"; "foo2", "bar"; "foo3", "bar"; "foo4", "bar" ]
+      headers
+  | Error e ->
+    Alcotest.fail e
+
 let suite =
   [ ( "insert field with name reference"
     , `Quick
@@ -426,4 +464,13 @@ let suite =
   ; "dynamic table size update", `Quick, test_dynamic_table_size_update
   ; "parse instruction that is too short", `Quick, test_instruction_too_short
   ; "decode indexed header field", `Quick, test_decode_indexed_header_field
+  ; ( "decode indexed header field with post base index"
+    , `Quick
+    , test_decode_post_base_indexed )
+  ; "decode name reference field", `Quick, test_decode_name_ref
+  ; "decode post base name ref", `Quick, test_decode_post_base_name_ref
+  ; ( "decode literal without name reference"
+    , `Quick
+    , test_decode_literal_without_name_ref_header_field )
+  ; "decode single pass", `Quick, test_decode_single_pass_encoded
   ]

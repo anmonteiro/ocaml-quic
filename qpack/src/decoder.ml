@@ -271,9 +271,7 @@ let parser { table; _ } ~base =
     lift2
       (fun idx value ->
         let index = absolute_of_post_base ~base idx in
-        let name, _ =
-          Dynamic_table.get table (absolute_of_relative ~base index)
-        in
+        let name, _ = Dynamic_table.get table index in
         name, Result.get_ok value)
       (any_uint8 >>= fun b -> Qint.decode b 3)
       (Qstring.decode 8))
