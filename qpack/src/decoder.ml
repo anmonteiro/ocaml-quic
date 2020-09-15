@@ -89,7 +89,8 @@ module Instruction = struct
     let prefix = 0b0000_0000 in
     Qint.encode t prefix 6 increment
 
-  (* Returns the insert count increment for the instruction processed *)
+  (* Reads encoder instructions, returns the insert count increment for the
+   * instruction processed *)
   let parser t =
     let open Angstrom in
     peek_char_fail >>= fun c ->
@@ -122,7 +123,7 @@ module Instruction = struct
         (any_uint8 >>= fun b -> Qint.decode b 6)
         (Qstring.decode 8)
     else if b land 0b0100_0000 = 0b0100_0000 then
-      (* From RFC<QPACK-RFC>§4.3.1:
+      (* From RFC<QPACK-RFC>§4.3.3:
        *   An encoder adds an entry to the dynamic table where both the field
        *   name and the field value are represented as string literals using an
        *   instruction that starts with the '01' two-bit pattern. *)
@@ -138,7 +139,7 @@ module Instruction = struct
           0)
         (any_uint8 >>= fun b -> Qint.decode b 5)
     else (
-      assert (b land 0b0001_0000 = 0);
+      assert (b land 0b1110_0000 = 0);
       lift
         (fun idx ->
           let name, value =
