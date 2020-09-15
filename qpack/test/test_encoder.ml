@@ -153,7 +153,10 @@ module Encoding = struct
   let decode d stream =
     let open Angstrom in
     let p =
-      Decoder.section_prefix d >>= fun (_req_insert_count, _base) -> parser
+      lift2
+        (fun (req_insert_count, _base) headers -> req_insert_count, headers)
+        (Decoder.section_prefix d)
+        parser
     in
     match Angstrom.parse_string ~consume:Prefix p stream with
     | Ok x ->
@@ -164,8 +167,10 @@ module Encoding = struct
   let decode_many d stream =
     let open Angstrom in
     let p =
-      Decoder.section_prefix d >>= fun (_req_insert_count, _base) ->
-      many1 parser
+      lift2
+        (fun (req_insert_count, _base) headers -> req_insert_count, headers)
+        (Decoder.section_prefix d)
+        (many1 parser)
     in
     match Angstrom.parse_string ~consume:Prefix p stream with
     | Ok x ->
@@ -258,21 +263,25 @@ let test_encode_static () =
   let t, d = Encoder.create 4096, Decoder.create 4096 in
   let encoder, stream = encode t [ hdr ] in
   Alcotest.(check string) "no encoder instructions" "" encoder;
+  let req_insert_count, decoded_headers = Encoding.decode d stream in
+  Alcotest.(check int) "no insert count necessary" 0 req_insert_count;
   Alcotest.check
     encoding
     "encoded static table index"
     (Encoding.Indexed (Static 17))
-    (Encoding.decode d stream)
+    decoded_headers
 
 let test_encode_static_name_reference () =
   let hdr = header "location" "/bar" in
   let t, d = Encoder.create 4096, Decoder.create 4096 in
   let encoder, stream = encode t [ hdr ] in
+  let req_insert_count, decoded_headers = Encoding.decode d stream in
+  Alcotest.(check int) "expected required insert count" 1 req_insert_count;
   Alcotest.check
     encoding
     "encoded in the dynamic table with post base indexing"
     (Encoding.Indexed (Dynamic (PostBase, 0)))
-    (Encoding.decode d stream);
+    decoded_headers;
   Alcotest.check
     instruction
     "insert with (static) name ref"
@@ -284,22 +293,26 @@ let test_encode_static_nameref_indexed_in_dynamic () =
   let t, d = Encoder.create 4096, Decoder.create 4096 in
   let _ = encode t [ hdr ] in
   let encoder, stream = encode t [ hdr ] in
+  let req_insert_count, decoded_headers = Encoding.decode d stream in
+  Alcotest.(check int) "expected required insert count" 1 req_insert_count;
   Alcotest.check
     encoding
     "encoded in the dynamic table with post base indexing"
     (Encoding.Indexed (Dynamic (Relative, 0)))
-    (Encoding.decode d stream);
+    decoded_headers;
   Alcotest.(check string) "no encoder instructions" "" encoder
 
 let test_encode_dynamic_insert () =
   let hdr = header "foo" "bar" in
   let t, d = Encoder.create 4096, Decoder.create 4096 in
   let encoder, stream = encode t [ hdr ] in
+  let req_insert_count, decoded_headers = Encoding.decode d stream in
+  Alcotest.(check int) "expected required insert count" 1 req_insert_count;
   Alcotest.check
     encoding
     "encoded in the dynamic table with post base indexing"
     (Encoding.Indexed (Dynamic (PostBase, 0)))
-    (Encoding.decode d stream);
+    decoded_headers;
   Alcotest.check
     instruction
     "insert with name ref"
@@ -310,11 +323,13 @@ let test_encode_dynamic_insert_nameref () =
   let t, d = Encoder.create 4096, Decoder.create 4096 in
   let _ = encode t [ header "foo" "bar"; header "baz" "bar" ] in
   let encoder, stream = encode t [ header "foo" "quxx" ] in
+  let req_insert_count, decoded_headers = Encoding.decode d stream in
+  Alcotest.(check int) "expected required insert count" 3 req_insert_count;
   Alcotest.check
     encoding
     "encoded in the dynamic table with post base indexing"
     (Encoding.Indexed (Dynamic (PostBase, 0)))
-    (Encoding.decode d stream);
+    decoded_headers;
   Alcotest.check
     instruction
     "insert with (dynamic) name ref"
@@ -327,33 +342,41 @@ let test_encode_literal () =
   let t, d = Encoder.create 0, Decoder.create 0 in
   let hdr = header "foo" "bar" in
   let encoder, stream = encode t [ hdr ] in
+  let req_insert_count, decoded_headers = Encoding.decode d stream in
+  Alcotest.(check int) "expected required insert count" 0 req_insert_count;
   Alcotest.(check string) "no encoder instructions" "" encoder;
   Alcotest.check
     encoding
     "encoded in the dynamic table with post base indexing"
     (Encoding.LiteralWithoutNameRef (Ok "foo", Ok "bar"))
-    (Encoding.decode d stream)
+    decoded_headers
 
 let test_encode_literal_with_nameref () =
   let t, d = Encoder.create 63, Decoder.create 63 in
   let hdr = header "foo" "bar" in
   let _encoder, stream = encode t [ hdr ] in
+  let req_insert_count, decoded_headers = Encoding.decode d stream in
+  Alcotest.(check int) "expected required insert count" 1 req_insert_count;
   Alcotest.check
     encoding
     "encoded in the dynamic table with post base indexing"
     (Encoding.Indexed (Dynamic (PostBase, 0)))
-    (Encoding.decode d stream);
+    decoded_headers;
   let encoder, stream = encode t [ header "foo" "quxx" ] in
+  let req_insert_count, decoded_headers = Encoding.decode d stream in
+  Alcotest.(check int) "expected required insert count" 1 req_insert_count;
   Alcotest.check
     encoding
     "encoded in the dynamic table with post base indexing"
     (Encoding.LiteralWithNameRef (Dynamic (Relative, 0), Ok "quxx"))
-    (Encoding.decode d stream);
+    decoded_headers;
   Alcotest.(check string) "no encoder instructions" "" encoder
 
 let test_encode_literal_postbase_nameref () =
   let t, d = Encoder.create 63, Decoder.create 63 in
   let encoder, stream = encode t [ header "foo" "bar"; header "foo" "quxx" ] in
+  let req_insert_count, decoded_headers = Encoding.decode_many d stream in
+  Alcotest.(check int) "expected required insert count" 1 req_insert_count;
   Alcotest.check
     instruction
     "insert with name ref"
@@ -364,7 +387,7 @@ let test_encode_literal_postbase_nameref () =
     [ Encoding.Indexed (Dynamic (PostBase, 0))
     ; Encoding.LiteralWithNameRef (Dynamic (PostBase, 0), Ok "quxx")
     ]
-    (Encoding.decode_many d stream)
+    decoded_headers
 
 let test_encode_with_header_block () =
   let t, d = Encoder.create 4096, Decoder.create 4096 in
@@ -384,6 +407,8 @@ let test_encode_with_header_block () =
       ; header "newfoo" "newbar"
       ]
   in
+  let req_insert_count, decoded_headers = Encoding.decode_many d stream in
+  Alcotest.(check int) "expected required insert count" 7 req_insert_count;
   Alcotest.(check int) "dynamic table has 7 entries" 7 t.table.length;
   Alcotest.(check (list instruction))
     "expected encoder instructions"
@@ -401,7 +426,7 @@ let test_encode_with_header_block () =
     ; Indexed (Dynamic (PostBase, 1))
     ; Indexed (Dynamic (PostBase, 2))
     ]
-    (Encoding.decode_many d stream)
+    decoded_headers
 
 let suite =
   [ "static access", `Quick, test_encode_static
