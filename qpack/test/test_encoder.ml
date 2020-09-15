@@ -150,19 +150,24 @@ module Encoding = struct
         (any_uint8 >>= fun b -> Qint.decode b 3)
         (Qstring.decode 8))
 
-  let decode stream =
-    Format.eprintf "%a@." Hex.pp (Hex.of_string stream);
-    match Angstrom.parse_string ~consume:Prefix parser stream with
+  let decode d stream =
+    let open Angstrom in
+    let p =
+      Decoder.section_prefix d >>= fun (_req_insert_count, _base) -> parser
+    in
+    match Angstrom.parse_string ~consume:Prefix p stream with
     | Ok x ->
       x
     | Error e ->
       failwith e
 
-  let decode_many stream =
-    Format.eprintf "%a@." Hex.pp (Hex.of_string stream);
-    match
-      Angstrom.parse_string ~consume:Prefix (Angstrom.many1 parser) stream
-    with
+  let decode_many d stream =
+    let open Angstrom in
+    let p =
+      Decoder.section_prefix d >>= fun (_req_insert_count, _base) ->
+      many1 parser
+    in
+    match Angstrom.parse_string ~consume:Prefix p stream with
     | Ok x ->
       x
     | Error e ->
@@ -241,34 +246,33 @@ let hex_of_int i =
 let header ?(sensitive = false) name value = { Types.name; value; sensitive }
 
 let encode t hs =
-  let prefixBuffer = Faraday.create 0x1000 in
   let encoder_buffer = Faraday.create 0x1000 in
   let faraday = Faraday.create 0x1000 in
-  Encoder.encode_headers t ~prefixBuffer ~encoder_buffer faraday hs;
+  Encoder.encode_headers t ~encoder_buffer faraday hs;
   let s = Faraday.serialize_to_string faraday in
   let e = Faraday.serialize_to_string encoder_buffer in
   e, s
 
 let test_encode_static () =
   let hdr = header ":method" "GET" in
-  let t = Encoder.create 4096 in
+  let t, d = Encoder.create 4096, Decoder.create 4096 in
   let encoder, stream = encode t [ hdr ] in
   Alcotest.(check string) "no encoder instructions" "" encoder;
   Alcotest.check
     encoding
     "encoded static table index"
     (Encoding.Indexed (Static 17))
-    (Encoding.decode stream)
+    (Encoding.decode d stream)
 
 let test_encode_static_name_reference () =
   let hdr = header "location" "/bar" in
-  let t = Encoder.create 4096 in
+  let t, d = Encoder.create 4096, Decoder.create 4096 in
   let encoder, stream = encode t [ hdr ] in
   Alcotest.check
     encoding
     "encoded in the dynamic table with post base indexing"
     (Encoding.Indexed (Dynamic (PostBase, 0)))
-    (Encoding.decode stream);
+    (Encoding.decode d stream);
   Alcotest.check
     instruction
     "insert with (static) name ref"
@@ -277,25 +281,25 @@ let test_encode_static_name_reference () =
 
 let test_encode_static_nameref_indexed_in_dynamic () =
   let hdr = header "location" "/bar" in
-  let t = Encoder.create 4096 in
+  let t, d = Encoder.create 4096, Decoder.create 4096 in
   let _ = encode t [ hdr ] in
   let encoder, stream = encode t [ hdr ] in
   Alcotest.check
     encoding
     "encoded in the dynamic table with post base indexing"
     (Encoding.Indexed (Dynamic (Relative, 0)))
-    (Encoding.decode stream);
+    (Encoding.decode d stream);
   Alcotest.(check string) "no encoder instructions" "" encoder
 
 let test_encode_dynamic_insert () =
   let hdr = header "foo" "bar" in
-  let t = Encoder.create 4096 in
+  let t, d = Encoder.create 4096, Decoder.create 4096 in
   let encoder, stream = encode t [ hdr ] in
   Alcotest.check
     encoding
     "encoded in the dynamic table with post base indexing"
     (Encoding.Indexed (Dynamic (PostBase, 0)))
-    (Encoding.decode stream);
+    (Encoding.decode d stream);
   Alcotest.check
     instruction
     "insert with name ref"
@@ -303,14 +307,14 @@ let test_encode_dynamic_insert () =
     (Instruction.decode encoder)
 
 let test_encode_dynamic_insert_nameref () =
-  let t = Encoder.create 4096 in
+  let t, d = Encoder.create 4096, Decoder.create 4096 in
   let _ = encode t [ header "foo" "bar"; header "baz" "bar" ] in
   let encoder, stream = encode t [ header "foo" "quxx" ] in
   Alcotest.check
     encoding
     "encoded in the dynamic table with post base indexing"
     (Encoding.Indexed (Dynamic (PostBase, 0)))
-    (Encoding.decode stream);
+    (Encoding.decode d stream);
   Alcotest.check
     instruction
     "insert with (dynamic) name ref"
@@ -320,7 +324,7 @@ let test_encode_dynamic_insert_nameref () =
 (* TODO: add a test that sets the capacity to 0 and check that the encoder
  * stream emits a table size update. *)
 let test_encode_literal () =
-  let t = Encoder.create 0 in
+  let t, d = Encoder.create 0, Decoder.create 0 in
   let hdr = header "foo" "bar" in
   let encoder, stream = encode t [ hdr ] in
   Alcotest.(check string) "no encoder instructions" "" encoder;
@@ -328,27 +332,27 @@ let test_encode_literal () =
     encoding
     "encoded in the dynamic table with post base indexing"
     (Encoding.LiteralWithoutNameRef (Ok "foo", Ok "bar"))
-    (Encoding.decode stream)
+    (Encoding.decode d stream)
 
 let test_encode_literal_with_nameref () =
-  let t = Encoder.create 63 in
+  let t, d = Encoder.create 63, Decoder.create 63 in
   let hdr = header "foo" "bar" in
   let _encoder, stream = encode t [ hdr ] in
   Alcotest.check
     encoding
     "encoded in the dynamic table with post base indexing"
     (Encoding.Indexed (Dynamic (PostBase, 0)))
-    (Encoding.decode stream);
+    (Encoding.decode d stream);
   let encoder, stream = encode t [ header "foo" "quxx" ] in
   Alcotest.check
     encoding
     "encoded in the dynamic table with post base indexing"
     (Encoding.LiteralWithNameRef (Dynamic (Relative, 0), Ok "quxx"))
-    (Encoding.decode stream);
+    (Encoding.decode d stream);
   Alcotest.(check string) "no encoder instructions" "" encoder
 
 let test_encode_literal_postbase_nameref () =
-  let t = Encoder.create 63 in
+  let t, d = Encoder.create 63, Decoder.create 63 in
   let encoder, stream = encode t [ header "foo" "bar"; header "foo" "quxx" ] in
   Alcotest.check
     instruction
@@ -360,10 +364,10 @@ let test_encode_literal_postbase_nameref () =
     [ Encoding.Indexed (Dynamic (PostBase, 0))
     ; Encoding.LiteralWithNameRef (Dynamic (PostBase, 0), Ok "quxx")
     ]
-    (Encoding.decode_many stream)
+    (Encoding.decode_many d stream)
 
 let test_encode_with_header_block () =
-  let t = Encoder.create 4096 in
+  let t, d = Encoder.create 4096, Decoder.create 4096 in
   for idx = 1 to 4 do
     ignore
     @@ encode
@@ -380,10 +384,7 @@ let test_encode_with_header_block () =
       ; header "newfoo" "newbar"
       ]
   in
-  Alcotest.(check int)
-    "dynamic table has 7 entries"
-    7
-    t.Encoder.table.Dynamic_table.length;
+  Alcotest.(check int) "dynamic table has 7 entries" 7 t.table.length;
   Alcotest.(check (list instruction))
     "expected encoder instructions"
     [ Instruction.InsertWithNameRef (Dynamic (Relative, 1), Ok "new bar3")
@@ -400,7 +401,7 @@ let test_encode_with_header_block () =
     ; Indexed (Dynamic (PostBase, 1))
     ; Indexed (Dynamic (PostBase, 2))
     ]
-    (Encoding.decode_many stream)
+    (Encoding.decode_many d stream)
 
 let suite =
   [ "static access", `Quick, test_encode_static

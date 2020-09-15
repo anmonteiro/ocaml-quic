@@ -382,151 +382,106 @@ let encode_section_prefix t f ~required_insert_count ~base =
     if base >= required_insert_count then
       Qint.encode f 0 7 (base - required_insert_count)
     else
-      Qint.encode f 0x80 7 (required_insert_count - base - 1)
+      Qint.encode f 0b1000_0000 7 (required_insert_count - base - 1)
 
-let encode_headers t ~prefixBuffer ~encoder_buffer f headers =
+let req_insert_count_from_index ~required_insert_count absolute_index =
+  (* From RFC<QPACK-RFC>§2.1.2:
+   *   For a field section encoded using references to the dynamic table, the
+   *   Required Insert Count is one larger than the largest absolute index of
+   *   all referenced dynamic table entries. *)
+  max required_insert_count (absolute_index + 1)
+
+let encode_headers t ~encoder_buffer f headers =
+  let blockf = Faraday.create 0x200 in
   let base = t.next_seq in
-  let required_insert_count = ref 0 in
-  List.iter
-    (fun { name; value; sensitive = _ } ->
-      let name_idx, header_idx = Static_table.lookup name value in
-      if header_idx <> Static_table.not_found then
-        (* static name + value -> static index reference *)
-        encode_index_reference f ~table:Static ~base header_idx
-      else
-        let dynamic_name_index, dynamic_index =
-          match HeaderFieldsTbl.find t.lookup_table name with
-          | map ->
-            (match ValueMap.find value map with
-            | idx ->
-              (* Header value is indexed in the dynamic table. *)
-              idx, idx
+  let required_insert_count =
+    List.fold_left
+      (fun required_insert_count { name; value; sensitive = _ } ->
+        let name_idx, header_idx = Static_table.lookup name value in
+        if header_idx <> Static_table.not_found then (
+          (* static name + value -> static index reference *)
+          encode_index_reference blockf ~table:Static ~base header_idx;
+          required_insert_count)
+        else
+          let dynamic_name_index, dynamic_index =
+            match HeaderFieldsTbl.find t.lookup_table name with
+            | map ->
+              (match ValueMap.find value map with
+              | idx ->
+                (* Header value is indexed in the dynamic table. *)
+                idx, idx
+              | exception Not_found ->
+                let _, any_entry = ValueMap.choose map in
+                any_entry, not_found)
             | exception Not_found ->
-              let _, any_entry = ValueMap.choose map in
-              any_entry, not_found)
-          | exception Not_found ->
-            not_found, not_found
-        in
-        let dynamic_index =
-          if dynamic_index = not_found then
-            (* Not found in the dynamic table, try to index. *)
-            if true (* should_index x *) then (
-              (* save base before adding to the dynamic table. *)
-              let base_for_encoder = t.next_seq in
-              let maybe_added = add (* to the dyn table *) t (name, value) in
-              (* From RFC<QPACK-RFC>§3.2.5:
-               *   In encoder instructions (Section 4.3), a relative index of
-               *   "0" refers to the most recently inserted value in the
-               *   dynamic table. Note that this means the entry referenced by
-               *   a given relative index will change while interpreting
-               *   instructions on the encoder stream. *)
-              if maybe_added <> not_found then
-                Instruction.encode_insert
-                  encoder_buffer
-                  ~static_name_idx:name_idx
-                  ~dynamic_name_idx:dynamic_name_index
-                  ~base:base_for_encoder
-                  name
-                  value;
-              (* with or without name reference based on dynamic_name_index and
-                 static_name_index *)
-              maybe_added)
+              not_found, not_found
+          in
+          let dynamic_index =
+            if dynamic_index = not_found then
+              (* Not found in the dynamic table, try to index. *)
+              if true (* should_index x *) then (
+                (* save base before adding to the dynamic table. *)
+                let base_for_encoder = t.next_seq in
+                let maybe_added = add (* to the dyn table *) t (name, value) in
+                (* From RFC<QPACK-RFC>§3.2.5:
+                 *   In encoder instructions (Section 4.3), a relative index of
+                 *   "0" refers to the most recently inserted value in the
+                 *   dynamic table. Note that this means the entry referenced by
+                 *   a given relative index will change while interpreting
+                 *   instructions on the encoder stream. *)
+                if maybe_added <> not_found then
+                  Instruction.encode_insert
+                    encoder_buffer
+                    ~static_name_idx:name_idx
+                    ~dynamic_name_idx:dynamic_name_index
+                    ~base:base_for_encoder
+                    name
+                    value;
+                (* with or without name reference based on dynamic_name_index
+                   and static_name_index *)
+                maybe_added)
+              else
+                dynamic_index
             else
               dynamic_index
-          else
-            dynamic_index
-        in
-        (* Could not index, literal *)
-        if dynamic_index = not_found then
-          if dynamic_name_index <> not_found then (
-            encode_literal
-              f
-              ~static_name_idx:name_idx
-              ~dynamic_name_idx:dynamic_name_index
-              ~base
-              name
-              value;
-            required_insert_count :=
-              (* TODO: probably using some diff indexing? *)
-              max !required_insert_count dynamic_name_index)
+          in
+          (* Could not index, literal *)
+          if dynamic_index = not_found then
+            if dynamic_name_index <> not_found then (
+              encode_literal
+                blockf
+                ~static_name_idx:name_idx
+                ~dynamic_name_idx:dynamic_name_index
+                ~base
+                name
+                value;
+              req_insert_count_from_index
+                ~required_insert_count
+                dynamic_name_index)
+            else (
+              assert (dynamic_name_index = not_found);
+              encode_literal
+                blockf
+                ~static_name_idx:name_idx
+                ~dynamic_name_idx:dynamic_name_index
+                ~base
+                name
+                value;
+              required_insert_count)
           else (
-            assert (dynamic_name_index = not_found);
-            encode_literal
-              f
-              ~static_name_idx:name_idx
-              ~dynamic_name_idx:dynamic_name_index
-              ~base
-              name
-              value)
-        else (
-          (* Dynamic Index reference *)
-          assert (dynamic_index <> not_found);
-          required_insert_count := max !required_insert_count dynamic_index;
-          encode_index_reference f ~table:Dynamic ~base dynamic_index))
-    headers;
-  encode_section_prefix
-    t
-    prefixBuffer
-    ~required_insert_count:!required_insert_count
-    ~base
-
-(*
- *  base = dynamicTable.getInsertCount()
- *  requiredInsertCount = 0
- *  for line in field_lines:
- *    staticIndex = staticTable.findIndex(line)
- *    if staticIndex is not None:
- *      encodeIndexReference(streamBuffer, staticIndex)
- *      continue
- *
- *    dynamicIndex = dynamicTable.findIndex(line)
- *    if dynamicIndex is None:
- *      # No matching entry.  Either insert+index or encode literal
- *      staticNameIndex = staticTable.findName(line.name)
- *      if staticNameIndex is None:
- *         dynamicNameIndex = dynamicTable.findName(line.name)
- *
- *      if shouldIndex(line) and dynamicTable.canIndex(line):
- *        encodeInsert(encoderBuffer, staticNameIndex,
- *                     dynamicNameIndex, line)
- *        dynamicIndex = dynamicTable.add(line)
- *
- *    if dynamicIndex is None:
- *      # Could not index it, literal
- *      if dynamicNameIndex is not None:
- *        # Encode literal with dynamic name, possibly above base
- *        encodeDynamicLiteral(streamBuffer, dynamicNameIndex,
- *                             base, line)
- *        requiredInsertCount = max(requiredInsertCount,
- *                                  dynamicNameIndex)
- *      else:
- *        # Encodes a literal with a static name or literal name
- *        encodeLiteral(streamBuffer, staticNameIndex, line)
- *    else:
- *      # Dynamic index reference
- *      assert(dynamicIndex is not None)
- *      requiredInsertCount = max(requiredInsertCount, dynamicIndex)
- *      # Encode dynamicIndex, possibly above base
- *      encodeDynamicIndexReference(streamBuffer, dynamicIndex, base)
- *
- *  # encode the prefix
- *  if requiredInsertCount == 0:
- *    encodeIndexReference(prefixBuffer, 0, 0, 8)
- *    encodeIndexReference(prefixBuffer, 0, 0, 7)
- *  else:
- *    wireRIC = (
- *      requiredInsertCount
- *      % (2 * getMaxEntries(maxTableCapacity))
- *    ) + 1;
- *    encodeInteger(prefixBuffer, 0x00, wireRIC, 8)
- *    if base >= requiredInsertCount:
- *      encodeInteger(prefixBuffer, 0, base - requiredInsertCount, 7)
- *    else:
- *      encodeInteger(prefixBuffer, 0x80,
- *                    requiredInsertCount  - base - 1, 7)
- *
- *  return encoderBuffer, prefixBuffer + streamBuffer
- *)
+            (* Dynamic Index reference *)
+            assert (dynamic_index <> not_found);
+            encode_index_reference blockf ~table:Dynamic ~base dynamic_index;
+            req_insert_count_from_index ~required_insert_count dynamic_index))
+      (* From RFC<QPACK-RFC>§4.3.1:
+       * For a field section encoded with no references to the dynamic table,
+       * the Required Insert Count is zero. *)
+      0
+      headers
+  in
+  let bs = Faraday.serialize_to_bigstring blockf in
+  encode_section_prefix t f ~required_insert_count ~base;
+  Faraday.schedule_bigstring f bs
 
 let encode_header encoder t _headers =
   match encoder.dyn_table_capacity_change with

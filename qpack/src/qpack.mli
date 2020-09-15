@@ -58,7 +58,6 @@ module Encoder : sig
 
   val encode_headers
     :  t
-    -> prefixBuffer:Faraday.t
     -> encoder_buffer:Faraday.t
     -> Faraday.t
     -> header list
