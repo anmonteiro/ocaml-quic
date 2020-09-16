@@ -32,12 +32,6 @@
 
 open Types
 
-module IntSet = Set.Make (struct
-  type t = int
-
-  let compare = compare
-end)
-
 module HeaderFieldsTbl = struct
   include Hashtbl.Make (struct
     type t = string
@@ -64,43 +58,14 @@ type t =
     mutable dyn_table_capacity_change : int
   ; lookup_table : int ValueMap.t HeaderFieldsTbl.t
   ; mutable next_seq : int
+  ; (* From RFC<QPACK-RFC>§2.1.1:
+     *   [...] an encoder that uses the dynamic table has to keep track of each
+     *   dynamic table entry referenced by each field section until those
+     *   representations are acknowledged by the decoder; see Section 4.4.1. *)
+    stream_references : (int64, IntSet.t list) Hashtbl.t
   }
 
 let not_found = Static_table.not_found
-
-module BinaryFormat = struct
-  (* From RFC7541§6.2.3. Literal Header Field Never Indexed
-   *   A literal header field never-indexed representation starts with the
-   *   '0001' 4-bit pattern. *)
-  let never_indexed = 0b0001_0000, 4
-
-  (* From RFC<QPACK-RFC>§4.5.3:
-   *   This representation starts with the '0001' 4-bit pattern. This is
-   *   followed by the post-base index (Section 3.2.6) of the matching field
-   *   line, represented as an integer with a 4-bit prefix [...]. *)
-  let indexed_with_post_base_index = 0b0001_0000, 4
-
-  (* From RFC<QPACK-RFC>§4.5.4:
-   *   This representation starts with the '01' two-bit pattern. [...] The
-   *   4-bit prefix integer (Section 4.1.1) that follows is used to locate the
-   *   table entry for the field name. *)
-  let literal_with_name_reference = 0b0100_0000, 4
-
-  (* From RFC<QPACK-RFC>§4.5.5:
-   *   This representation starts with the '0000' four-bit pattern. The fifth
-   *   bit is the 'N' bit as described in Section 4.5.4. This is followed by a
-   *   post-base index of the dynamic table entry (Section 3.2.6) encoded as an
-   *   integer with a 3-bit prefix [...]. *)
-  let literal_with_post_base_name_reference = 0b0000_0000, 3
-
-  (* From RFC<QPACK-RFC>§4.5.6:
-   *   This representation begins with the '001' three-bit pattern. The fourth
-   *   bit is the 'N' bit as described in Section 4.5.4. The name follows,
-   *   represented as a 4-bit prefix string literal [...]. *)
-  let literal_without_name_reference = 0b0010_0000, 4
-
-  let[@inline] is_indexed = function 128 -> true | _ -> false
-end
 
 type table =
   | Static
@@ -120,9 +85,18 @@ let create capacity =
   ; lookup_table
   ; next_seq = 0
   ; dyn_table_capacity_change = -1
+  ; stream_references = Hashtbl.create ~random:true 100
   }
 
-let add ({ table; lookup_table; next_seq; _ } as encoder) name value =
+let track_table_reference t idx set =
+  IntSet.add (Dynamic_table.offset_from_index t.table idx) set
+
+let add
+    ({ table; lookup_table; next_seq; _ } as t)
+    ~cur_referenced_fields
+    name
+    value
+  =
   if Dynamic_table.add table name value then (
     let map =
       match HeaderFieldsTbl.find_opt lookup_table name with
@@ -131,11 +105,20 @@ let add ({ table; lookup_table; next_seq; _ } as encoder) name value =
       | None ->
         ValueMap.singleton value next_seq
     in
-    encoder.next_seq <- next_seq + 1;
+    t.next_seq <- next_seq + 1;
     HeaderFieldsTbl.replace lookup_table name map;
+    assert (Dynamic_table.offset_from_index t.table next_seq = t.table.offset);
+    cur_referenced_fields :=
+      track_table_reference t next_seq !cur_referenced_fields;
     next_seq)
   else
     not_found
+
+let all_referenced_indices ~cur_referenced_fields t =
+  Hashtbl.fold
+    (fun _ sets acc -> List.fold_left IntSet.union acc sets)
+    t.stream_references
+    cur_referenced_fields
 
 let tokens_without_indexing =
   (* From RFC7541§6.2.2: Never-Indexed Literals
@@ -261,7 +244,13 @@ module Instruction = struct
     | Stream_cancelation of int64
     | Insert_count_increment of int
 
-  let parser =
+  let rec remove_last = function
+    | [] | [ _ ] ->
+      []
+    | x :: xs ->
+      x :: remove_last xs
+
+  let parser t =
     let open Angstrom in
     any_uint8 >>= fun b ->
     if b land 0b1000_0000 = 0b1000_0000 then
@@ -270,7 +259,18 @@ module Instruction = struct
        *   field section's associated stream ID encoded as a 7-bit prefix
        *   integer; see Section 4.1.1. *)
       lift
-        (fun stream_id -> Section_ack (Int64.of_int stream_id))
+        (fun stream_id ->
+          let stream_id = Int64.of_int stream_id in
+          (match Hashtbl.find_opt t.stream_references stream_id with
+          | Some sets ->
+            (match remove_last sets with
+            | [] ->
+              Hashtbl.remove t.stream_references stream_id
+            | sets' ->
+              Hashtbl.replace t.stream_references stream_id sets')
+          | None ->
+            assert false);
+          Section_ack stream_id)
         (Qint.decode b 7)
     else if b land 0b0100_0000 = 0b0100_0000 then
       (* From RFC<QPACK-RFC>§4.4.2:
@@ -390,7 +390,8 @@ let req_insert_count_from_index ~required_insert_count absolute_index =
    *   all referenced dynamic table entries. *)
   max required_insert_count (absolute_index + 1)
 
-let encode_headers t ~encoder_buffer f headers =
+let encode_headers t ~stream_id ~encoder_buffer f headers =
+  let cur_referenced_fields = ref IntSet.empty in
   let blockf = Faraday.create 0x200 in
   let base = t.next_seq in
   let required_insert_count =
@@ -419,12 +420,21 @@ let encode_headers t ~encoder_buffer f headers =
             if dynamic_index = not_found then
               (* Not found in the dynamic table, try to index. *)
               if
-                (* TODO: should_index x *)
-                true && Dynamic_table.can_index t.table ~name ~value
+                (* TODO: should_index with never_indexed fields *)
+                true
+                && Dynamic_table.can_index
+                     t.table
+                     ~referenced_indices:
+                       (all_referenced_indices
+                          ~cur_referenced_fields:!cur_referenced_fields
+                          t)
+                     ~name
+                     ~value
               then (
                 (* save base before adding to the dynamic table. *)
                 let base_for_encoder = t.next_seq in
-                let maybe_added = add (* to the dyn table *) t name value in
+                (* add to the dynamic table *)
+                let maybe_added = add t ~cur_referenced_fields name value in
                 (* From RFC<QPACK-RFC>§3.2.5:
                  *   In encoder instructions (Section 4.3), a relative index of
                  *   "0" refers to the most recently inserted value in the
@@ -457,6 +467,11 @@ let encode_headers t ~encoder_buffer f headers =
                 ~base
                 name
                 value;
+              cur_referenced_fields :=
+                track_table_reference
+                  t
+                  dynamic_name_index
+                  !cur_referenced_fields;
               req_insert_count_from_index
                 ~required_insert_count
                 dynamic_name_index)
@@ -474,6 +489,8 @@ let encode_headers t ~encoder_buffer f headers =
             (* Dynamic Index reference *)
             assert (dynamic_index <> not_found);
             encode_index_reference blockf ~table:Dynamic ~base dynamic_index;
+            cur_referenced_fields :=
+              track_table_reference t dynamic_name_index !cur_referenced_fields;
             req_insert_count_from_index ~required_insert_count dynamic_index))
       (* From RFC<QPACK-RFC>§4.3.1:
        * For a field section encoded with no references to the dynamic table,
@@ -481,6 +498,14 @@ let encode_headers t ~encoder_buffer f headers =
       0
       headers
   in
+  (match Hashtbl.find_opt t.stream_references stream_id with
+  | Some sets ->
+    Hashtbl.replace
+      t.stream_references
+      stream_id
+      (!cur_referenced_fields :: sets)
+  | None ->
+    Hashtbl.add t.stream_references stream_id [ !cur_referenced_fields ]);
   let bs = Faraday.serialize_to_bigstring blockf in
   encode_section_prefix t f ~required_insert_count ~base;
   Faraday.schedule_bigstring f bs

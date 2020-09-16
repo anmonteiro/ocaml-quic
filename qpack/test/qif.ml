@@ -67,3 +67,8 @@ let parser =
   BE.any_int64 >>= fun stream_id ->
   BE.any_int32 >>= fun length ->
   lift (fun encoded -> { stream_id; encoded }) (take (Int32.to_int length))
+
+let serialize f { stream_id; encoded } =
+  Faraday.BE.write_uint64 f stream_id;
+  Faraday.BE.write_uint32 f (Int32.of_int (String.length encoded));
+  Faraday.write_string f encoded

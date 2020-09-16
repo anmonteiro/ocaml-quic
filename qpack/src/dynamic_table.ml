@@ -30,6 +30,8 @@
  *  POSSIBILITY OF SUCH DAMAGE.
  *---------------------------------------------------------------------------*)
 
+open Types
+
 type t =
   { mutable entries : (string * string * int) array
   ; mutable length : int
@@ -79,7 +81,9 @@ let max_entries t =
 
 let ( mod ) x y = ((x mod y) + y) mod y
 
-let[@inline] _get t i = t.entries.((t.capacity - 1 - i) mod t.capacity)
+let[@inline] offset_from_index t i = (t.capacity - 1 - i) mod t.capacity
+
+let[@inline] _get t i = t.entries.((offset_from_index [@inlined]) t i)
 
 let[@inline] get table i =
   let name, value, _ = _get table i in
@@ -122,10 +126,7 @@ let increase_capacity table =
 
 exception Local
 
-let can_index t ~name ~value =
-  (* From RFC<QPACK-RFC>§2.1.1:
-   *   A dynamic table entry cannot be evicted immediately after insertion,
-   *   even if it has never been referenced. *)
+let can_index t ~referenced_indices ~name ~value =
   let entry_size = entry_size name value in
   let cur_size = ref t.size in
   let cur_length = ref t.length in
@@ -133,7 +134,17 @@ let can_index t ~name ~value =
   try
     while !cur_size > 0 && !cur_size + entry_size > t.max_size do
       let eviction_offset = (t.offset + !cur_length - 1) mod t.capacity in
-      if prev_offset = eviction_offset then
+      if
+        prev_offset = eviction_offset
+        || IntSet.mem eviction_offset referenced_indices
+      then
+        (* From RFC<QPACK-RFC>§2.1.1:
+         *   A dynamic table entry cannot be evicted immediately after
+         *   insertion, even if it has never been referenced. [...] If the
+         *   dynamic table does not contain enough room for a new entry without
+         *   evicting other entries, and the entries that would be evicted are
+         *   not evictable, the encoder MUST NOT insert that entry into the
+         *   dynamic table (including duplicates of existing entries). *)
         raise Local
       else (
         decr cur_length;

@@ -1,4 +1,6 @@
 open Qpack__
+open Test_helpers
+
 
 type index =
   | PostBase
@@ -238,22 +240,14 @@ module Encoding = struct
   let testable : block Alcotest.testable = (module Testable)
 end
 
-let hex = Alcotest.of_pp Hex.pp
-
 let encoding = Encoding.testable
 
 let instruction = Instruction.testable
 
-let hex_of_int i =
-  let c1, c2 = Hex.of_char (Char.chr i) in
-  `Hex (Format.asprintf "%c%c" c1 c2)
-
-let header ?(sensitive = false) name value = { Types.name; value; sensitive }
-
 let encode t hs =
   let encoder_buffer = Faraday.create 0x1000 in
   let faraday = Faraday.create 0x1000 in
-  Encoder.encode_headers t ~encoder_buffer faraday hs;
+  Encoder.encode_headers t ~stream_id:1L ~encoder_buffer faraday hs;
   let s = Faraday.serialize_to_string faraday in
   let e = Faraday.serialize_to_string encoder_buffer in
   e, s

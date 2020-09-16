@@ -351,6 +351,7 @@ module Buffered = struct
     | Error e ->
       failwith e
 
+  (* TODO: emit section acknowledgement as per 2.2.2.1 *)
   let parse_header_block t ~stream_id bs f =
     match
       Angstrom.parse_bigstring ~consume:Prefix (section_prefix t.decoder) bs

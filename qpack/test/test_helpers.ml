@@ -23,3 +23,5 @@ let headers_list_pp =
     Headers.pp
 
 let qstring = Alcotest.testable (Fmt.quote Fmt.string) ( = )
+
+let header ?(sensitive = false) name value = { Types.name; value; sensitive }

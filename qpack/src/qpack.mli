@@ -58,6 +58,7 @@ module Encoder : sig
 
   val encode_headers
     :  t
+    -> stream_id:int64
     -> encoder_buffer:Faraday.t
     -> Faraday.t
     -> header list

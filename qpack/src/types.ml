@@ -30,6 +30,8 @@
  *  POSSIBILITY OF SUCH DAMAGE.
  *---------------------------------------------------------------------------*)
 
+module IntSet = Set.Make (Int)
+
 type header =
   { name : string
   ; value : string
