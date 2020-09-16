@@ -122,28 +122,39 @@ let increase_capacity table =
 
 exception Local
 
+let can_index t ~name ~value =
+  (* From RFC<QPACK-RFC>§2.1.1:
+   *   A dynamic table entry cannot be evicted immediately after insertion,
+   *   even if it has never been referenced. *)
+  let entry_size = entry_size name value in
+  let cur_size = ref t.size in
+  let cur_length = ref t.length in
+  let prev_offset = t.offset in
+  try
+    while !cur_size > 0 && !cur_size + entry_size > t.max_size do
+      let eviction_offset = (t.offset + !cur_length - 1) mod t.capacity in
+      if prev_offset = eviction_offset then
+        raise Local
+      else (
+        decr cur_length;
+        let _name, _value, entry_size = t.entries.(eviction_offset) in
+        cur_size := !cur_size - entry_size)
+    done;
+    true
+  with
+  | Local ->
+    false
+
 let evict_if_needed t ~entry_size =
   (* From RFC<QPACK-RFC>§3.2.2:
    *   Before a new entry is added to the dynamic table, entries are evicted
    *   from the end of the dynamic table until the size of the dynamic table is
    *   less than or equal to (table capacity - size of new entry). *)
-  try
-    while t.size > 0 && t.size + entry_size > t.max_size do
-      let prev_offset = t.offset in
-      let eviction_offset = eviction_offset t in
-      if prev_offset = eviction_offset then
-        (* From RFC<QPACK-RFC>§2.1.1:
-         *   A dynamic table entry cannot be evicted immediately after
-         *   insertion, even if it has never been referenced. *)
-        raise Local
-      else
-        evict_one t
-    done
-  with
-  | Local ->
-    ()
+  while t.size > 0 && t.size + entry_size > t.max_size do
+    evict_one t
+  done
 
-let add ({ max_size; _ } as table) (name, value) =
+let add ({ max_size; _ } as table) name value =
   let entry_size = (entry_size [@inlined]) name value in
   evict_if_needed table ~entry_size;
   (* From RFC7541§4.4:

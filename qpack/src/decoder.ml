@@ -36,11 +36,14 @@ open Angstrom
 type t =
   { table : Dynamic_table.t
   ; max_capacity : int
-  ; mutable next_seq : int
+  ; mutable insertion_count : int
   }
 
 let create max_capacity =
-  { table = Dynamic_table.create max_capacity; max_capacity; next_seq = 0 }
+  { table = Dynamic_table.create max_capacity
+  ; max_capacity
+  ; insertion_count = 0
+  }
 
 let set_capacity { table; max_capacity; _ } capacity =
   if capacity > max_capacity then
@@ -58,8 +61,8 @@ let[@inline] ok x = return (Ok x)
 let[@inline] error x = return (Error x)
 
 let add t name value =
-  let ret = Dynamic_table.add t.table (name, value) in
-  if ret then t.next_seq <- t.next_seq + 1;
+  let ret = Dynamic_table.add t.table name value in
+  if ret then t.insertion_count <- t.insertion_count + 1;
   ret
 
 let[@inline] absolute_of_relative ~base relative = base - 1 - relative
@@ -117,7 +120,7 @@ module Instruction = struct
           let name, _ =
             Dynamic_table.get
               t.table
-              (absolute_of_relative ~base:t.next_seq idx)
+              (absolute_of_relative ~base:t.insertion_count idx)
           in
           if add t name (Result.get_ok value) then 1 else 0)
         (any_uint8 >>= fun b -> Qint.decode b 6)
@@ -145,7 +148,7 @@ module Instruction = struct
           let name, value =
             Dynamic_table.get
               t.table
-              (absolute_of_relative ~base:t.next_seq idx)
+              (absolute_of_relative ~base:t.insertion_count idx)
           in
           if add t name value then 1 else 0)
         (any_uint8 >>= fun b -> Qint.decode b 5))
@@ -171,7 +174,6 @@ module Instruction = struct
 end
 
 let reconstruct_required_insert_count t ~encoded_insert_count =
-  let total_inserts = t.next_seq in
   let max_entries = t.table.max_size / 32 in
   let full_range = 2 * max_entries in
   if encoded_insert_count = 0 then
@@ -179,7 +181,7 @@ let reconstruct_required_insert_count t ~encoded_insert_count =
   else if encoded_insert_count > full_range then
     failwith "error"
   else
-    let max_value = total_inserts + max_entries in
+    let max_value = t.insertion_count + max_entries in
     let max_wrapped = max_value / full_range * full_range in
     let req_insert_count = max_wrapped + encoded_insert_count - 1 in
     (* If ReqInsertCount exceeds MaxValue, the Encoder's value must have wrapped
@@ -217,7 +219,7 @@ let parser { table; _ } ~base =
   peek_char_fail >>= fun c ->
   let b = Char.code c in
   if b land 0b1100_0000 = 0b1100_0000 then
-    (* From RFC<QPACK-RFC>§4.5.1:
+    (* From RFC<QPACK-RFC>§4.5.2:
      *   This representation starts with the '1' 1-bit pattern, followed by the
      *   'T' bit indicating whether the reference is into the static or dynamic
      *   table. *)
@@ -253,7 +255,7 @@ let parser { table; _ } ~base =
       (any_uint8 >>= fun b -> Qint.decode b 4)
       (Qstring.decode 8)
   else if b land 0b0010_0000 = 0b0010_0000 then
-    (* From RFC<QPACK-RFC>§4.3.1:
+    (* From RFC<QPACK-RFC>§4.5.6:
      *   This representation begins with the '001' three-bit pattern. *)
     lift2
       (fun name value -> Result.get_ok name, Result.get_ok value)
@@ -268,6 +270,8 @@ let parser { table; _ } ~base =
         Dynamic_table.get table index)
       (any_uint8 >>= fun b -> Qint.decode b 4)
   else (
+    (* From RFC<QPACK-RFC>§4.5.5:
+     *   This representation starts with the '0000' four-bit pattern. *)
     assert (b land 0b1111_0000 = 0b0000_0000);
     lift2
       (fun idx value ->
@@ -282,3 +286,97 @@ let parser t =
   Angstrom.many1 (parser t ~base)
 
 let decode_block = parser
+
+module Buffered = struct
+  module StreamIdSet = Set.Make (Int64)
+
+  type blocked =
+    { required_insertion_count : int
+    ; blocks : Bigstringaf.t list
+    ; callback : Bigstringaf.t -> unit
+    }
+
+  module Q : Psq.S with type k = int64 and type p = blocked =
+    Psq.Make
+      (Int64)
+      (struct
+        type t = blocked
+
+        let compare
+            { required_insertion_count = ric1; _ }
+            { required_insertion_count = ric2; _ }
+          =
+          compare ric1 ric2
+      end)
+
+  module AB = Angstrom.Buffered
+
+  type nonrec t =
+    { decoder : t
+    ; mutable blocked_blocks : Q.t
+    ; mutable blocked_streams : StreamIdSet.t
+    ; max_blocked_streams : int
+    }
+
+  let create ~max_size ~max_blocked_streams =
+    { decoder = create max_size
+    ; blocked_blocks = Q.empty
+    ; blocked_streams = StreamIdSet.empty
+    ; max_blocked_streams
+    }
+
+  let rec process_blocked_streams t =
+    match Q.pop t.blocked_blocks with
+    | Some
+        ( (stream_id, { required_insertion_count = ric; blocks = bs; callback })
+        , q' ) ->
+      assert (List.length bs = 1);
+      assert (stream_id > 0L);
+      if ric <= t.decoder.insertion_count then (
+        t.blocked_blocks <- q';
+        if not (Q.mem stream_id q') then
+          t.blocked_streams <- StreamIdSet.remove stream_id t.blocked_streams;
+        let chunks = List.rev bs in
+        List.iter callback chunks;
+        process_blocked_streams t)
+    | None ->
+      ()
+
+  let parse_instructions t bs =
+    match
+      Angstrom.parse_bigstring ~consume:All (Instruction.parser t.decoder) bs
+    with
+    | Ok _section_acks ->
+      process_blocked_streams t
+    | Error e ->
+      failwith e
+
+  let parse_header_block t ~stream_id bs f =
+    match
+      Angstrom.parse_bigstring ~consume:Prefix (section_prefix t.decoder) bs
+    with
+    | Ok (required_insertion_count, _base) ->
+      if required_insertion_count > t.decoder.insertion_count then (
+        (* From RFC<QPACK-RFC>§4.5.1:
+         *   When the decoder receives an encoded field section with a Required
+         *   Insert Count greater than its own Insert Count, the stream cannot
+         *   be processed immediately, and is considered "blocked"; see Section
+         *   2.2.1. *)
+        t.blocked_streams <- StreamIdSet.add stream_id t.blocked_streams;
+        let q' =
+          Q.update
+            stream_id
+            (function
+              | None ->
+                Some { required_insertion_count; blocks = [ bs ]; callback = f }
+              | Some ({ required_insertion_count = ric; blocks; _ } as found) ->
+                assert (ric >= required_insertion_count);
+                Some { found with blocks = bs :: blocks })
+            t.blocked_blocks
+        in
+        t.blocked_blocks <- q')
+      else
+        f bs
+    | Error e ->
+      failwith e
+end

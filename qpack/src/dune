@@ -1,6 +1,6 @@
 (library
  (public_name qpack)
- (libraries angstrom faraday))
+ (libraries angstrom faraday psq))
 
 (rule
  (targets huffman_table.ml)

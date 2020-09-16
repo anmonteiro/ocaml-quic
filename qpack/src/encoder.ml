@@ -122,9 +122,8 @@ let create capacity =
   ; dyn_table_capacity_change = -1
   }
 
-let add ({ table; lookup_table; next_seq; _ } as encoder) entry =
-  let name, value = entry in
-  if Dynamic_table.add table entry then (
+let add ({ table; lookup_table; next_seq; _ } as encoder) name value =
+  if Dynamic_table.add table name value then (
     let map =
       match HeaderFieldsTbl.find_opt lookup_table name with
       | Some map ->
@@ -419,10 +418,13 @@ let encode_headers t ~encoder_buffer f headers =
           let dynamic_index =
             if dynamic_index = not_found then
               (* Not found in the dynamic table, try to index. *)
-              if true (* should_index x *) then (
+              if
+                (* TODO: should_index x *)
+                true && Dynamic_table.can_index t.table ~name ~value
+              then (
                 (* save base before adding to the dynamic table. *)
                 let base_for_encoder = t.next_seq in
-                let maybe_added = add (* to the dyn table *) t (name, value) in
+                let maybe_added = add (* to the dyn table *) t name value in
                 (* From RFC<QPACK-RFC>§3.2.5:
                  *   In encoder instructions (Section 4.3), a relative index of
                  *   "0" refers to the most recently inserted value in the

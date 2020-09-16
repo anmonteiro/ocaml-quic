@@ -1,13 +1,9 @@
 (test
  (name test)
- (libraries qpack yojson hex alcotest))
-
-(rule
- (alias slowtests)
  (deps
-  (:test_exe test.exe)
   (source_tree ./qifs))
+ (libraries qpack yojson hex alcotest)
  (action
   (chdir
    %{project_root}
-   (run %{test_exe} --verbose))))
+   (run %{test}))))

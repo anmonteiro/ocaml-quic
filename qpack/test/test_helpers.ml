@@ -1,6 +1,8 @@
 open Qpack__
 open Types
 
+let ( // ) = Filename.concat
+
 let header_equal { name; value; _ } { name = name'; value = value'; _ } =
   name = name' && value = value'
 
