@@ -102,5 +102,8 @@ module Decoder : sig
   (** [decode_headers decoder] creates an Angstrom parser that will decode a
       header block and return a list of the decoded headers *)
 
-  val decode_block : t -> (string * string) list Angstrom.t
+  val parser
+    :  t
+    -> stream_id:int64
+    -> ((string * string) list * string) Angstrom.t
 end

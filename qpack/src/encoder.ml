@@ -250,6 +250,17 @@ module Instruction = struct
     | x :: xs ->
       x :: remove_last xs
 
+  let stop_tracking t ~stream_id =
+    match Hashtbl.find_opt t.stream_references stream_id with
+    | Some sets ->
+      (match remove_last sets with
+      | [] ->
+        Hashtbl.remove t.stream_references stream_id
+      | sets' ->
+        Hashtbl.replace t.stream_references stream_id sets')
+    | None ->
+      assert false
+
   let parser t =
     let open Angstrom in
     any_uint8 >>= fun b ->
@@ -261,15 +272,7 @@ module Instruction = struct
       lift
         (fun stream_id ->
           let stream_id = Int64.of_int stream_id in
-          (match Hashtbl.find_opt t.stream_references stream_id with
-          | Some sets ->
-            (match remove_last sets with
-            | [] ->
-              Hashtbl.remove t.stream_references stream_id
-            | sets' ->
-              Hashtbl.replace t.stream_references stream_id sets')
-          | None ->
-            assert false);
+          stop_tracking t ~stream_id;
           Section_ack stream_id)
         (Qint.decode b 7)
     else if b land 0b0100_0000 = 0b0100_0000 then
@@ -277,7 +280,13 @@ module Instruction = struct
        *   The instruction begins with the '01' two-bit pattern, followed by the
        *   stream ID of the affected stream encoded as a 6-bit prefix integer. *)
       lift
-        (fun stream_id -> Stream_cancelation (Int64.of_int stream_id))
+        (fun stream_id ->
+          (* From RFC<QPACK-RFC>§2.2.2.2:
+           *   This signals to the encoder that all references to the dynamic
+           *   table on that stream are no longer outstanding. *)
+          let stream_id = Int64.of_int stream_id in
+          stop_tracking t ~stream_id;
+          Stream_cancelation stream_id)
         (Qint.decode b 6)
     else (
       assert (b land 0b1100_0000 = 0b0000_0000);

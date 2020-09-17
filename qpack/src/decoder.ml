@@ -214,7 +214,7 @@ let section_prefix t =
   in
   req_insert_count, base
 
-let parser { table; _ } ~base =
+let decode_header_block { table; _ } ~base =
   let open Angstrom in
   peek_char_fail >>= fun c ->
   let b = Char.code c in
@@ -281,11 +281,16 @@ let parser { table; _ } ~base =
       (any_uint8 >>= fun b -> Qint.decode b 3)
       (Qstring.decode 8))
 
-let parser t =
+let parser t ~stream_id =
   section_prefix t >>= fun (_req_insert_count, base) ->
-  Angstrom.many1 (parser t ~base)
-
-let decode_block = parser
+  lift
+    (fun headers ->
+      let f = Faraday.create 0x100 in
+      Instruction.encode_section_acknowledgement
+        f
+        ~stream_id:(Int64.to_int stream_id);
+      headers, Faraday.serialize_to_string f)
+    (Angstrom.many1 (decode_header_block t ~base))
 
 module Buffered = struct
   module StreamIdSet = Set.Make (Int64)
@@ -346,19 +351,19 @@ module Buffered = struct
     match
       Angstrom.parse_bigstring ~consume:All (Instruction.parser t.decoder) bs
     with
-    | Ok _section_acks ->
-      process_blocked_streams t
+    | Ok received_count_increment ->
+      process_blocked_streams t;
+      received_count_increment
     | Error e ->
       failwith e
 
-  (* TODO: emit section acknowledgement as per 2.2.2.1 *)
   let parse_header_block t ~stream_id bs f =
     match
       Angstrom.parse_bigstring ~consume:Prefix (section_prefix t.decoder) bs
     with
     | Ok (required_insertion_count, _base) ->
       if required_insertion_count > t.decoder.insertion_count then (
-        (* From RFC<QPACK-RFC>§4.5.1:
+        (* From RFC<QPACK-RFC>§2.1.2:
          *   When the decoder receives an encoded field section with a Required
          *   Insert Count greater than its own Insert Count, the stream cannot
          *   be processed immediately, and is considered "blocked"; see Section

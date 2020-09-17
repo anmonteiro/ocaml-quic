@@ -11,23 +11,18 @@ let rec join ?(memo = []) = function
 
 let decoder ~max_size ~max_blocked_streams:_ = Decoder.create max_size
 
-let decode_instruction t { Qif.encoded; _ } =
-  Angstrom.parse_string ~consume:All (Decoder.Instruction.parser t) encoded
-
-let decode_block t { Qif.encoded; _ } =
-  Angstrom.parse_string ~consume:All (Decoder.parser t) encoded
-
 let test t ~f { Qif.stream_id; encoded } =
   if Int64.equal stream_id 0L then
     Decoder.Buffered.parse_instructions
       t
       (Bigstringaf.of_string ~off:0 ~len:(String.length encoded) encoded)
+    |> ignore
   else
     Decoder.Buffered.parse_header_block
       ~stream_id
       t
       (Bigstringaf.of_string ~off:0 ~len:(String.length encoded) encoded)
-      f
+      (f ~stream_id)
 
 let test_case ~max_size ~max_blocked_streams ~expected f () =
   let content = Qif.read_entire_file f in
@@ -36,14 +31,14 @@ let test_case ~max_size ~max_blocked_streams ~expected f () =
     let instructions, _ = List.partition (fun x -> x.Qif.stream_id = 0L) xs in
     let t = Decoder.Buffered.create ~max_size ~max_blocked_streams in
     let decoded_headers = ref [] in
-    let f bs =
+    let f ~stream_id bs =
       match
         Angstrom.parse_bigstring
           ~consume:All
-          (Decoder.decode_block t.decoder)
+          (Decoder.parser ~stream_id t.decoder)
           bs
       with
-      | Ok hs ->
+      | Ok (hs, _section_ack) ->
         decoded_headers := hs :: !decoded_headers
       | Error e ->
         failwith e
