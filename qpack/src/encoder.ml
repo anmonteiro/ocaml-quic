@@ -132,8 +132,7 @@ let tokens_without_indexing =
    * dynamic table. *)
   IntSet.of_list
     Static_table.TokenIndices.
-      [ token__path
-      ; token_age
+      [ token_age
       ; token_content_length
       ; token_etag
       ; token_if_modified_since
@@ -141,9 +140,6 @@ let tokens_without_indexing =
       ; token_location
       ; token_set_cookie
       ]
-
-let[@inline] is_without_indexing token =
-  token <> -1 && IntSet.mem token tokens_without_indexing
 
 let[@inline] is_sensitive token value =
   token <> -1
@@ -154,6 +150,11 @@ let[@inline] is_sensitive token value =
   Static_table.TokenIndices.(
     token == token_authorization
     || (token == token_cookie && String.length value < 20))
+
+let[@inline] should_skip_indexing ~token { value; sensitive; _ } =
+  sensitive
+  || (token <> -1 && IntSet.mem token tokens_without_indexing)
+  || is_sensitive token value
 
 let[@inline] relative_index ~base absolute_index =
   (* a relative index of "0" refers to the entry with absolute index equal to
@@ -428,7 +429,7 @@ let encode_headers t ~stream_id ~encoder_buffer f headers =
     Instruction.encode_set_dynamic_table_capacity encoder_buffer min_max_size);
   let required_insert_count =
     List.fold_left
-      (fun required_insert_count { name; value; sensitive = _ } ->
+      (fun required_insert_count ({ name; value; _ } as header) ->
         let name_idx, header_idx = Static_table.lookup name value in
         if header_idx <> Static_table.not_found then (
           (* static name + value -> static index reference *)
@@ -452,8 +453,7 @@ let encode_headers t ~stream_id ~encoder_buffer f headers =
             if dynamic_index = not_found then
               (* Not found in the dynamic table, try to index. *)
               if
-                (* TODO: should_index with never_indexed fields *)
-                true
+                (not (should_skip_indexing ~token:name_idx header))
                 && Dynamic_table.can_index
                      t.table
                      ~referenced_indices:

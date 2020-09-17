@@ -244,7 +244,7 @@ module Encoding = struct
         , LiteralWithoutNameRef (name2, value2) ) ->
         name1 = name2 && value1 = value2
       | _ ->
-        assert false
+        false
   end
 
   let testable : block Alcotest.testable = (module Testable)
@@ -276,7 +276,7 @@ let test_encode_static () =
     decoded_headers
 
 let test_encode_static_name_reference () =
-  let hdr = header "location" "/bar" in
+  let hdr = header ":path" "/bar" in
   let t, d = Encoder.create 4096, Decoder.create 4096 in
   let encoder, stream = encode t [ hdr ] in
   let req_insert_count, decoded_headers = Encoding.decode d stream in
@@ -289,11 +289,12 @@ let test_encode_static_name_reference () =
   Alcotest.check
     instruction
     "insert with (static) name ref"
-    (Instruction.InsertWithNameRef (Static 12, Ok "/bar"))
+    (Instruction.InsertWithNameRef
+       (Static Static_table.TokenIndices.token__path, Ok "/bar"))
     (Instruction.decode encoder)
 
 let test_encode_static_nameref_indexed_in_dynamic () =
-  let hdr = header "location" "/bar" in
+  let hdr = header ":path" "/bar" in
   let t, d = Encoder.create 4096, Decoder.create 4096 in
   let _ = encode t [ hdr ] in
   let encoder, stream = encode t [ hdr ] in
@@ -538,6 +539,40 @@ let test_encoder_unknown_stream () =
   | Error e ->
     failwith e
 
+let test_never_indexed_fields () =
+  let hdr = header "location" "/bar" in
+  let t, d = Encoder.create 4096, Decoder.create 4096 in
+  let _encoder, stream = encode t [ hdr ] in
+  let req_insert_count, decoded_headers = Encoding.decode d stream in
+  Alcotest.(check int) "expected required insert count" 0 req_insert_count;
+  Alcotest.check
+    encoding
+    "encoded in the dynamic table with post base indexing"
+    (Encoding.LiteralWithNameRef
+       (Static Static_table.TokenIndices.token_location, Ok "/bar"))
+    decoded_headers;
+  let hdr = { Types.name = "foo"; value = "/bar"; sensitive = true } in
+  let t, d = Encoder.create 4096, Decoder.create 4096 in
+  let _encoder, stream = encode t [ hdr ] in
+  let req_insert_count, decoded_headers = Encoding.decode d stream in
+  Alcotest.(check int) "expected required insert count" 0 req_insert_count;
+  Alcotest.check
+    encoding
+    "encoded in the dynamic table with post base indexing"
+    (Encoding.LiteralWithoutNameRef (Ok "foo", Ok "/bar"))
+    decoded_headers;
+  let hdr = header "authorization" "password" in
+  let t, d = Encoder.create 4096, Decoder.create 4096 in
+  let _encoder, stream = encode t [ hdr ] in
+  let req_insert_count, decoded_headers = Encoding.decode d stream in
+  Alcotest.(check int) "expected required insert count" 0 req_insert_count;
+  Alcotest.check
+    encoding
+    "encoded in the dynamic table with post base indexing"
+    (Encoding.LiteralWithNameRef
+       (Static Static_table.TokenIndices.token_authorization, Ok "password"))
+    decoded_headers
+
 let suite =
   [ "static access", `Quick, test_encode_static
   ; ( "encode with static name reference"
@@ -557,4 +592,7 @@ let suite =
   ; "decoder block ack", `Quick, test_decoder_block_ack
   ; "decoder stream canceled", `Quick, test_decoder_stream_canceled
   ; "cancelation on unknown stream", `Quick, test_encoder_unknown_stream
+  ; ( "field that this implementation doesn't index"
+    , `Quick
+    , test_never_indexed_fields )
   ]
