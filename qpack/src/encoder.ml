@@ -403,6 +403,18 @@ let encode_headers t ~stream_id ~encoder_buffer f headers =
   let cur_referenced_fields = ref IntSet.empty in
   let blockf = Faraday.create 0x200 in
   let base = t.next_seq in
+  (* There's a dynamic table max size update enqueued. *)
+  (match t.dyn_table_capacity_change with
+  | -1 ->
+    ()
+  | min_max_size ->
+    t.dyn_table_capacity_change <- -1;
+    (* From RFC<QPACK-RFC>§3.2.1:
+     *   An encoder informs the decoder of a change to the dynamic table
+     *   capacity using an instruction that begins with the '001' three-bit
+     *   pattern. This is followed by the new dynamic table capacity
+     *   represented as an integer with a 5-bit prefix. *)
+    Instruction.encode_set_dynamic_table_capacity encoder_buffer min_max_size);
   let required_insert_count =
     List.fold_left
       (fun required_insert_count { name; value; sensitive = _ } ->
@@ -518,23 +530,6 @@ let encode_headers t ~stream_id ~encoder_buffer f headers =
   let bs = Faraday.serialize_to_bigstring blockf in
   encode_section_prefix t f ~required_insert_count ~base;
   Faraday.schedule_bigstring f bs
-
-let encode_header encoder t _headers =
-  match encoder.dyn_table_capacity_change with
-  | -1 ->
-    ()
-  | min_max_size ->
-    encoder.dyn_table_capacity_change <- -1;
-    (* From RFC<QPACK-RFC>§3.2.1:
-     *   An encoder informs the decoder of a change to the dynamic table
-     *   capacity using an instruction that begins with the '001' three-bit
-     *   pattern. This is followed by the new dynamic table capacity
-     *   represented as an integer with a 5-bit prefix. *)
-    Qint.encode t 32 5 min_max_size
-
-(* wtf is this doing anyway? *)
-(* if encoder.table.max_size > min_max_size then *)
-(* Qint.encode t 32 5 encoder.table.max_size *)
 
 let set_capacity ({ table; _ } as t) new_capacity =
   Dynamic_table.set_capacity table new_capacity;

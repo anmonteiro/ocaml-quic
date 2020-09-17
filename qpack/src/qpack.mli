@@ -63,10 +63,9 @@ module Encoder : sig
     -> Faraday.t
     -> header list
     -> unit
-
-  val encode_header : t -> Faraday.t -> header -> unit
-  (** [encode_header encoder f header] writes an encoded header to the Faraday
-      buffer [f]. *)
+  (** [encode_headers encoder ~stream_id ~encoder_buffer f headers] writes a
+      header block to the Faraday buffer [f], and encoder instructions into
+      [encoder_buffer]. *)
 
   val set_capacity : t -> int -> unit
   (** [set_capacity encoder capacity] sets [encoder]'s dynamic table size to
