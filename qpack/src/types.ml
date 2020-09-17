@@ -45,3 +45,5 @@ type error =
 let ok = Ok ()
 
 let decompression_failed = Error QPACK_DECOMPRESSION_FAILED
+
+let encoder_stream_error = Error QPACK_ENCODER_STREAM_ERROR

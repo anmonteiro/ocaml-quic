@@ -50,6 +50,7 @@ module ValueMap = struct
   let[@inline] find_opt k m = try Some (find k m) with Not_found -> None
 end
 
+(* TODO: known received count, section 2.1.4 *)
 type t =
   { (* We maintain a lookup table of header fields to their indexes in the
      * dynamic table. The format is name -> (value -> index) *)
@@ -89,6 +90,7 @@ let create capacity =
   }
 
 let track_table_reference t idx set =
+  assert (idx > -1);
   IntSet.add (Dynamic_table.offset_from_index t.table idx) set
 
 let add
@@ -257,9 +259,16 @@ module Instruction = struct
       | [] ->
         Hashtbl.remove t.stream_references stream_id
       | sets' ->
-        Hashtbl.replace t.stream_references stream_id sets')
+        Hashtbl.replace t.stream_references stream_id sets');
+      ok
     | None ->
-      assert false
+      (* From RFC<QPACK-RFC>§4.4.1:
+       *   If an encoder receives a Section Acknowledgement instruction
+       *   referring to a stream on which every encoded field section with a
+       *   non-zero Required Insert Count has already been acknowledged, this
+       *   MUST be treated as a connection error of type
+       *   QPACK_DECODER_STREAM_ERROR. *)
+      encoder_stream_error
 
   let parser t =
     let open Angstrom in
@@ -272,8 +281,9 @@ module Instruction = struct
       lift
         (fun stream_id ->
           let stream_id = Int64.of_int stream_id in
-          stop_tracking t ~stream_id;
-          Section_ack stream_id)
+          Result.map
+            (fun () -> Section_ack stream_id)
+            (stop_tracking t ~stream_id))
         (Qint.decode b 7)
     else if b land 0b0100_0000 = 0b0100_0000 then
       (* From RFC<QPACK-RFC>§4.4.2:
@@ -285,15 +295,16 @@ module Instruction = struct
            *   This signals to the encoder that all references to the dynamic
            *   table on that stream are no longer outstanding. *)
           let stream_id = Int64.of_int stream_id in
-          stop_tracking t ~stream_id;
-          Stream_cancelation stream_id)
+          Result.map
+            (fun () -> Stream_cancelation stream_id)
+            (stop_tracking t ~stream_id))
         (Qint.decode b 6)
     else (
       assert (b land 0b1100_0000 = 0b0000_0000);
       (* From RFC<QPACK-RFC>§4.4.3:
        *   The Insert Count Increment instruction begins with the '00' two-bit
        *   pattern, followed by the Increment encoded as a 6-bit prefix integer. *)
-      lift (fun inc -> Insert_count_increment inc) (Qint.decode b 6))
+      lift (fun inc -> Ok (Insert_count_increment inc)) (Qint.decode b 6))
 end
 
 let encode_index_reference t ~table ~base absolute_index =
@@ -511,7 +522,7 @@ let encode_headers t ~stream_id ~encoder_buffer f headers =
             assert (dynamic_index <> not_found);
             encode_index_reference blockf ~table:Dynamic ~base dynamic_index;
             cur_referenced_fields :=
-              track_table_reference t dynamic_name_index !cur_referenced_fields;
+              track_table_reference t dynamic_index !cur_referenced_fields;
             req_insert_count_from_index ~required_insert_count dynamic_index))
       (* From RFC<QPACK-RFC>§4.3.1:
        * For a field section encoded with no references to the dynamic table,

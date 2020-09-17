@@ -78,7 +78,7 @@ let set_capacity { table; max_capacity; _ } capacity =
     (* From RFC<QPACK-RFC>§4.3.1:
      *   The decoder MUST treat a new dynamic table capacity value that exceeds
      *   this limit as a connection error of type QPACK_ENCODER_STREAM_ERROR. *)
-    Error QPACK_ENCODER_STREAM_ERROR
+    encoder_stream_error
   else (
     Dynamic_table.set_capacity table capacity;
     ok)
@@ -89,7 +89,7 @@ let add t name value =
    *   than the dynamic table capacity; the decoder MUST treat this as a
    *   connection error of type QPACK_ENCODER_STREAM_ERROR. *)
   if Dynamic_table.entry_size name value > t.table.max_size then
-    Error QPACK_ENCODER_STREAM_ERROR
+    encoder_stream_error
   else
     let ret = Dynamic_table.add t.table name value in
     if ret then t.insertion_count <- t.insertion_count + 1;

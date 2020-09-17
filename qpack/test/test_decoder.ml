@@ -94,7 +94,7 @@ open Test_helpers
  *)
 
 module Instruction = struct
-  type t =
+  type t = Encoder.Instruction.decoder_instruction =
     | Section_ack of int64
     | Stream_cancelation of int64
     | Insert_count_increment of int
@@ -493,3 +493,5 @@ let suite =
     , test_decode_literal_without_name_ref_header_field )
   ; "decode single pass", `Quick, test_decode_single_pass_encoded
   ]
+
+(* Test invalid references *)

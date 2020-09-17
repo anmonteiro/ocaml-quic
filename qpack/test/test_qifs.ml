@@ -114,8 +114,10 @@ let gen_ocaml t f ~ack_mode ~stream_id_gen headers =
     (match
        Angstrom.parse_string ~consume:All (Encoder.Instruction.parser t) sack
      with
-    | Ok instruction ->
+    | Ok (Ok instruction) ->
       assert (instruction = Encoder.Instruction.Section_ack stream_id)
+    | Ok (Error _) ->
+      assert false
     | Error e ->
       failwith e)
   | None ->

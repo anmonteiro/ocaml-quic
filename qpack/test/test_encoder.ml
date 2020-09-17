@@ -432,6 +432,112 @@ let test_encode_with_header_block () =
     ]
     decoded_headers
 
+let test_decoder_block_ack () =
+  let t, d = Encoder.create 4096, Decoder.create 4096 in
+  let encoder, stream = encode t [ header "foo" "bar"; header "foo" "quxx" ] in
+  let req_insert_count, decoded_headers = Encoding.decode_many d stream in
+  Alcotest.(check int) "expected required insert count" 2 req_insert_count;
+  Alcotest.check
+    instruction
+    "insert with name ref"
+    (Instruction.InsertWithoutNameRef (Ok "foo", Ok "bar"))
+    (Instruction.decode encoder);
+  Alcotest.(check (list encoding))
+    "encoded in the dynamic table with post base indexing"
+    [ Encoding.Indexed (Dynamic (PostBase, 0))
+    ; Encoding.Indexed (Dynamic (PostBase, 1))
+    ]
+    decoded_headers;
+  Alcotest.(check int)
+    "tracking block to be acked"
+    2
+    (Hashtbl.find t.Encoder.stream_references 1L
+    |> List.hd
+    |> Types.IntSet.cardinal);
+  let sackf = Faraday.create 0x10 in
+  Decoder.Instruction.encode_section_acknowledgement sackf ~stream_id:1;
+  match
+    Angstrom.parse_string
+      ~consume:All
+      (Encoder.Instruction.parser t)
+      (Faraday.serialize_to_string sackf)
+  with
+  | Ok (Ok ack) ->
+    Alcotest.(check Test_decoder.instruction) "section ack" ack (Section_ack 1L);
+    Alcotest.(check bool)
+      "ack causes encoder to stop tracking stream references"
+      true
+      (Hashtbl.find_opt t.Encoder.stream_references 1L = None)
+  | Ok (Error _) ->
+    assert false
+  | Error e ->
+    failwith e
+
+let test_decoder_stream_canceled () =
+  let t, d = Encoder.create 4096, Decoder.create 4096 in
+  let encoder, stream = encode t [ header "foo" "bar"; header "foo" "quxx" ] in
+  let req_insert_count, decoded_headers = Encoding.decode_many d stream in
+  Alcotest.(check int) "expected required insert count" 2 req_insert_count;
+  Alcotest.check
+    instruction
+    "insert with name ref"
+    (Instruction.InsertWithoutNameRef (Ok "foo", Ok "bar"))
+    (Instruction.decode encoder);
+  Alcotest.(check (list encoding))
+    "encoded in the dynamic table with post base indexing"
+    [ Encoding.Indexed (Dynamic (PostBase, 0))
+    ; Encoding.Indexed (Dynamic (PostBase, 1))
+    ]
+    decoded_headers;
+  Alcotest.(check int)
+    "tracking block to be acked"
+    2
+    (Hashtbl.find t.Encoder.stream_references 1L
+    |> List.hd
+    |> Types.IntSet.cardinal);
+  let sackf = Faraday.create 0x10 in
+  Decoder.Instruction.encode_stream_cancelation sackf ~stream_id:1;
+  match
+    Angstrom.parse_string
+      ~consume:All
+      (Encoder.Instruction.parser t)
+      (Faraday.serialize_to_string sackf)
+  with
+  | Ok (Ok ack) ->
+    Alcotest.(check Test_decoder.instruction)
+      "stream cancelation"
+      ack
+      (Stream_cancelation 1L);
+    Alcotest.(check bool)
+      "ack causes encoder to stop tracking stream references"
+      true
+      (Hashtbl.find_opt t.Encoder.stream_references 1L = None)
+  | Ok (Error _) ->
+    assert false
+  | Error e ->
+    failwith e
+
+let test_encoder_unknown_stream () =
+  let t = Encoder.create 4096 in
+  ignore (encode t [ header "foo" "bar"; header "foo" "quxx" ]);
+  let sackf = Faraday.create 0x10 in
+  Decoder.Instruction.encode_stream_cancelation sackf ~stream_id:4;
+  match
+    Angstrom.parse_string
+      ~consume:All
+      (Encoder.Instruction.parser t)
+      (Faraday.serialize_to_string sackf)
+  with
+  | Ok (Ok _) ->
+    Alcotest.fail "expected stream cancelation on unknown stream to fail"
+  | Ok (Error e) ->
+    Alcotest.(check bool)
+      "cancelation on unknown stream returns QPACK_ENCODER_STREAM_ERROR"
+      true
+      (e = QPACK_ENCODER_STREAM_ERROR)
+  | Error e ->
+    failwith e
+
 let suite =
   [ "static access", `Quick, test_encode_static
   ; ( "encode with static name reference"
@@ -448,4 +554,7 @@ let suite =
     , `Quick
     , test_encode_literal_postbase_nameref )
   ; "encode with header block", `Quick, test_encode_with_header_block
+  ; "decoder block ack", `Quick, test_decoder_block_ack
+  ; "decoder stream canceled", `Quick, test_decoder_stream_canceled
+  ; "cancelation on unknown stream", `Quick, test_encoder_unknown_stream
   ]
