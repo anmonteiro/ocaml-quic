@@ -156,7 +156,12 @@ module Encoding = struct
     let open Angstrom in
     let p =
       lift2
-        (fun (req_insert_count, _base) headers -> req_insert_count, headers)
+        (fun x headers ->
+          match x with
+          | Ok (req_insert_count, _base) ->
+            req_insert_count, headers
+          | Error _ ->
+            assert false)
         (Decoder.section_prefix d)
         parser
     in
@@ -170,7 +175,12 @@ module Encoding = struct
     let open Angstrom in
     let p =
       lift2
-        (fun (req_insert_count, _base) headers -> req_insert_count, headers)
+        (fun x headers ->
+          match x with
+          | Ok (req_insert_count, _base) ->
+            req_insert_count, headers
+          | Error _ ->
+            assert false)
         (Decoder.section_prefix d)
         (many1 parser)
     in

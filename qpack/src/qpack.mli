@@ -43,7 +43,6 @@ type header =
 type error =
   | QPACK_DECOMPRESSION_FAILED
   | QPACK_ENCODER_STREAM_ERROR
-  | Decoding_error
 
 module Encoder : sig
   type t
@@ -104,5 +103,5 @@ module Decoder : sig
   val parser
     :  t
     -> stream_id:int64
-    -> ((string * string) list * string) Angstrom.t
+    -> ((string * string) list * string, error) result Angstrom.t
 end

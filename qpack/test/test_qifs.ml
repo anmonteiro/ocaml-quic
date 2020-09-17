@@ -23,6 +23,7 @@ let test t ~f { Qif.stream_id; encoded } =
       t
       (Bigstringaf.of_string ~off:0 ~len:(String.length encoded) encoded)
       (f ~stream_id)
+    |> Result.get_ok
 
 let test_case ~max_size ~max_blocked_streams ~expected f () =
   let content = Qif.read_entire_file f in
@@ -38,8 +39,10 @@ let test_case ~max_size ~max_blocked_streams ~expected f () =
           (Decoder.parser ~stream_id t.decoder)
           bs
       with
-      | Ok (hs, _section_ack) ->
+      | Ok (Ok (hs, _section_ack)) ->
         decoded_headers := hs :: !decoded_headers
+      | Ok (Error _) ->
+        assert false
       | Error e ->
         failwith e
     in

@@ -157,10 +157,36 @@ let instruction = Instruction.testable
 let header ?(sensitive = false) name value = { Types.name; value; sensitive }
 
 let decode_instructions t buf =
-  Angstrom.parse_string ~consume:All (Decoder.Instruction.parser t) buf
+  match
+    Angstrom.parse_string ~consume:All (Decoder.Instruction.parser t) buf
+  with
+  | Ok (Ok x) ->
+    Ok x
+  | Ok (Error _) ->
+    assert false
+  | Error _ as e ->
+    e
 
 let decode_header_block t hs =
-  Angstrom.parse_string ~consume:All (Decoder.parser ~stream_id:1L t) hs
+  match
+    Angstrom.parse_string ~consume:All (Decoder.parser ~stream_id:1L t) hs
+  with
+  | Ok (Ok x) ->
+    Ok x
+  | Ok (Error _) ->
+    assert false
+  | Error _ as e ->
+    e
+
+let fill_table t n =
+  for i = 1 to n do
+    match Decoder.add t (Format.asprintf "foo%d" i) "bar" with
+    | Ok added ->
+      Alcotest.(check bool) "added to the dynamic table" true added
+    | Error _ ->
+      Alcotest.fail "expected entry to be added"
+  done;
+  Alcotest.(check int) "table has n entries" n t.table.length
 
 let test_insert_field_with_dynamic_name_ref () =
   let t = Decoder.create 4096 in
@@ -216,8 +242,8 @@ let test_insert_field_without_name_ref () =
 let test_duplicate_field () =
   let t = Decoder.create 4096 in
   let f = Faraday.create 0x1000 in
-  let added1 = Decoder.add t "" "" in
-  let added2 = Decoder.add t "foo" "bar" in
+  let added1 = Result.get_ok (Decoder.add t "" "") in
+  let added2 = Result.get_ok (Decoder.add t "foo" "bar") in
   Alcotest.(check bool) "added to the dynamic table" true added1;
   Alcotest.(check bool) "added to the dynamic table" true added2;
   Encoder.Instruction.encode_duplicate f ~base:2 1;
@@ -273,13 +299,6 @@ let test_instruction_too_short () =
     Alcotest.fail "expected decoding instruction too short to fail"
   | Error _ ->
     Alcotest.(check pass) "failed decoding a too short instruction" true true
-
-let fill_table t n =
-  for i = 1 to n do
-    let added = Decoder.add t (Format.asprintf "foo%d" i) "bar" in
-    Alcotest.(check bool) "added to the dynamic table" true added
-  done;
-  Alcotest.(check int) "table has n entries" n t.table.length
 
 (*
  *  Largest Reference

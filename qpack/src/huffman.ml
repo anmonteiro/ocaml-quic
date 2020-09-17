@@ -107,13 +107,13 @@ let decode s =
         if exists_in_huffman_table id then
           loop id accept (i + 1)
         else
-          Error Decoding_error)
+          decompression_failed)
       else
-        Error Decoding_error)
+        decompression_failed)
     else if not accept then
-      Error Decoding_error
+      decompression_failed
     else
-      Ok ()
+      ok
   in
   match loop 0 true 0 with
   | Ok _ ->
