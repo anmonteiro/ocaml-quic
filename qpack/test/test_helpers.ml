@@ -25,3 +25,6 @@ let headers_list_pp =
 let qstring = Alcotest.testable (Fmt.quote Fmt.string) ( = )
 
 let header ?(sensitive = false) name value = { Types.name; value; sensitive }
+
+let combine l1 l2 =
+  List.fold_left (fun acc i1 -> acc @ List.map (fun i2 -> i1, i2) l2) [] l1

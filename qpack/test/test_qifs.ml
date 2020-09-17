@@ -125,11 +125,10 @@ let write_ocaml_qif_output () =
   List.iter
     (fun fname ->
       let blocks = Qif.parse_file (qifs_dir // fname) in
-      (* TODO: improve, can generate more files. *)
       List.iter
-        (fun ack_mode ->
+        (fun (max_size, ack_mode) ->
           let stream_id_gen = ref 1L in
-          let t = Encoder.create 4096 in
+          let t = Encoder.create max_size in
           let f = Faraday.create 0x1000 in
           List.iter (gen_ocaml t f ~ack_mode ~stream_id_gen) blocks;
           let qif_ch =
@@ -137,13 +136,14 @@ let write_ocaml_qif_output () =
               (encoded_path
               // "ocaml-qpack"
               // Format.asprintf
-                   "%s.out.4096.0.%d"
+                   "%s.out.%d.0.%d"
                    (Filename.chop_extension (Filename.basename fname))
+                   max_size
                    (match ack_mode with Immediate -> 1 | None -> 0))
           in
           output_string qif_ch (Faraday.serialize_to_string f);
           close_out qif_ch)
-        [ Immediate; None ])
+        (combine [ 0; 256; 512; 4096 ] [ Immediate; None ]))
     files
 
 let suite =
