@@ -74,6 +74,15 @@ module Encoder : sig
       See {{:https://tools.ietf.org/html/rfc7540#section-6.5.2} RFC7540§6.5.2}
       and {{:https://tools.ietf.org/html/rfc7541#section-4.1} RFC7541§4.1} for
       more details. *)
+
+  module Instruction : sig
+    type decoder_instruction =
+      | Section_ack of int64
+      | Stream_cancelation of int64
+      | Insert_count_increment of int
+
+    val parser : t -> (decoder_instruction, error) result Angstrom.t
+  end
 end
 
 module Decoder : sig
@@ -104,4 +113,22 @@ module Decoder : sig
     :  t
     -> stream_id:int64
     -> ((string * string) list * string, error) result Angstrom.t
+
+  module Buffered : sig
+    type t
+
+    val create : max_size:int -> max_blocked_streams:int -> t
+
+    val parse_instructions
+      :  t
+      -> [ `Bigstring of Bigstringaf.t | `Eof | `String of string ]
+      -> (string option, error) result
+
+    val parse_header_block
+      :  t
+      -> stream_id:int64
+      -> Bigstringaf.t
+      -> (Bigstringaf.t -> unit)
+      -> (unit, error) result
+  end
 end

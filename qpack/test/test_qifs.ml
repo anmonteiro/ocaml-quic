@@ -12,11 +12,13 @@ let rec join ?(memo = []) = function
 let decoder ~max_size ~max_blocked_streams:_ = Decoder.create max_size
 
 let test t ~f { Qif.stream_id; encoded } =
-  if Int64.equal stream_id 0L then
+  if Int64.equal stream_id 0L then (
     Decoder.Buffered.parse_instructions
       t
-      (Bigstringaf.of_string ~off:0 ~len:(String.length encoded) encoded)
-    |> ignore
+      (`Bigstring
+        (Bigstringaf.of_string ~off:0 ~len:(String.length encoded) encoded))
+    |> ignore;
+    Decoder.Buffered.parse_instructions t `Eof |> ignore)
   else
     Decoder.Buffered.parse_header_block
       ~stream_id

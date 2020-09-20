@@ -347,6 +347,7 @@ let parser t ~stream_id =
     return e
 
 module Buffered = struct
+  module AB = Angstrom.Buffered
   module StreamIdSet = Set.Make (Int64)
 
   type blocked =
@@ -368,20 +369,21 @@ module Buffered = struct
           compare ric1 ric2
       end)
 
-  module AB = Angstrom.Buffered
-
   type nonrec t =
     { decoder : t
     ; mutable blocked_blocks : Q.t
     ; mutable blocked_streams : StreamIdSet.t
     ; max_blocked_streams : int
+    ; mutable instructions_parse_state : (string, error) result AB.state
     }
 
   let create ~max_size ~max_blocked_streams =
-    { decoder = create max_size
+    let decoder = create max_size in
+    { decoder
     ; blocked_blocks = Q.empty
     ; blocked_streams = StreamIdSet.empty
     ; max_blocked_streams
+    ; instructions_parse_state = AB.parse (Instruction.parser decoder)
     }
 
   let rec process_blocked_streams t =
@@ -401,15 +403,32 @@ module Buffered = struct
     | None ->
       ()
 
-  let parse_instructions t bs =
-    match
-      Angstrom.parse_bigstring ~consume:All (Instruction.parser t.decoder) bs
-    with
-    | Ok received_count_increment ->
-      process_blocked_streams t;
-      Ok received_count_increment
-    | Error _ as e ->
-      e
+  let parse_instructions t fragment =
+    let process_result t state =
+      match state with
+      | AB.Done (unconsumed, result) ->
+        assert (unconsumed.len = 0);
+        t.instructions_parse_state <- AB.parse (Instruction.parser t.decoder);
+        (match result with
+        | Ok received_count_increment ->
+          process_blocked_streams t;
+          Ok (Some received_count_increment)
+        | Error _ as e ->
+          e)
+      | Partial _ ->
+        t.instructions_parse_state <- state;
+        Ok None
+      | Fail _ ->
+        t.instructions_parse_state <- AB.parse (Instruction.parser t.decoder);
+        Error QPACK_ENCODER_STREAM_ERROR
+    in
+    match t.instructions_parse_state with
+    | Done _ ->
+      assert false
+    | Partial k ->
+      process_result t (k fragment)
+    | Fail _ as state ->
+      process_result t state
 
   let parse_header_block t ~stream_id bs f =
     match
@@ -417,10 +436,11 @@ module Buffered = struct
     with
     | Ok (Ok (required_insertion_count, _base)) ->
       if required_insertion_count > t.decoder.insertion_count then (
-        (* From RFC<QPACK-RFC>§2.1.2: * When the decoder receives an encoded
-           field section with a Required * Insert Count greater than its own
-           Insert Count, the stream cannot * be processed immediately, and is
-           considered "blocked"; see Section * 2.2.1. *)
+        (* From RFC<QPACK-RFC>§2.1.2:
+         *   When the decoder receives an encoded field section with a Required
+         *   Insert Count greater than its own Insert Count, the stream cannot
+         *   be processed immediately, and is considered "blocked"; see Section
+         *   2.2.1. *)
         t.blocked_streams <- StreamIdSet.add stream_id t.blocked_streams;
         let q' =
           Q.update
