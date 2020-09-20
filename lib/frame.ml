@@ -30,18 +30,6 @@
  *  POSSIBILITY OF SUCH DAMAGE.
  *---------------------------------------------------------------------------*)
 
-module Direction = struct
-  type t =
-    | Unidirectional
-    | Bidirectional
-
-  let classify id =
-    if Stream_id.is_bidi id then
-      Bidirectional
-    else
-      Unidirectional
-end
-
 module Type = struct
   type t =
     (* From RFC<QUIC-RFC>§19.1:

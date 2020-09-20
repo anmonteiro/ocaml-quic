@@ -215,11 +215,11 @@ module IO_loop = struct
 end
 
 module Server = struct
-  let establish_server listen_address handler =
+  let establish_server ~config listen_address handler =
     let server_fd =
       Lwt_unix.socket (Unix.domain_of_sockaddr listen_address) Unix.SOCK_DGRAM 0
     in
     Lwt_unix.bind server_fd listen_address >>= fun () ->
-    let connection = Quic.Server_connection.create handler in
+    let connection = Quic.Server_connection.create ~config handler in
     IO_loop.start connection ~read_buffer_size:0x1000 server_fd
 end

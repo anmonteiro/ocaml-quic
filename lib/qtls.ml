@@ -171,14 +171,14 @@ let ciphersuites =
   ; `AES_128_CCM_SHA256
   ]
 
-let server ~cert ~priv_key =
+let server ~certificates ~alpn_protocols =
   let server =
     Engine.server
       (Config.server
          ~ciphers:ciphersuites
-         ~certificates:(`Single (Qx509.private_of_pems ~cert ~priv_key))
+         ~certificates
          ~version:(`TLS_1_3, `TLS_1_3)
-         ~alpn_protocols:[ "http/0.9" ]
+         ~alpn_protocols
          ())
   in
   (server : t)

@@ -107,7 +107,7 @@ type 'a connection =
   ; queued_packets : (Writer.header_info * Frame.t list) Queue.t
   ; writer : Writer.t
   ; streams : (Stream_id.t, Stream.t) Hashtbl.t
-  ; handler : Stream.t -> unit
+  ; handler : Stream.t -> direction:Direction.t -> id:Stream_id.t -> unit
   ; wakeup_writer : unit -> unit
   }
 
@@ -126,7 +126,7 @@ type 'a t =
   ; mutable current_client_address : 'a option
   ; mutable wakeup_writer : Optional_thunk.t
   ; mutable closed : bool
-  ; stream_handler : Stream.t -> unit
+  ; stream_handler : Stream.t -> direction:Direction.t -> id:Stream_id.t -> unit
   }
 
 let wakeup_writer t =
@@ -386,14 +386,10 @@ let process_stream_frame c ~id ~fragment ~is_fin =
     | Some stream ->
       stream
     | None ->
-      let stream =
-        Stream.create
-          ~direction:(Frame.Direction.classify id)
-          ~id
-          c.wakeup_writer
-      in
+      let direction = Direction.classify id in
+      let stream = Stream.create ~direction ~id c.wakeup_writer in
       Hashtbl.add c.streams id stream;
-      c.handler stream;
+      c.handler ~direction ~id stream;
       stream
   in
   Stream.Recv.push fragment ~is_fin stream.recv;

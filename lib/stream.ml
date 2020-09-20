@@ -32,6 +32,20 @@
 
 module Writer = Serialize.Writer
 
+module Type = struct
+  type t =
+    | Client of Direction.t
+    | Server of Direction.t
+
+  let classify t =
+    let direction = Direction.classify t in
+    if Stream_id.is_server_initiated t then
+      Server direction
+    else (
+      assert (Stream_id.is_client_initiated t);
+      Client direction)
+end
+
 module Buffer = struct
   type t =
     { faraday : Faraday.t
@@ -62,6 +76,8 @@ module Buffer = struct
     t
 
   let empty = create_empty ()
+
+  let write_uint8 t c = Faraday.write_uint8 t.faraday c
 
   let write_char t c = Faraday.write_char t.faraday c
 
@@ -177,11 +193,12 @@ module Recv = struct
       if is_fin then t.fin_offset <- Some off)
 
   let flush t =
-    if Buffer.has_pending_output t.consumer then
+    if Buffer.has_pending_output t.consumer then (
       try Buffer.execute_read t.consumer with
-      | _exn ->
+      | exn ->
         (* report_exn t exn *)
-        failwith "NYI: Streamd.flush_recv / report_exn"
+        Format.eprintf "REAL EXN: %s@." (Printexc.to_string exn);
+        failwith "NYI: Streamd.flush_recv / report_exn")
 
   let pop t =
     match Q.pop t.q with
@@ -294,7 +311,7 @@ end
 type t =
   { send : Send.t
   ; recv : Recv.t
-  ; direction : Frame.Direction.t
+  ; direction : Direction.t
   ; id : int64
   }
 
@@ -308,6 +325,8 @@ let create_crypto () =
   { send = Send.create ignore; recv; direction = Bidirectional; id = -1L }
 
 (* Public (application layer) API *)
+let write_uint8 t c = Buffer.write_uint8 t.send.producer c
+
 let write_char t c = Buffer.write_char t.send.producer c
 
 let write_string t ?off ?len s = Buffer.write_string t.send.producer ?off ?len s
@@ -317,6 +336,8 @@ let write_bigstring t ?off ?len b =
 
 let schedule_bigstring t ?off ?len (b : Bigstringaf.t) =
   Buffer.schedule_bigstring t.send.producer ?off ?len b
+
+let unsafe_faraday t = Buffer.unsafe_faraday t.send.producer
 
 let flush t k = Buffer.flush t.send.producer k
 

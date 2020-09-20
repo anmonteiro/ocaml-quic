@@ -30,9 +30,12 @@
  *  POSSIBILITY OF SUCH DAMAGE.
  *---------------------------------------------------------------------------*)
 
-module Config = Config
-module Direction = Direction
-module Server_connection = Server_connection
-module IOVec = IOVec
-module Stream = Stream
-module Stream_id = Stream_id
+type t =
+  | Unidirectional
+  | Bidirectional
+
+let classify id =
+  if Stream_id.is_bidi id then
+    Bidirectional
+  else
+    Unidirectional

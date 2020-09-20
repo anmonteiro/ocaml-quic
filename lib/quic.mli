@@ -30,6 +30,13 @@
  *  POSSIBILITY OF SUCH DAMAGE.
  *---------------------------------------------------------------------------*)
 
+module Config : sig
+  type t =
+    { certificates : Tls.Config.own_cert
+    ; alpn_protocols : string list
+    }
+end
+
 module IOVec : sig
   type 'a t = 'a Faraday.iovec =
     { buffer : 'a
@@ -48,6 +55,26 @@ module IOVec : sig
   val pp_hum : Format.formatter -> _ t -> unit [@@ocaml.toplevel_printer]
 end
 
+module Stream_id : sig
+  type t = int64
+
+  val is_bidi : t -> bool
+
+  val is_uni : t -> bool
+
+  val is_client_initiated : t -> bool
+
+  val is_server_initiated : t -> bool
+end
+
+module Direction : sig
+  type t =
+    | Unidirectional
+    | Bidirectional
+
+  val classify : Stream_id.t -> t
+end
+
 module Stream : sig
   type t
 
@@ -56,6 +83,8 @@ module Stream : sig
     -> on_eof:(unit -> unit)
     -> on_read:(Bigstringaf.t -> off:int -> len:int -> unit)
     -> unit
+
+  val write_uint8 : t -> int -> unit
 
   val write_char : t -> char -> unit
 
@@ -72,12 +101,17 @@ module Stream : sig
   val close_writer : t -> unit
 
   val is_closed : t -> bool
+
+  val unsafe_faraday : t -> Faraday.t
 end
 
 module Server_connection : sig
   type 'a t
 
-  val create : (Stream.t -> unit) -> _ t
+  val create
+    :  config:Config.t
+    -> (Stream.t -> direction:Direction.t -> id:Stream_id.t -> unit)
+    -> _ t
 
   val next_read_operation : _ t -> [ `Read | `Yield | `Close ]
 
