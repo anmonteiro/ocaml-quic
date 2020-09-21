@@ -12,19 +12,16 @@ let rec join ?(memo = []) = function
 let decoder ~max_size ~max_blocked_streams:_ = Decoder.create max_size
 
 let test t ~f { Qif.stream_id; encoded } =
-  if Int64.equal stream_id 0L then (
-    Decoder.Buffered.parse_instructions
-      t
-      (`Bigstring
-        (Bigstringaf.of_string ~off:0 ~len:(String.length encoded) encoded))
-    |> ignore;
-    Decoder.Buffered.parse_instructions t `Eof |> ignore)
+  let faraday = Faraday.create 0x100 in
+  let bs = Bigstringaf.of_string ~off:0 ~len:(String.length encoded) encoded in
+  if Int64.equal stream_id 0L then
+    Angstrom.parse_bigstring
+      ~consume:All
+      (Decoder.Buffered.parse_instructions t faraday)
+      bs
+    |> Result.get_ok
   else
-    Decoder.Buffered.parse_header_block
-      ~stream_id
-      t
-      (Bigstringaf.of_string ~off:0 ~len:(String.length encoded) encoded)
-      (f ~stream_id)
+    Decoder.Buffered.decode_header_block ~stream_id t bs (f ~stream_id)
     |> Result.get_ok
 
 let test_case ~max_size ~max_blocked_streams ~expected f () =
@@ -54,7 +51,7 @@ let test_case ~max_size ~max_blocked_streams ~expected f () =
       "dynamic table has some entries"
       true
       (t.decoder.table.length > 0 || List.length instructions = 0);
-    Alcotest.(check (list (list (pair qstring qstring))))
+    Alcotest.(check (list (list theader)))
       "expected headers"
       expected
       decoded_headers
@@ -99,7 +96,7 @@ let gen_ocaml t f ~ack_mode ~stream_id_gen headers =
     ~stream_id
     ~encoder_buffer
     block_buffer
-    (List.map (fun (name, value) -> header name value) headers);
+    (List.map (fun { Types.name; value; _ } -> header name value) headers);
   let encoder_s = Faraday.serialize_to_string encoder_buffer in
   if String.length encoder_s > 0 then
     Qif.serialize f { encoded = encoder_s; stream_id = 0L };

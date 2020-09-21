@@ -157,13 +157,15 @@ let instruction = Instruction.testable
 let header ?(sensitive = false) name value = { Types.name; value; sensitive }
 
 let decode_instructions t buf =
+  let f = Faraday.create 0x10 in
   match
-    Angstrom.parse_string ~consume:All (Decoder.Instruction.parser t) buf
+    Angstrom.parse_string
+      ~consume:All
+      (Decoder.Instruction.parser ~f:ignore t f)
+      buf
   with
-  | Ok (Ok x) ->
-    Ok x
-  | Ok (Error _) ->
-    assert false
+  | Ok () ->
+    Ok (Faraday.serialize_to_string f)
   | Error _ as e ->
     e
 
@@ -326,9 +328,13 @@ let test_decode_indexed_header_field () =
   let s = Faraday.serialize_to_string f in
   match decode_header_block t s with
   | Ok (headers, _) ->
-    Alcotest.(check (list (pair qstring qstring)))
+    Alcotest.(check (list theader))
       "expected headers"
-      [ "foo2", "bar"; "foo1", "bar"; Static_table.table.(18) ]
+      [ header "foo2" "bar"
+      ; header "foo1" "bar"
+      ; (let n, v = Static_table.table.(18) in
+         header n v)
+      ]
       headers
   | Error e ->
     Alcotest.fail e
@@ -361,9 +367,9 @@ let test_decode_post_base_indexed () =
   let s = Faraday.serialize_to_string f in
   match decode_header_block t s with
   | Ok (headers, _) ->
-    Alcotest.(check (list (pair qstring qstring)))
+    Alcotest.(check (list theader))
       "expected headers"
-      [ "foo2", "bar"; "foo3", "bar"; "foo4", "bar" ]
+      [ header "foo2" "bar"; header "foo3" "bar"; header "foo4" "bar" ]
       headers
   | Error e ->
     Alcotest.fail e
@@ -387,9 +393,9 @@ let test_decode_name_ref () =
   let s = Faraday.serialize_to_string f in
   match decode_header_block t s with
   | Ok (headers, _) ->
-    Alcotest.(check (list (pair qstring qstring)))
+    Alcotest.(check (list theader))
       "expected headers"
-      [ "foo1", "new bar1"; ":method", "PUT" ]
+      [ header "foo1" "new bar1"; header ":method" "PUT" ]
       headers
   | Error e ->
     Alcotest.fail e
@@ -412,9 +418,9 @@ let test_decode_post_base_name_ref () =
   let s = Faraday.serialize_to_string f in
   match decode_header_block t s with
   | Ok (headers, _) ->
-    Alcotest.(check (list (pair qstring qstring)))
+    Alcotest.(check (list theader))
       "expected headers"
-      [ "foo3", "new bar3" ]
+      [ header "foo3" "new bar3" ]
       headers
   | Error e ->
     Alcotest.fail e
@@ -431,9 +437,9 @@ let test_decode_literal_without_name_ref_header_field () =
   let s = Faraday.serialize_to_string f in
   match decode_header_block t s with
   | Ok (headers, _) ->
-    Alcotest.(check (list (pair qstring qstring)))
+    Alcotest.(check (list theader))
       "expected headers"
-      [ "foo", "bar" ]
+      [ header "foo" "bar" ]
       headers
   | Error e ->
     Alcotest.fail e
@@ -467,9 +473,13 @@ let test_decode_single_pass_encoded () =
   let s = Faraday.serialize_to_string f in
   match decode_header_block t s with
   | Ok (headers, _) ->
-    Alcotest.(check (list (pair qstring qstring)))
+    Alcotest.(check (list theader))
       "expected headers"
-      [ "foo1", "bar"; "foo2", "bar"; "foo3", "bar"; "foo4", "bar" ]
+      [ header "foo1" "bar"
+      ; header "foo2" "bar"
+      ; header "foo3" "bar"
+      ; header "foo4" "bar"
+      ]
       headers
   | Error e ->
     Alcotest.fail e

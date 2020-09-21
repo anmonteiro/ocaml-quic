@@ -387,7 +387,7 @@ let process_stream_frame c ~id ~fragment ~is_fin =
       stream
     | None ->
       let direction = Direction.classify id in
-      let stream = Stream.create ~direction ~id c.wakeup_writer in
+      let stream = Stream.create ~typ:(Client direction) ~id c.wakeup_writer in
       Hashtbl.add c.streams id stream;
       c.handler ~direction ~id stream;
       stream
@@ -602,9 +602,8 @@ let packet_handler t packet =
   | Retry _ ->
     failwith "NYI: retry"
 
-let create stream_handler =
-  let cert = "./certificates/server.pem" in
-  let priv_key = "./certificates/server.key" in
+let create ~config stream_handler =
+  let { Config.certificates; alpn_protocols } = config in
   let rec handler t packet = packet_handler (Lazy.force t) packet
   and decrypt t ~header bs ~off ~len =
     let t : 'a t = Lazy.force t in
@@ -632,7 +631,7 @@ let create stream_handler =
     lazy
       { reader = Reader.packets ~decrypt:(decrypt t) (handler t)
       ; connections = Conntbl.create ~random:true 1024
-      ; base_tls_state = Qtls.server ~cert ~priv_key
+      ; base_tls_state = Qtls.server ~certificates ~alpn_protocols
       ; current_client_address = None
       ; wakeup_writer = Optional_thunk.none
       ; closed = false
@@ -682,33 +681,40 @@ module Streams = struct
   let flush t streams =
     let rec inner acc = function
       | Seq.Cons (stream, xs) ->
-        let _flushed = Stream.Send.flush stream.Stream.send in
-        if Stream.Send.has_pending_output stream.send then (
-          let encryption_level = Encryption_level.Application_data in
-          let { Crypto.encrypter; _ } =
-            Encryption_level.find_exn encryption_level t.encdec
-          in
-          let packet_number =
-            Packet_number.send_next
-              (Spaces.of_encryption_level
-                 t.packet_number_spaces
-                 encryption_level)
-          in
-          let header_info =
-            Writer.make_header_info
-              ~encrypter
-              ~packet_number
-              ~encryption_level
-              ~source_cid:t.source_cid
-              t.dest_cid
-          in
-          let fragment, is_fin = Stream.Send.pop_exn stream.send in
-          let frames = [ Frame.Stream { id = stream.id; fragment; is_fin } ] in
-          Writer.write_frames_packet t.writer ~header_info frames;
-          on_packet_sent t ~encryption_level ~packet_number frames;
-          Wrote_app_data)
-        else
-          inner acc (xs ())
+        (match stream.Stream.typ with
+        | Stream.Type.Server _ | Client Bidirectional ->
+          let _flushed = Stream.Send.flush stream.Stream.send in
+          if Stream.Send.has_pending_output stream.send then (
+            let encryption_level = Encryption_level.Application_data in
+            let { Crypto.encrypter; _ } =
+              Encryption_level.find_exn encryption_level t.encdec
+            in
+            let packet_number =
+              Packet_number.send_next
+                (Spaces.of_encryption_level
+                   t.packet_number_spaces
+                   encryption_level)
+            in
+            let header_info =
+              Writer.make_header_info
+                ~encrypter
+                ~packet_number
+                ~encryption_level
+                ~source_cid:t.source_cid
+                t.dest_cid
+            in
+            let fragment, is_fin = Stream.Send.pop_exn stream.send in
+            let frames =
+              [ Frame.Stream { id = stream.id; fragment; is_fin } ]
+            in
+            Writer.write_frames_packet t.writer ~header_info frames;
+            on_packet_sent t ~encryption_level ~packet_number frames;
+            Wrote_app_data)
+          else
+            inner acc (xs ())
+        | Client Unidirectional ->
+          (* Server can't send on unidirectional streams created by the client *)
+          inner acc (xs ()))
       | Nil ->
         acc
     in

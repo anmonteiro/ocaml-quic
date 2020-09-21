@@ -1,3 +1,5 @@
+open Test_helpers
+
 (* https://github.com/quicwg/base-drafts/wiki/QPACK-Offline-Interop *)
 
 let input_lines =
@@ -16,7 +18,7 @@ let read_entire_file f =
   close_in ch;
   ret
 
-let parse_file f : (string * string) list list =
+let parse_file f =
   let ch = open_in_bin f in
   let lines = input_lines ch in
   close_in ch;
@@ -31,7 +33,7 @@ let parse_file f : (string * string) list list =
           let hs = List.hd acc in
           match String.split_on_char '\t' line with
           | [ name; value ] ->
-            ((name, value) :: hs) :: List.tl acc
+            (header name value :: hs) :: List.tl acc
           | _ ->
             assert false)
       [ [] ]

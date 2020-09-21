@@ -133,7 +133,7 @@ module Instruction = struct
 
   (* Reads encoder instructions, returns the insert count increment for the
    * instruction processed *)
-  let parser t =
+  let parse_encoder_instruction t =
     let open Angstrom in
     peek_char_fail >>= fun c ->
     let b = Char.code c in
@@ -194,23 +194,21 @@ module Instruction = struct
           add_returning_insert_count_increment t name value)
         (any_uint8 >>= fun b -> Qint.decode b 5))
 
-  let parser t =
-    let f = Faraday.create 0x100 in
-    let p = Helpers.many1p ~f:( + ) ~init:0 (parser t) in
-    lift
-      (function
-        | Ok insert_count_increment ->
-          if insert_count_increment > 0 then
-            (* From RFC<QPACK-RFC>§4.4.3:
-             *   An encoder that receives an Increment field equal to zero, or
-             *   one that increases the Known Received Count beyond what the
-             *   encoder has sent MUST treat this as a connection error of type
-             *   QPACK_DECODER_STREAM_ERROR. *)
-            encode_insert_count_increment f insert_count_increment;
-          Ok (Faraday.serialize_to_string f)
-        | Error _ as e ->
-          e)
-      p
+  let parser t ~f faraday =
+    skip_many1
+      (parse_encoder_instruction t >>| function
+       | Ok insert_count_increment ->
+         if insert_count_increment > 0 then (
+           (* From RFC<QPACK-RFC>§4.4.3:
+            *   An encoder that receives an Increment field equal to zero, or
+            *   one that increases the Known Received Count beyond what the
+            *   encoder has sent MUST treat this as a connection error of type
+            *   QPACK_DECODER_STREAM_ERROR. *)
+           encode_insert_count_increment faraday insert_count_increment;
+           f ());
+         Ok ()
+       | Error _ as e ->
+         e)
 end
 
 let reconstruct_required_insert_count t ~encoded_insert_count =
@@ -268,7 +266,9 @@ let decode_header_block { table; _ } ~base =
      *   table. *)
     lift
       (* When T=1, the number represents the static table index; *)
-        (fun index -> Ok Static_table.table.(index))
+        (fun index ->
+        let name, value = Static_table.table.(index) in
+        Ok { name; value; sensitive = false })
       (any_uint8 >>= fun b -> Qint.decode b 6)
   else if b land 0b1000_0000 = 0b1000_0000 then
     lift
@@ -276,7 +276,8 @@ let decode_header_block { table; _ } ~base =
          table. *)
         (fun idx ->
         let index = absolute_of_relative ~base idx in
-        Ok (Dynamic_table.get table index))
+        let name, value = Dynamic_table.get table index in
+        Ok { name; value; sensitive = false })
       (any_uint8 >>= fun b -> Qint.decode b 6)
   else if b land 0b0100_0000 = 0b0100_0000 then
     (* From RFC<QPACK-RFC>§4.5.4:
@@ -294,7 +295,14 @@ let decode_header_block { table; _ } ~base =
           else
             Dynamic_table.get table (absolute_of_relative ~base index)
         in
-        Result.map (fun value -> name, value) value)
+        Result.map
+          (fun value ->
+            let header = { name; value; sensitive = false } in
+            { header with
+              sensitive =
+                is_static && Encoder.should_skip_indexing ~token:index header
+            })
+          value)
       (any_uint8 >>= fun b -> Qint.decode b 4)
       (Qstring.decode 8)
   else if b land 0b0010_0000 = 0b0010_0000 then
@@ -304,7 +312,7 @@ let decode_header_block { table; _ } ~base =
       (fun name value ->
         match name, value with
         | Ok name, Ok value ->
-          Ok (name, value)
+          Ok { name; value; sensitive = false }
         | (Error _ as e), _ | _, (Error _ as e) ->
           e)
       (Qstring.decode 4)
@@ -315,7 +323,8 @@ let decode_header_block { table; _ } ~base =
     lift
       (fun idx ->
         let index = absolute_of_post_base ~base idx in
-        Ok (Dynamic_table.get table index))
+        let name, value = Dynamic_table.get table index in
+        Ok { name; value; sensitive = false })
       (any_uint8 >>= fun b -> Qint.decode b 4)
   else (
     (* From RFC<QPACK-RFC>§4.5.5:
@@ -325,7 +334,7 @@ let decode_header_block { table; _ } ~base =
       (fun idx value ->
         let index = absolute_of_post_base ~base idx in
         let name, _ = Dynamic_table.get table index in
-        Result.map (fun value -> name, value) value)
+        Result.map (fun value -> { name; value; sensitive = false }) value)
       (any_uint8 >>= fun b -> Qint.decode b 3)
       (Qstring.decode 8))
 
@@ -374,7 +383,6 @@ module Buffered = struct
     ; mutable blocked_blocks : Q.t
     ; mutable blocked_streams : StreamIdSet.t
     ; max_blocked_streams : int
-    ; mutable instructions_parse_state : (string, error) result AB.state
     }
 
   let create ~max_size ~max_blocked_streams =
@@ -383,7 +391,6 @@ module Buffered = struct
     ; blocked_blocks = Q.empty
     ; blocked_streams = StreamIdSet.empty
     ; max_blocked_streams
-    ; instructions_parse_state = AB.parse (Instruction.parser decoder)
     }
 
   let rec process_blocked_streams t =
@@ -403,34 +410,12 @@ module Buffered = struct
     | None ->
       ()
 
-  let parse_instructions t fragment =
-    let process_result t state =
-      match state with
-      | AB.Done (unconsumed, result) ->
-        assert (unconsumed.len = 0);
-        t.instructions_parse_state <- AB.parse (Instruction.parser t.decoder);
-        (match result with
-        | Ok received_count_increment ->
-          process_blocked_streams t;
-          Ok (Some received_count_increment)
-        | Error _ as e ->
-          e)
-      | Partial _ ->
-        t.instructions_parse_state <- state;
-        Ok None
-      | Fail _ ->
-        t.instructions_parse_state <- AB.parse (Instruction.parser t.decoder);
-        Error QPACK_ENCODER_STREAM_ERROR
-    in
-    match t.instructions_parse_state with
-    | Done _ ->
-      assert false
-    | Partial k ->
-      process_result t (k fragment)
-    | Fail _ as state ->
-      process_result t state
+  let parse_instructions t f =
+    Instruction.parser t.decoder ~f:(fun () -> process_blocked_streams t) f
 
-  let parse_header_block t ~stream_id bs f =
+  let parser t ~stream_id = parser t.decoder ~stream_id
+
+  let decode_header_block t ~stream_id bs f =
     match
       Angstrom.parse_bigstring ~consume:Prefix (section_prefix t.decoder) bs
     with

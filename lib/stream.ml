@@ -311,18 +311,18 @@ end
 type t =
   { send : Send.t
   ; recv : Recv.t
-  ; direction : Direction.t
+  ; typ : Type.t
   ; id : int64
   }
 
-let create ~direction ~id when_ready =
-  { send = Send.create when_ready; recv = Recv.create (); direction; id }
+let create ~typ ~id when_ready =
+  { send = Send.create when_ready; recv = Recv.create (); typ; id }
 
 (* These are not consumed by the application, so the `recv` consumer starts out
  * closed. *)
 let create_crypto () =
   let recv = { (Recv.create ()) with consumer = Buffer.empty } in
-  { send = Send.create ignore; recv; direction = Bidirectional; id = -1L }
+  { send = Send.create ignore; recv; typ = Server Bidirectional; id = -1L }
 
 (* Public (application layer) API *)
 let write_uint8 t c = Buffer.write_uint8 t.send.producer c

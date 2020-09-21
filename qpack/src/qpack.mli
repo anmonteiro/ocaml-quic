@@ -40,6 +40,8 @@ type header =
   ; sensitive : bool
   }
 
+(* TODO: it might make sense to make these 2 separate types, since they occur in
+   different streams. *)
 type error =
   | QPACK_DECOMPRESSION_FAILED
   | QPACK_ENCODER_STREAM_ERROR
@@ -112,19 +114,21 @@ module Decoder : sig
   val parser
     :  t
     -> stream_id:int64
-    -> ((string * string) list * string, error) result Angstrom.t
+    -> (header list * string, error) result Angstrom.t
 
   module Buffered : sig
     type t
 
     val create : max_size:int -> max_blocked_streams:int -> t
 
-    val parse_instructions
-      :  t
-      -> [ `Bigstring of Bigstringaf.t | `Eof | `String of string ]
-      -> (string option, error) result
+    val parse_instructions : t -> Faraday.t -> unit Angstrom.t
 
-    val parse_header_block
+    val parser
+      :  t
+      -> stream_id:int64
+      -> (header list * string, error) result Angstrom.t
+
+    val decode_header_block
       :  t
       -> stream_id:int64
       -> Bigstringaf.t
