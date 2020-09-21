@@ -1,18 +1,13 @@
 open Lwt.Infix
-
-let stream_handler stream =
-  let rec on_read bs ~off ~len =
-    Format.eprintf "GOT DATA: %S@." (Bigstringaf.substring bs ~off ~len);
-    Quic.Stream.schedule_read stream ~on_read ~on_eof
-  and on_eof () =
-    Format.eprintf "Got EOF@.";
-    Quic.Stream.write_string stream "HTTP/0.9 200 OK\r\n";
-    Quic.Stream.close_writer stream
-  in
-  Quic.Stream.schedule_read stream ~on_read ~on_eof
+open H3
 
 let connection_handler =
-  let request_handler _reqd = Format.eprintf "got request@." in
+  let request_handler reqd =
+    let request = Reqd.request reqd in
+    Format.eprintf "Request: %a@." Request.pp_hum request;
+    let response = Response.create `OK in
+    Reqd.respond_with_string reqd response "hello"
+  in
   H3.Server_connection.create request_handler
 
 let () =

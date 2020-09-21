@@ -78,6 +78,10 @@ end
 module Stream : sig
   type t
 
+  val id : t -> Stream_id.t
+
+  val direction : t -> Direction.t
+
   val schedule_read
     :  t
     -> on_eof:(unit -> unit)
@@ -108,9 +112,11 @@ end
 module Server_connection : sig
   type 'a t
 
+  type start_stream = direction:Direction.t -> Stream.t
+
   val create
     :  config:Config.t
-    -> (Stream.t -> direction:Direction.t -> id:Stream_id.t -> unit)
+    -> (Stream.t -> start_stream:start_stream -> unit)
     -> _ t
 
   val next_read_operation : _ t -> [ `Read | `Yield | `Close ]

@@ -88,6 +88,8 @@ module Packet_number = struct
     Frame.Ack { delay = 0; ranges; ecn_counts = None }
 end
 
+type start_stream = direction:Direction.t -> Stream.t
+
 type 'a connection =
   { encdec : Crypto.encdec Encryption_level.t
   ; mutable tls_state : Qtls.t
@@ -107,8 +109,10 @@ type 'a connection =
   ; queued_packets : (Writer.header_info * Frame.t list) Queue.t
   ; writer : Writer.t
   ; streams : (Stream_id.t, Stream.t) Hashtbl.t
-  ; handler : Stream.t -> direction:Direction.t -> id:Stream_id.t -> unit
+  ; handler : Stream.t -> start_stream:start_stream -> unit
+  ; start_stream : start_stream
   ; wakeup_writer : unit -> unit
+  ; mutable next_unidirectional_stream_id : Stream_id.t
   }
 
 type 'a packet_info =
@@ -126,7 +130,7 @@ type 'a t =
   ; mutable current_client_address : 'a option
   ; mutable wakeup_writer : Optional_thunk.t
   ; mutable closed : bool
-  ; stream_handler : Stream.t -> direction:Direction.t -> id:Stream_id.t -> unit
+  ; stream_handler : Stream.t -> start_stream:start_stream -> unit
   }
 
 let wakeup_writer t =
@@ -380,6 +384,11 @@ let rec process_stream_data t ~stream =
   | None ->
     ()
 
+let create_stream (c : 'a connection) ~typ ~id =
+  let stream = Stream.create ~typ ~id c.wakeup_writer in
+  Hashtbl.add c.streams id stream;
+  stream
+
 let process_stream_frame c ~id ~fragment ~is_fin =
   let stream =
     match Hashtbl.find_opt c.streams id with
@@ -387,9 +396,8 @@ let process_stream_frame c ~id ~fragment ~is_fin =
       stream
     | None ->
       let direction = Direction.classify id in
-      let stream = Stream.create ~typ:(Client direction) ~id c.wakeup_writer in
-      Hashtbl.add c.streams id stream;
-      c.handler ~direction ~id stream;
+      let stream = create_stream c ~typ:(Client direction) ~id in
+      c.handler stream ~start_stream:c.start_stream;
       stream
   in
   Stream.Recv.push fragment ~is_fin stream.recv;
@@ -453,6 +461,13 @@ let frame_handler ~packet_info t frame =
          "frame NYI: 0x%x"
          (Frame.Type.serialize (Frame.to_frame_type frame)))
 
+let next_unidirectional_stream_id t ~direction =
+  let id =
+    Stream.Type.gen_id ~typ:(Server direction) t.next_unidirectional_stream_id
+  in
+  t.next_unidirectional_stream_id <- Int64.succ t.next_unidirectional_stream_id;
+  id
+
 let initialize_crypto_streams () =
   (* From RFC<QUIC-RFC>§19.6:
    *   The CRYPTO frame (type=0x06) is used to transmit cryptographic handshake
@@ -464,32 +479,42 @@ let initialize_crypto_streams () =
 
 let create_connection ~client_address ~tls_state ~wakeup_writer handler =
   let crypto_streams = initialize_crypto_streams () in
-  { encdec = Encryption_level.create ~current:Initial
-  ; packet_number_spaces =
-      Spaces.create
-        ~initial:(Packet_number.create ())
-        ~handshake:(Packet_number.create ())
-        ~application_data:(Packet_number.create ())
-  ; crypto_streams
-  ; tls_state
-  ; source_cid =
-      (let id =
-         (* needs to match CID.src_length. *)
-         Hex.to_string (`Hex "c3eaeabd54582a4ee2cb75bff63b8f0a874a51ad")
-       in
-       assert (String.length id = CID.src_length);
-       CID.of_string id)
-  ; original_dest_cid = CID.empty
-  ; dest_cid = CID.empty
-  ; client_address
-  ; client_transport_params = Transport_parameters.default
-  ; recovery = Recovery.create ()
-  ; queued_packets = Queue.create ()
-  ; writer = Writer.create 0x1000
-  ; streams = Hashtbl.create ~random:true 1024
-  ; handler
-  ; wakeup_writer
-  }
+  let rec t =
+    lazy
+      { encdec = Encryption_level.create ~current:Initial
+      ; packet_number_spaces =
+          Spaces.create
+            ~initial:(Packet_number.create ())
+            ~handshake:(Packet_number.create ())
+            ~application_data:(Packet_number.create ())
+      ; crypto_streams
+      ; tls_state
+      ; source_cid =
+          (let id =
+             (* needs to match CID.src_length. *)
+             Hex.to_string (`Hex "c3eaeabd54582a4ee2cb75bff63b8f0a874a51ad")
+           in
+           assert (String.length id = CID.src_length);
+           CID.of_string id)
+      ; original_dest_cid = CID.empty
+      ; dest_cid = CID.empty
+      ; client_address
+      ; client_transport_params = Transport_parameters.default
+      ; recovery = Recovery.create ()
+      ; queued_packets = Queue.create ()
+      ; writer = Writer.create 0x1000
+      ; streams = Hashtbl.create ~random:true 1024
+      ; handler
+      ; wakeup_writer
+      ; next_unidirectional_stream_id = 0L
+      ; start_stream =
+          (fun ~direction ->
+            let t = Lazy.force t in
+            let id = next_unidirectional_stream_id t ~direction in
+            create_stream t ~typ:(Server direction) ~id)
+      }
+  in
+  Lazy.force t
 
 let create_outgoing_frames ~current =
   let r = Encryption_level.create ~current in

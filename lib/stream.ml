@@ -44,6 +44,24 @@ module Type = struct
     else (
       assert (Stream_id.is_client_initiated t);
       Client direction)
+
+  (* From RFC<QUIC-RFC>§2.1:
+   *   Bits Stream Type
+   *   0x0  Client-Initiated, Bidirectional
+   *   0x1  Server-Initiated, Bidirectional
+   *   0x2  Client-Initiated, Unidirectional
+   *   0x3  Server-Initiated, Unidirectional *)
+  let serialize = function
+    | Client Bidirectional ->
+      0x0L
+    | Server Bidirectional ->
+      0x1L
+    | Client Unidirectional ->
+      0x2L
+    | Server Unidirectional ->
+      0x3L
+
+  let gen_id ~typ id = Int64.logor (Int64.shift_left id 2) (serialize typ)
 end
 
 module Buffer = struct
@@ -252,7 +270,7 @@ module Send = struct
           false
         | Some fin_offset ->
           assert (fin_offset = t.offset);
-          fin_offset = t.offset
+          Q.is_empty q'
       in
       Some (fragment, is_fin)
     | None ->
@@ -272,14 +290,19 @@ module Send = struct
   let create when_ready =
     { q = Q.empty
     ; offset = 0
-    ; producer = Buffer.create Bigstringaf.empty when_ready
+    ; producer =
+        (* TODO: configurable size? *)
+        Buffer.create (Bigstringaf.create 0x1000) when_ready
     ; fin_offset = None
     }
 
   let has_pending_output t =
     (* Force another write poll to make sure that a frame with the fin bit set
        is sent. *)
-    (not (Q.is_empty t.q)) || Option.is_none t.fin_offset
+    not (Q.is_empty t.q)
+
+  (* TODO: this is probably not needed? *)
+  (* || Option.is_none t.fin_offset *)
 
   let flush ?(max_bytes = Int.max_int) t =
     let faraday = t.producer.faraday in
@@ -323,6 +346,11 @@ let create ~typ ~id when_ready =
 let create_crypto () =
   let recv = { (Recv.create ()) with consumer = Buffer.empty } in
   { send = Send.create ignore; recv; typ = Server Bidirectional; id = -1L }
+
+let id { id; _ } = id
+
+let direction { typ; _ } =
+  match typ with Client direction | Server direction -> direction
 
 (* Public (application layer) API *)
 let write_uint8 t c = Buffer.write_uint8 t.send.producer c

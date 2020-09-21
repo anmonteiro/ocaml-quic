@@ -187,158 +187,65 @@ let unidirectional_stream_header =
     failwith "unknown"
 
 module Reader = struct
-  module AU = Angstrom.Unbuffered
-
-  type parse_context =
-    { mutable remaining_bytes_to_skip : int
-    ; mutable did_report_stream_error : bool
-    }
+  module AB = Angstrom.Buffered
 
   type parse_error =
-    (* Parse error reported by Angstrom *)
-    [ `Parse of string list * string
-    | (* Full error information *)
+    [ (* Full error information *)
       `Error of Error.t
     | `Error_code of Error.Code.t
     ]
 
-  type 'error parse_state =
-    | Initial
-    | Fail of 'error
-    | Partial of
-        (Bigstringaf.t
-         -> off:int
-         -> len:int
-         -> AU.more
-         -> (unit, 'error) result AU.state)
-
   type 'error t =
     { parser : (unit, 'error) result Angstrom.t
-    ; mutable parse_state : 'error parse_state
+    ; mutable parse_state : (unit, 'error) result AB.state
           (* The state of the parse for the current request *)
     ; mutable closed : bool
           (* Whether the input source has left the building, indicating that no
            * further input will be received. *)
-    ; parse_context : parse_context
-          (* The current stream identifier being processed, in order to discern
-           * whether the error that needs to be assembled is a stream or
-           * connection error. *)
     }
 
   type frame = parse_error t
 
-  let create parser parse_context =
-    { parser; parse_state = Initial; closed = false; parse_context }
+  let create parser = { parser; parse_state = AB.parse parser; closed = false }
 
-  let create_parse_context () =
-    { remaining_bytes_to_skip = 0; did_report_stream_error = false }
-
-  (* From RFC<HTTP3-RFC>§8.1:
-   *   After the QUIC connection is established, a SETTINGS frame (Section
-   *   7.2.4) MUST be sent by each endpoint as the initial frame of their
-   *   respective HTTP control stream; see Section 6.2.1. *)
-
-  let settings_preface _parse_context =
-    (* From RFC7540§3.5:
-     *   [...] the connection preface starts with the string
-     *   PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n). This sequence MUST be followed by
-     *   a SETTINGS frame (Section 6.5), which MAY be empty. *)
-    parse_frame >>= fun x ->
-    return (Ok x) >>| function
-    | Ok (Frame.Settings settings as frame) ->
-      Ok (frame, settings)
-    | Ok _ ->
-      (* From RFC7540§3.5:
-       *   Clients and servers MUST treat an invalid connection preface as a
-       *   connection error (Section 5.4.1) of type PROTOCOL_ERROR. A GOAWAY
-       *   frame (Section 6.8) MAY be omitted in this case, since an invalid
-       *   preface indicates that the peer is not using HTTP/2. *)
-      Error
-        (`Error
-          Error.(
-            ConnectionError
-              (Error.Code.Frame_unexpected, "Invalid connection preface")))
-    | Error e ->
-      Error (`Error e)
+  let ignored_stream = skip_many (any_char <* commit) >>| fun () -> Ok ()
 
   let http3_frames handler =
     skip_many (parse_frame <* commit >>| fun frame -> handler (Ok frame))
     >>| fun () -> Ok ()
 
   let unirectional_frames select_stream_parser =
-    let parse_context = create_parse_context () in
     let parser =
       unidirectional_stream_header <* commit >>= select_stream_parser
     in
-    create parser parse_context
+    create parser
 
   let bidirectional_frames frame_handler =
-    let parse_context = create_parse_context () in
     let parser = http3_frames frame_handler in
-    create parser parse_context
+    create parser
 
   let is_closed t = t.closed
 
-  let transition t state =
-    match state with
-    | AU.Done (consumed, Ok ()) ->
-      t.parse_state <- Initial;
-      consumed
-    | Done (consumed, Error error) ->
-      t.parse_state <- Fail error;
-      consumed
-    | Fail (consumed, marks, msg) ->
-      t.parse_state <- Fail (`Parse (marks, msg));
-      consumed
-    | Partial { committed; continue } ->
-      (* If we have bytes to skip over then it means we've spotted a
-       * FRAME_SIZE_ERROR, a case where, due to our unbuffered parsing, the
-       * payload length declared in a frame header is larger than the
-       * underlying buffer can fit. *)
-      if t.parse_context.remaining_bytes_to_skip > 0 then
-        t.parse_state <- Fail (`Error_code Error.Code.Frame_error)
-      else
-        t.parse_state <- Partial continue;
-      committed
-
-  let start t state =
-    match state with
-    | AU.Done _ ->
-      failwith "h2.Parse.Reader.unable to start parser"
-    | Fail (0, marks, msg) ->
-      t.parse_state <- Fail (`Parse (marks, msg))
-    | Partial { committed = 0; continue } ->
-      t.parse_state <- Partial continue
-    | Partial _ | Fail _ ->
+  let transition t bs =
+    match t.parse_state with
+    | AB.Done (_unconsumed, Ok ()) ->
       assert false
+    | Done (_unconsumed, Error _error) ->
+      (* t.parse_state <- Fail error; *)
+      assert false
+    | Fail (_unconsumed, _marks, _msg) ->
+      t.parse_state
+    | Partial continue ->
+      continue (`Bigstring bs)
 
-  let rec read_with_more t bs ~off ~len more =
-    let consumed =
-      match t.parse_state with
-      | Fail _ ->
-        let parser_ctx = t.parse_context in
-        let remaining_bytes = parser_ctx.remaining_bytes_to_skip in
-        (* Just skip input if we need to *)
-        if remaining_bytes > 0 then (
-          assert (remaining_bytes >= len);
-          let remaining_bytes' = remaining_bytes - len in
-          parser_ctx.remaining_bytes_to_skip <- remaining_bytes';
-          assert (remaining_bytes' >= 0);
-          if remaining_bytes' = 0 then
-            (* Reset the parser state to `Done` so that we can read the next
-             * frame (after skipping through the bad input) *)
-            t.parse_state <- Initial;
-          len)
-        else
-          0
-      | Initial ->
-        start t (AU.parse t.parser);
-        read_with_more t bs ~off ~len more
-      | Partial continue ->
-        transition t (continue bs more ~off ~len)
-    in
-    (match more with Complete -> t.closed <- true | Incomplete -> ());
-    consumed
+  let read_with_more t bs more =
+    t.parse_state <- transition t bs;
+    match more with
+    | Angstrom.Unbuffered.Complete ->
+      t.closed <- true;
+      t.parse_state <- AB.feed t.parse_state `Eof
+    | Incomplete ->
+      ()
 
   let force_close t = t.closed <- true
 
@@ -375,31 +282,31 @@ module Reader = struct
 
   let next t =
     match t.parse_state with
-    | Fail error ->
+    | Done (_, Error error) ->
       (match error with
       | `Error e ->
         `Error e
       | `Error_code _error_code ->
-        failwith "fix me"
-      | `Parse (marks, msg) ->
-        let _error_code =
-          match marks, msg with
-          | [ "frame_payload" ], "not enough input" ->
-            (* From RFC7540§4.2:
-             *   An endpoint MUST send an error code of FRAME_SIZE_ERROR if a
-             *   frame exceeds the size defined in SETTINGS_MAX_FRAME_SIZE,
-             *   exceeds any limit defined for the frame type, or is too small
-             *   to contain mandatory frame data. *)
-            Error.Code.Frame_error
-          | _ ->
-            Error.Code.General_protocol_error
-        in
         failwith "fix me")
+    | Fail (_, marks, msg) ->
+      let _error_code =
+        match marks, msg with
+        | [ "frame_payload" ], "not enough input" ->
+          (* From RFC7540§4.2:
+           *   An endpoint MUST send an error code of FRAME_SIZE_ERROR if a
+           *   frame exceeds the size defined in SETTINGS_MAX_FRAME_SIZE,
+           *   exceeds any limit defined for the frame type, or is too small
+           *   to contain mandatory frame data. *)
+          Error.Code.Frame_error
+        | _ ->
+          Error.Code.General_protocol_error
+      in
+      failwith "fix me"
     | _ when t.closed ->
       `Close
     | Partial _ ->
       `Read
-    | Initial ->
+    | Done _ ->
       if t.closed then
         `Close
       else

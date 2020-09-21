@@ -33,8 +33,8 @@
 module Reader = Parse.Reader
 module Stream = Quic.Stream
 module Qdecoder = Qpack.Decoder.Buffered
+module Writer = Serialize.Writer
 
-(* module Writer = Serialize.Writer *)
 type request_handler = Reqd.t -> unit
 
 type error =
@@ -47,15 +47,14 @@ type error_handler =
   ?request:Request.t -> error -> (Headers.t -> [ `write ] Body.t) -> unit
 
 type stream =
-  { reader : Reader.frame
-  ; stream : Stream.t
-  ; id : Quic.Stream_id.t
+  { stream : Stream.t
   ; direction : Quic.Direction.t
   ; mutable reqd : Reqd.t option
+  ; writer : Writer.t
   }
 
 type critical_streams =
-  { mutable control : Stream.t option
+  { mutable control : stream option
   ; mutable qencoder : Stream.t option
   ; mutable qdecoder : Stream.t option
   }
@@ -85,7 +84,8 @@ let default_error_handler ?request:_ error handle =
   Body.write_string body message;
   Body.close_writer body
 
-let handle_headers t ~stream_id stream headers =
+let handle_headers t { stream; writer; _ } headers =
+  let stream_id = Stream.id stream in
   match Headers.method_path_and_scheme_or_malformed headers with
   | `Malformed ->
     Format.eprintf "wat: %a@." Headers.pp_hum headers;
@@ -108,10 +108,12 @@ let handle_headers t ~stream_id stream headers =
           request
           request_body
           stream
+          writer
       in
       t.request_handler reqd
 
-let process_headers_frame t ~stream_id stream headers_block =
+let process_headers_frame t stream headers_block =
+  let stream_id = Stream.id stream.stream in
   let f bs =
     match
       Angstrom.parse_bigstring
@@ -120,7 +122,7 @@ let process_headers_frame t ~stream_id stream headers_block =
         bs
     with
     | Ok (Ok (headers, _instructions)) ->
-      handle_headers t ~stream_id stream (Headers.of_qpack_list headers)
+      handle_headers t stream (Headers.of_qpack_list headers)
     | Ok (Error _) | Error _ ->
       assert false
   in
@@ -136,18 +138,19 @@ let process_settings_frame _t _settings_list = failwith "NYI: settings"
 
 let process_goaway_frame _t _id = failwith "NYI: goaway"
 
-let read _t stream bs ~off ~len =
-  Format.eprintf "LEN: %d@." len;
-  let read = Reader.read_with_more stream.reader bs ~off ~len Incomplete in
-  assert (read > 0)
+(* TODO: need to schedule read again. *)
+let read _t _stream ~reader bs ~off ~len:_ =
+  assert (off = 0);
+  Reader.read_with_more reader bs Incomplete
 
-let read_eof _t stream () =
-  let read =
-    Reader.read_with_more stream.reader Bigstringaf.empty ~off:0 ~len:0 Complete
-  in
-  assert (read = 0)
+let read_eof _t _stream ~reader () =
+  Reader.read_with_more reader Bigstringaf.empty Complete
 
-let frame_handler t stream ~id r =
+(* From RFC<HTTP3-RFC>§8.1:
+ *   After the QUIC connection is established, a SETTINGS frame (Section
+ *   7.2.4) MUST be sent by each endpoint as the initial frame of their
+ *   respective HTTP control stream; see Section 6.2.1. *)
+let frame_handler t (stream : stream) r =
   match r with
   | Error _e ->
     (* report_error t e *)
@@ -155,7 +158,7 @@ let frame_handler t stream ~id r =
   | Ok frame ->
     match frame with
     | Frame.Headers header_block ->
-      process_headers_frame t ~stream_id:id stream header_block
+      process_headers_frame t stream header_block
     | Data bs ->
       process_data_frame t bs
     | Settings settings ->
@@ -171,29 +174,52 @@ let frame_handler t stream ~id r =
     | Ignored _ | Unknown _ ->
       ()
 
-let unistream_frame_handler t ~id stream unitype =
+let start_unidirectional_stream ~start_stream unitype =
+  let stream = start_stream ~direction:Quic.Direction.Unidirectional in
+  Writer.write_unidirectional_stream_type stream unitype;
+  stream
+
+let unistream_frame_handler t ~start_stream (stream : stream) unitype =
+  (* TODO: check that these are only called once. The client shouldn't open more
+     than one of these streams. *)
   let open Angstrom in
-  Format.eprintf "GOT: %d@." (Unidirectional_stream.serialize unitype);
   match unitype with
   | Unidirectional_stream.Qencoder ->
+    t.critical_streams.qencoder <-
+      Some (start_unidirectional_stream ~start_stream unitype);
     skip_many (Qpack.Encoder.Instruction.parser t.qpack_encoder) >>| fun () ->
     Ok ()
   | Qdecoder ->
-    let tmpf = Faraday.create 0x10 in
-    Qdecoder.parse_instructions t.qpack_decoder tmpf >>| fun () -> Ok ()
+    let stream = start_unidirectional_stream ~start_stream unitype in
+    t.critical_streams.qdecoder <- Some stream;
+    let f = Stream.unsafe_faraday stream in
+    Qdecoder.parse_instructions t.qpack_decoder f >>| fun () -> Ok ()
   | Control ->
-    (* TODO: write settings frame, start a new unidirectional stream and
-     * encoder streams. *)
-    Reader.http3_frames (frame_handler t stream ~id)
+    let quic_stream = start_unidirectional_stream ~start_stream unitype in
+    let control_stream =
+      { stream = quic_stream
+      ; reqd = None
+      ; direction = Unidirectional
+      ; writer = Writer.create quic_stream
+      }
+    in
+    t.critical_streams.control <- Some control_stream;
+    (* From RFC<HTTP3-RFC>§6.2.1:
+     *   Each side MUST initiate a single control stream at the beginning of
+     *   the connection and send its SETTINGS frame as the first frame on this
+     *   stream. *)
+    Writer.write_settings control_stream.writer Settings.default;
+    Reader.http3_frames (frame_handler t stream)
   | Push _ ->
-    Reader.http3_frames (frame_handler t stream ~id)
+    (* Client shouldn't send push frames. *)
+    assert false
   | Ignored _ ->
     (* From RFC<HTTP3-RFC>§8.1:
      *   Stream types of the format 0x1f * N + 0x21 for non-negative integer
      *   values of N are reserved to exercise the requirement that unknown
      *   types be ignored. These streams have no semantics, and can be sent
      *   when application-layer padding is desired. *)
-    Reader.http3_frames ignore
+    Reader.ignored_stream
 
 (* ?(config = Config.default) *)
 let create ?(error_handler = default_error_handler) request_handler =
@@ -209,25 +235,31 @@ let create ?(error_handler = default_error_handler) request_handler =
     ; critical_streams = { control = None; qencoder = None; qdecoder = None }
     }
   in
-  fun stream ~direction ~id ->
+  fun quic_stream ~start_stream ->
+    let id = Stream.id quic_stream in
+    let direction = Stream.direction quic_stream in
     let stream =
       match Hashtbl.find_opt t.streams id with
       | Some _stream ->
         assert false
       | None ->
-        let reader =
-          match direction with
-          | Quic.Direction.Unidirectional ->
-            Format.eprintf "uni: %Ld@." id;
-            Reader.unirectional_frames (unistream_frame_handler t ~id stream)
-          | Bidirectional ->
-            Format.eprintf "bidi: %Ld@." id;
-            Reader.bidirectional_frames (frame_handler t ~id stream)
-        in
-        { stream; reader; direction; id; reqd = None }
+        { stream = quic_stream
+        ; direction
+        ; reqd = None
+        ; writer = Writer.create quic_stream
+        }
+    in
+    let reader =
+      match direction with
+      | Quic.Direction.Unidirectional ->
+        Reader.unirectional_frames
+          (unistream_frame_handler t ~start_stream stream)
+      | Bidirectional ->
+        Format.eprintf "bidi: %Ld@." id;
+        Reader.bidirectional_frames (frame_handler t stream)
     in
     Stream.schedule_read
       stream.stream
-      ~on_eof:(read_eof t stream)
-      ~on_read:(read t stream);
+      ~on_eof:(read_eof t stream ~reader)
+      ~on_read:(read t stream ~reader);
     Hashtbl.add t.streams id stream

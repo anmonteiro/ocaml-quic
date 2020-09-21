@@ -1,6 +1,6 @@
 open Lwt.Infix
 
-let stream_handler stream ~direction:_ ~id:_ =
+let stream_handler stream ~start_stream:_ =
   let rec on_read bs ~off ~len =
     Format.eprintf "GOT DATA: %S@." (Bigstringaf.substring bs ~off ~len);
     Quic.Stream.schedule_read stream ~on_read ~on_eof

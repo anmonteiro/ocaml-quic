@@ -69,6 +69,7 @@ let write_variable_length_integer t n =
   List.iter (fun n -> Quic.Stream.write_uint8 t n) tl
 
 let write_data_frame t data =
+  write_variable_length_integer t (Frame.Type.serialize Data);
   write_variable_length_integer t (String.length data);
   Quic.Stream.write_string t data
 
@@ -76,14 +77,17 @@ let schedule_data_frame t ?off ?len data =
   let len =
     match len with None -> Bigstringaf.length data | Some len -> len
   in
+  write_variable_length_integer t (Frame.Type.serialize Data);
   write_variable_length_integer t len;
   Quic.Stream.schedule_bigstring t ?off ~len data
 
 let schedule_headers_frame t header_block =
+  write_variable_length_integer t (Frame.Type.serialize Headers);
   write_variable_length_integer t (Bigstringaf.length header_block);
   Quic.Stream.schedule_bigstring t header_block
 
 let write_cancel_push_frame t id =
+  write_variable_length_integer t (Frame.Type.serialize Cancel_push);
   write_variable_length_integer t (varint_encoding_length id);
   write_variable_length_integer t id
 
@@ -107,6 +111,7 @@ let write_settings_frame t { Settings.max_field_section_size } =
       0
       settings
   in
+  write_variable_length_integer t (Frame.Type.serialize Settings);
   write_variable_length_integer t length;
   List.iter
     (fun (k, v) ->
@@ -118,23 +123,36 @@ let write_push_promise_frame t ~push_id header_block =
   let length =
     varint_encoding_length push_id + Bigstringaf.length header_block
   in
+  write_variable_length_integer t (Frame.Type.serialize Push_promise);
   write_variable_length_integer t length;
   write_variable_length_integer t push_id;
   Quic.Stream.schedule_bigstring t header_block
 
 let write_goaway_frame t id =
+  write_variable_length_integer t (Frame.Type.serialize GoAway);
   write_variable_length_integer t (varint_encoding_length id);
   write_variable_length_integer t id
 
 let write_max_push_id_frame t id =
+  write_variable_length_integer t (Frame.Type.serialize Max_push_id);
   write_variable_length_integer t (varint_encoding_length id);
   write_variable_length_integer t id
 
 module Writer = struct
+  type t =
+    { stream : Quic.Stream.t
+    ; headers_block_buffer : Bigstringaf.t
+    }
+
+  let create stream =
+    { stream; headers_block_buffer = Bigstringaf.create 0x1000 }
+
   let encode_headers t qencoder ~encoder_stream ~stream_id headers =
-    let f = Quic.Stream.unsafe_faraday t in
+    let f = Faraday.of_bigstring t.headers_block_buffer in
     let encoder_buffer = Quic.Stream.unsafe_faraday encoder_stream in
-    Qpack.Encoder.encode_headers qencoder ~stream_id ~encoder_buffer f headers
+    Qpack.Encoder.encode_headers qencoder ~stream_id ~encoder_buffer f headers;
+    let bs = Faraday.serialize_to_bigstring f in
+    schedule_headers_frame t.stream bs
 
   let write_request_like_frame t ~stream_id ~encoder_stream qencoder request =
     let { Request.meth; target; scheme; headers } = request in
@@ -169,7 +187,13 @@ module Writer = struct
     in
     encode_headers t qencoder ~encoder_stream ~stream_id headers
 
-  let write_data t s = write_data_frame t s
+  let write_data t s = write_data_frame t.stream s
 
-  let schedule_data t ?off ?len s = schedule_data_frame ?off ?len t s
+  let schedule_data t ?off ?len s = schedule_data_frame ?off ?len t.stream s
+
+  let write_settings t settings = write_settings_frame t.stream settings
+
+  let write_unidirectional_stream_type t typ =
+    let typ = Unidirectional_stream.serialize typ in
+    write_variable_length_integer t typ
 end

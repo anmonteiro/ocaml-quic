@@ -52,7 +52,8 @@ type t =
   { id : Quic.Stream_id.t
   ; request : Request.t
   ; request_body : [ `read ] Body.t
-  ; writer : Quic.Stream.t
+  ; stream : Quic.Stream.t
+  ; writer : Writer.t
   ; encoder : Qpack.Encoder.t
   ; encoder_stream : Quic.Stream.t
   ; error_handler : error_handler
@@ -67,6 +68,7 @@ let create
     ~encoder_stream
     request
     request_body
+    stream
     writer
   =
   { id = stream_id
@@ -74,6 +76,7 @@ let create
   ; request_body
   ; encoder
   ; encoder_stream
+  ; stream
   ; writer
   ; error_handler
   ; response_state = Waiting
@@ -121,12 +124,13 @@ let unsafe_respond_with_data t response data =
       ~encoder_stream:t.encoder_stream
       ~stream_id:t.id
       response;
+    if length > 0 then
+      write_buffer_data t.writer iovec;
     (* From RFC<HTTP3-RFC>§4.1:
      *   An HTTP request/response exchange fully consumes a client-initiated
      *   bidirectional QUIC stream. [...] After sending a final response, the
      *   server MUST close the stream for sending. *)
-    if length > 0 then
-      write_buffer_data t.writer iovec;
+    Quic.Stream.close_writer t.stream;
     t.response_state <- Complete response
   | Streaming _ ->
     failwith "h3.Reqd.respond_with_*: response already started"
@@ -148,7 +152,7 @@ let respond_with_bigstring t response bstr =
 let unsafe_respond_with_streaming ~flush_headers_immediately:_ t response =
   match t.response_state with
   | Waiting ->
-    let response_body = Body.create t.writer in
+    let response_body = Body.create t.stream in
     Writer.write_response_headers
       t.writer
       t.encoder

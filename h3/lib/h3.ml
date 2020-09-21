@@ -30,4 +30,9 @@
  *  POSSIBILITY OF SUCH DAMAGE.
  *---------------------------------------------------------------------------*)
 
+module Headers = Headers
+module Status = Status
+module Request = Request
+module Response = Response
+module Reqd = Reqd
 module Server_connection = Server_connection

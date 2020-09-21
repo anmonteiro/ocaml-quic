@@ -36,6 +36,8 @@ module Server : sig
   val establish_server
     :  config:Quic.Config.t
     -> Unix.sockaddr
-    -> (Quic.Stream.t -> direction:Quic.Direction.t -> id:int64 -> unit)
+    -> (Quic.Stream.t
+        -> start_stream:Quic.Server_connection.start_stream
+        -> unit)
     -> unit Lwt.t
 end
