@@ -1,4 +1,4 @@
-(executable
+(executables
  (modes byte exe)
- (name lwt_echo_server)
- (libraries quic-lwt mirage-crypto-rng.unix))
+ (names lwt_http1_echo_server lwt_h3_echo_server)
+ (libraries h3 quic-lwt mirage-crypto-rng.unix))
