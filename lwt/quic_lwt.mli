@@ -30,14 +30,17 @@
  *  POSSIBILITY OF SUCH DAMAGE.
  *---------------------------------------------------------------------------*)
 
+open Quic
+
 module Server : sig
   (* XXX: Alternative: ~conn_handler:(conn -> stream_handler) called for each
    * connection. *)
   val establish_server
-    :  config:Quic.Config.t
+    :  config:Config.t
     -> Unix.sockaddr
-    -> (Quic.Stream.t
-        -> start_stream:Quic.Server_connection.start_stream
-        -> unit)
+    -> (cid:(* Unix.sockaddr -> *)
+            string
+        -> start_stream:Server_connection.start_stream
+        -> Server_connection.stream_handler)
     -> unit Lwt.t
 end

@@ -88,6 +88,8 @@ module Packet_number = struct
     Frame.Ack { delay = 0; ranges; ecn_counts = None }
 end
 
+type stream_handler = Stream.t -> unit
+
 type start_stream = direction:Direction.t -> Stream.t
 
 type 'a connection =
@@ -109,7 +111,7 @@ type 'a connection =
   ; queued_packets : (Writer.header_info * Frame.t list) Queue.t
   ; writer : Writer.t
   ; streams : (Stream_id.t, Stream.t) Hashtbl.t
-  ; handler : Stream.t -> start_stream:start_stream -> unit
+  ; handler : Stream.t -> unit
   ; start_stream : start_stream
   ; wakeup_writer : unit -> unit
   ; mutable next_unidirectional_stream_id : Stream_id.t
@@ -130,7 +132,7 @@ type 'a t =
   ; mutable current_client_address : 'a option
   ; mutable wakeup_writer : Optional_thunk.t
   ; mutable closed : bool
-  ; stream_handler : Stream.t -> start_stream:start_stream -> unit
+  ; handler : cid:string -> start_stream:start_stream -> stream_handler
   }
 
 let wakeup_writer t =
@@ -397,7 +399,7 @@ let process_stream_frame c ~id ~fragment ~is_fin =
     | None ->
       let direction = Direction.classify id in
       let stream = create_stream c ~typ:(Client direction) ~id in
-      c.handler stream ~start_stream:c.start_stream;
+      c.handler stream;
       stream
   in
   Stream.Recv.push fragment ~is_fin stream.recv;
@@ -477,8 +479,18 @@ let initialize_crypto_streams () =
     ~handshake:(Stream.create_crypto ())
     ~application_data:(Stream.create_crypto ())
 
-let create_connection ~client_address ~tls_state ~wakeup_writer handler =
+let create_connection
+    ~client_address ~tls_state ~wakeup_writer connection_handler
+  =
   let crypto_streams = initialize_crypto_streams () in
+  let source_cid =
+    let id =
+      (* needs to match CID.src_length. *)
+      Hex.to_string (`Hex "c3eaeabd54582a4ee2cb75bff63b8f0a874a51ad")
+    in
+    assert (String.length id = CID.src_length);
+    id
+  in
   let rec t =
     lazy
       { encdec = Encryption_level.create ~current:Initial
@@ -489,13 +501,7 @@ let create_connection ~client_address ~tls_state ~wakeup_writer handler =
             ~application_data:(Packet_number.create ())
       ; crypto_streams
       ; tls_state
-      ; source_cid =
-          (let id =
-             (* needs to match CID.src_length. *)
-             Hex.to_string (`Hex "c3eaeabd54582a4ee2cb75bff63b8f0a874a51ad")
-           in
-           assert (String.length id = CID.src_length);
-           CID.of_string id)
+      ; source_cid = CID.of_string source_cid
       ; original_dest_cid = CID.empty
       ; dest_cid = CID.empty
       ; client_address
@@ -504,15 +510,15 @@ let create_connection ~client_address ~tls_state ~wakeup_writer handler =
       ; queued_packets = Queue.create ()
       ; writer = Writer.create 0x1000
       ; streams = Hashtbl.create ~random:true 1024
-      ; handler
+      ; handler = connection_handler ~cid:source_cid ~start_stream
       ; wakeup_writer
       ; next_unidirectional_stream_id = 0L
-      ; start_stream =
-          (fun ~direction ->
-            let t = Lazy.force t in
-            let id = next_unidirectional_stream_id t ~direction in
-            create_stream t ~typ:(Server direction) ~id)
+      ; start_stream
       }
+  and start_stream ~direction =
+    let t = Lazy.force t in
+    let id = next_unidirectional_stream_id t ~direction in
+    create_stream t ~typ:(Server direction) ~id
   in
   Lazy.force t
 
@@ -539,7 +545,7 @@ let packet_handler t packet =
             ~client_address:(Option.get t.current_client_address)
             ~tls_state:t.base_tls_state
             ~wakeup_writer:(ready_to_write t)
-            t.stream_handler
+            t.handler
         in
         let encdec =
           { Crypto.encrypter =
@@ -627,7 +633,7 @@ let packet_handler t packet =
   | Retry _ ->
     failwith "NYI: retry"
 
-let create ~config stream_handler =
+let create ~config connection_handler =
   let { Config.certificates; alpn_protocols } = config in
   let rec handler t packet = packet_handler (Lazy.force t) packet
   and decrypt t ~header bs ~off ~len =
@@ -660,7 +666,7 @@ let create ~config stream_handler =
       ; current_client_address = None
       ; wakeup_writer = Optional_thunk.none
       ; closed = false
-      ; stream_handler
+      ; handler = connection_handler
       }
   in
   Lazy.force t

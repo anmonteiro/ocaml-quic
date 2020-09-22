@@ -30,9 +30,11 @@
  *  POSSIBILITY OF SUCH DAMAGE.
  *---------------------------------------------------------------------------*)
 
+module Method = Httpaf.Method
 module Headers = Headers
 module Status = Status
 module Request = Request
 module Response = Response
+module Body = Body
 module Reqd = Reqd
 module Server_connection = Server_connection

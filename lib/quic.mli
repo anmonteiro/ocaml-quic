@@ -114,9 +114,11 @@ module Server_connection : sig
 
   type start_stream = direction:Direction.t -> Stream.t
 
+  type stream_handler = Stream.t -> unit
+
   val create
     :  config:Config.t
-    -> (Stream.t -> start_stream:start_stream -> unit)
+    -> (cid:string -> start_stream:start_stream -> stream_handler)
     -> _ t
 
   val next_read_operation : _ t -> [ `Read | `Yield | `Close ]

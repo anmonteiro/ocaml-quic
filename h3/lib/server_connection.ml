@@ -222,7 +222,12 @@ let unistream_frame_handler t ~start_stream (stream : stream) unitype =
     Reader.ignored_stream
 
 (* ?(config = Config.default) *)
-let create ?(error_handler = default_error_handler) request_handler =
+let create
+    ?(error_handler = default_error_handler)
+    request_handler
+    ~cid:_
+    ~start_stream
+  =
   let settings = Settings.default in
   let t =
     { settings (* ; config *)
@@ -235,7 +240,7 @@ let create ?(error_handler = default_error_handler) request_handler =
     ; critical_streams = { control = None; qencoder = None; qdecoder = None }
     }
   in
-  fun quic_stream ~start_stream ->
+  fun quic_stream ->
     let id = Stream.id quic_stream in
     let direction = Stream.direction quic_stream in
     let stream =
