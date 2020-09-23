@@ -1,12 +1,24 @@
 open Lwt.Infix
 open H3
 
+let set_interval s f =
+  let timeout = Lwt_timeout.create s f in
+  Lwt_timeout.start timeout
+
 let connection_handler =
   let request_handler reqd =
     let request = Reqd.request reqd in
     Format.eprintf "Request: %a@." Request.pp_hum request;
     let response = Response.create `OK in
-    Reqd.respond_with_string reqd response "hello"
+    match request.Request.target with
+    | "/streaming" ->
+      let response_body = Reqd.respond_with_streaming reqd response in
+      Body.write_string response_body "hello, ";
+      set_interval 1 (fun () ->
+          Body.write_string response_body "world.";
+          Body.flush response_body (fun () -> Body.close_writer response_body))
+    | _ ->
+      Reqd.respond_with_string reqd response "hello"
   in
   H3.Server_connection.create request_handler
 

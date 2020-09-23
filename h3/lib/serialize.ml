@@ -68,17 +68,30 @@ let write_variable_length_integer t n =
   Quic.Stream.write_uint8 t ((encoding lsl 6) lor hd);
   List.iter (fun n -> Quic.Stream.write_uint8 t n) tl
 
-let write_data_frame t data =
+let write_data_frame_header t length =
   write_variable_length_integer t (Frame.Type.serialize Data);
-  write_variable_length_integer t (String.length data);
-  Quic.Stream.write_string t data
+  write_variable_length_integer t length
+
+let write_data_frame_char t c =
+  write_data_frame_header t 1;
+  Quic.Stream.write_char t c
+
+let write_data_frame t ?off ?len data =
+  let len = match len with None -> String.length data | Some len -> len in
+  write_data_frame_header t len;
+  Quic.Stream.write_string t ?off ~len data
+
+let write_data_frame_bigstring t ?off ?len data =
+  let len =
+    match len with None -> Bigstringaf.length data | Some len -> len
+  in
+  Quic.Stream.write_bigstring t ?off ~len data
 
 let schedule_data_frame t ?off ?len data =
   let len =
     match len with None -> Bigstringaf.length data | Some len -> len
   in
-  write_variable_length_integer t (Frame.Type.serialize Data);
-  write_variable_length_integer t len;
+  write_data_frame_header t len;
   Quic.Stream.schedule_bigstring t ?off ~len data
 
 let schedule_headers_frame t header_block =
@@ -187,7 +200,12 @@ module Writer = struct
     in
     encode_headers t qencoder ~encoder_stream ~stream_id headers
 
+  let write_data_char t c = write_data_frame_char t.stream c
+
   let write_data t s = write_data_frame t.stream s
+
+  let write_data_bigstring t ?off ?len b =
+    write_data_frame_bigstring ?off ?len t.stream b
 
   let schedule_data t ?off ?len s = schedule_data_frame ?off ?len t.stream s
 

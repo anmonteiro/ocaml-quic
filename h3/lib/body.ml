@@ -32,49 +32,27 @@
  *  POSSIBILITY OF SUCH DAMAGE.
  *---------------------------------------------------------------------------*)
 
-module Writer = Serialize.Writer
+type _ t = Quic.Stream.t
 
-type _ t =
-  { writer : Quic.Stream.t
-  ; mutable read_scheduled : bool
-  ; mutable write_final_data_frame : bool
-  ; mutable on_eof : unit -> unit
-  ; mutable on_read : Bigstringaf.t -> off:int -> len:int -> unit
-  ; buffered_bytes : int ref
-  }
+let create writer = writer
 
-let default_on_eof = Sys.opaque_identity (fun () -> ())
+let write_char = Serialize.write_data_frame_char
 
-let default_on_read = Sys.opaque_identity (fun _ ~off:_ ~len:_ -> ())
+let write_string = Serialize.write_data_frame
 
-let create writer =
-  { writer
-  ; read_scheduled = false
-  ; write_final_data_frame = true
-  ; on_eof = default_on_eof
-  ; on_read = default_on_read
-  ; buffered_bytes = ref 0
-  }
+let write_bigstring = Serialize.write_data_frame_bigstring
 
-let write_char t c = Quic.Stream.write_char t.writer c
+let schedule_bigstring = Serialize.schedule_data_frame
 
-let write_string t ?off ?len s = Quic.Stream.write_string t.writer ?off ?len s
+let flush t kontinue = Quic.Stream.flush t kontinue
 
-let write_bigstring t ?off ?len b =
-  Quic.Stream.write_bigstring ?off ?len t.writer b
+let is_closed t = Quic.Stream.is_closed t
 
-let schedule_bigstring t ?off ?len (b : Bigstringaf.t) =
-  Quic.Stream.schedule_bigstring ?off ?len t.writer b
+let close_writer t = Quic.Stream.close_writer t
 
-let flush t kontinue = Quic.Stream.flush t.writer kontinue
-
-let is_closed t = Quic.Stream.is_closed t.writer
-
-let close_writer t = Quic.Stream.close_writer t.writer
-
-let unsafe_faraday t = Quic.Stream.unsafe_faraday t.writer
+let unsafe_faraday t = Quic.Stream.unsafe_faraday t
 
 let schedule_read t ~on_eof ~on_read =
-  Quic.Stream.schedule_read t.writer ~on_eof ~on_read
+  Quic.Stream.schedule_read t ~on_eof ~on_read
 
-let close_reader t = Quic.Stream.close_reader t.writer
+let close_reader t = Quic.Stream.close_reader t
