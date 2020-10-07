@@ -479,15 +479,13 @@ let initialize_crypto_streams () =
     ~handshake:(Stream.create_crypto ())
     ~application_data:(Stream.create_crypto ())
 
+let random_bytes n = Mirage_crypto_rng.generate n |> Cstruct.to_string
 let create_connection
     ~client_address ~tls_state ~wakeup_writer connection_handler
   =
   let crypto_streams = initialize_crypto_streams () in
   let source_cid =
-    let id =
-      (* needs to match CID.src_length. *)
-      Hex.to_string (`Hex "c3eaeabd54582a4ee2cb75bff63b8f0a874a51ad")
-    in
+    let id = random_bytes 20 in
     assert (String.length id = CID.src_length);
     id
   in
