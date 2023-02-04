@@ -1,3 +1,6 @@
 [submodule "qpack/test/qifs"]
 	path = qpack/test/qifs
 	url = git@github.com:qpackers/qifs.git
+[submodule "vendor/ocaml-tls"]
+	path = vendor/ocaml-tls
+	url = git@github.com:anmonteiro/ocaml-tls.git
