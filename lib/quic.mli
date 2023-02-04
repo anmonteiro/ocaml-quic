@@ -45,13 +45,9 @@ module IOVec : sig
     }
 
   val length : _ t -> int
-
   val lengthv : _ t list -> int
-
   val shift : 'a t -> int -> 'a t
-
   val shiftv : 'a t list -> int -> 'a t list
-
   val pp_hum : Format.formatter -> _ t -> unit [@@ocaml.toplevel_printer]
 end
 
@@ -59,11 +55,8 @@ module Stream_id : sig
   type t = int64
 
   val is_bidi : t -> bool
-
   val is_uni : t -> bool
-
   val is_client_initiated : t -> bool
-
   val is_server_initiated : t -> bool
 end
 
@@ -79,7 +72,6 @@ module Stream : sig
   type t
 
   val id : t -> Stream_id.t
-
   val direction : t -> Direction.t
 
   val schedule_read
@@ -89,31 +81,20 @@ module Stream : sig
     -> unit
 
   val write_uint8 : t -> int -> unit
-
   val write_char : t -> char -> unit
-
   val write_string : t -> ?off:int -> ?len:int -> string -> unit
-
   val write_bigstring : t -> ?off:int -> ?len:int -> Bigstringaf.t -> unit
-
   val schedule_bigstring : t -> ?off:int -> ?len:int -> Bigstringaf.t -> unit
-
   val flush : t -> (unit -> unit) -> unit
-
   val close_reader : t -> unit
-
   val close_writer : t -> unit
-
   val is_closed : t -> bool
-
   val unsafe_faraday : t -> Faraday.t
 end
 
 module Server_connection : sig
   type 'a t
-
   type start_stream = direction:Direction.t -> Stream.t
-
   type stream_handler = Stream.t -> unit
 
   val create
@@ -132,7 +113,6 @@ module Server_connection : sig
     -> int
 
   val read_eof : _ t -> Bigstringaf.t -> off:int -> len:int -> int
-
   val yield_reader : _ t -> (unit -> unit) -> unit
 
   val next_write_operation
@@ -149,8 +129,7 @@ module Server_connection : sig
     -> unit
 
   val yield_writer : _ t -> (unit -> unit) -> unit
-
   val report_exn : _ t -> exn -> unit
-
   val is_closed : _ t -> bool
+  val shutdown : _ t -> unit
 end
