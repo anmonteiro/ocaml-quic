@@ -1,5 +1,4 @@
 open Tls
-open Utils
 open State
 
 type t = State.state =
@@ -9,7 +8,9 @@ type t = State.state =
   ; fragment : Cstruct.t
   }
 
-let ( <+> ) = Cs.( <+> )
+let (<+>) = Cstruct.append
+
+let ( let* ) = Result.bind
 
 module Alert = struct
   open Packet
@@ -22,17 +23,18 @@ module Alert = struct
     match Reader.parse_alert buf with
     | Ok (_, a_type) ->
       let err = match a_type with CLOSE_NOTIFY -> `Eof | _ -> `Alert a_type in
-      return (err, [ `Record close_notify ])
+      Ok (err, [ `Record close_notify ])
     | Error re ->
-      fail (`Fatal (`ReaderError re))
+      Error (`Fatal (`ReaderError re))
 end
 
 let rec separate_handshakes buf =
   match Reader.parse_handshake_frame buf with
   | None, rest ->
-    return ([], rest)
+    Ok ([], rest)
   | Some hs, rest ->
-    separate_handshakes rest >|= fun (rt, frag) -> hs :: rt, frag
+    let* rt, frag = separate_handshakes rest in
+    Ok (hs :: rt, frag)
 
 let handle_change_cipher_spec = function
   | Client cs ->
@@ -48,9 +50,9 @@ let handle_change_cipher_spec = function
   | Server13 AwaitClientHelloHRR13
   | Server13 (AwaitClientCertificate13 _)
   | Server13 (AwaitClientFinished13 _) ->
-    fun s _ -> return (s, [])
+    fun s _ -> Ok (s, [])
   | _ ->
-    fun _ _ -> fail (`Fatal `UnexpectedCCS)
+    fun _ _ -> Error (`Fatal `UnexpectedCCS)
 
 and handle_handshake ?embed_quic_transport_params = function
   | Client cs ->
@@ -63,15 +65,16 @@ and handle_handshake ?embed_quic_transport_params = function
     Handshake_server13.handle_handshake ?embed_quic_transport_params ss
 
 let handle_handshake_packet hs ?embed_quic_transport_params buf =
-  separate_handshakes (hs.hs_fragment <+> buf) >>= fun (hss, hs_fragment) ->
+  let* hss, hs_fragment = separate_handshakes (hs.hs_fragment <+> buf) in
   let hs = { hs with hs_fragment } in
-  foldM
-    (fun (hs, items) raw ->
-      handle_handshake ?embed_quic_transport_params hs.machina hs raw
-      >|= fun (hs', items') -> hs', items @ items')
-    (hs, [])
-    hss
-  >|= fun (hs, items) -> hs, items, `No_err
+  let* hs, items =
+    List.fold_left (fun acc raw ->
+        let* hs, items = acc in
+        let* hs', items' = handle_handshake ?embed_quic_transport_params hs.machina hs raw in
+        Ok (hs', items @ items'))
+      (Ok (hs, [])) hss
+    in
+  Ok (hs, items, `No_err)
 
 let early_data s =
   match s.machina with
@@ -87,7 +90,7 @@ let early_data s =
 let decrement_early_data hs ty buf =
   let bytes left cipher =
     let count =
-      Cstruct.len buf - fst (Ciphersuite.kn_13 (Ciphersuite.privprot13 cipher))
+      Cstruct.length buf - fst (Ciphersuite.kn_13 (Ciphersuite.privprot13 cipher))
     in
     let left' = Int32.sub left (Int32.of_int count) in
     if left' < 0l then Error (`Fatal `Toomany0rttbytes) else Ok left'
@@ -101,8 +104,8 @@ let decrement_early_data hs ty buf =
         `AES_128_GCM_SHA256
       (* TODO assert and ensure that all early_data states have a cipher *)
     in
-    bytes hs.early_data_left cipher >|= fun early_data_left ->
-    { hs with early_data_left }
+    let* early_data_left = bytes hs.early_data_left cipher in
+    Ok { hs with early_data_left }
   else
     Ok hs
 
@@ -132,6 +135,8 @@ let trace recs =
         trace_handshake ~s:"out" data)
     recs
 
+let guard p e = if p then Ok () else Error e
+
 let handle_raw_record ?embed_quic_transport_params state buf =
   (* trace_handshake buf; *)
   (* From RFC<QUIC-TLS-RFC>§4.1.3:
@@ -140,26 +145,27 @@ let handle_raw_record ?embed_quic_transport_params state buf =
   let hdr = { Core.content_type = Packet.HANDSHAKE; version = `TLS_1_2 } in
   let hs = state.handshake in
   let version = hs.protocol_version in
-  (match hs.machina, version with
-  | Client (AwaitServerHello _), _ ->
-    return ()
-  | Server AwaitClientHello, _ ->
-    return ()
-  | Server13 AwaitClientHelloHRR13, _ ->
-    return ()
-  | _, `TLS_1_3 ->
-    guard (hdr.version = `TLS_1_2) (`Fatal (`BadRecordVersion hdr.version))
-  | _, v ->
-    guard
-      (Core.version_eq hdr.version v)
-      (`Fatal (`BadRecordVersion hdr.version)))
-  >>= fun () ->
+  let* () = match hs.machina, version with
+    | Client (AwaitServerHello _), _ ->
+      Ok ()
+    | Server AwaitClientHello, _ ->
+      Ok ()
+    | Server13 AwaitClientHelloHRR13, _ ->
+      Ok ()
+    | _, `TLS_1_3 ->
+      guard (hdr.version = `TLS_1_2) (`Fatal (`BadRecordVersion hdr.version))
+    | _, v ->
+      guard
+        (Core.version_eq hdr.version v)
+        (`Fatal (`BadRecordVersion hdr.version))
+  in
   let ty = hdr.content_type in
-  decrement_early_data hs ty buf >>= fun handshake ->
-  handle_handshake_packet handshake ?embed_quic_transport_params buf
-  >|= fun (handshake, items, err) ->
+  let* handshake = decrement_early_data hs ty buf in
+  let* (handshake, items, err) =
+    handle_handshake_packet handshake ?embed_quic_transport_params buf
+  in
   (* trace items; *)
-  { state with handshake }, items, err
+  Ok ({ state with handshake }, items, err)
 
 (* From RFC<QUIC-TLS-RFC>§5.3:
  *   QUIC can use any of the ciphersuites defined in [TLS13] with the exception

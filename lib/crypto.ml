@@ -50,11 +50,11 @@ module Hkdf = struct
     and label =
       let lbl = Cstruct.of_string ("tls13 " ^ label) in
       let l = Cstruct.create 1 in
-      Cstruct.set_uint8 l 0 (Cstruct.len lbl);
+      Cstruct.set_uint8 l 0 (Cstruct.length lbl);
       Cstruct.append l lbl
     and context =
       let l = Cstruct.create 1 in
-      Cstruct.set_uint8 l 0 (Cstruct.len context);
+      Cstruct.set_uint8 l 0 (Cstruct.length context);
       Cstruct.append l context
     in
     let lbl = Cstruct.concat [ len; label; context ] in
@@ -253,7 +253,7 @@ module AEAD = struct
       Cstruct.get_uint8 header 0 lxor (Cstruct.get_uint8 mask 0 land masked_bits)
     in
     Cstruct.set_uint8 header 0 masked_header_first_byte;
-    let pn_offset = Cstruct.len header - pn_length in
+    let pn_offset = Cstruct.length header - pn_length in
     (* From RFC<QUIC-TLS-RFC>§5.4.1:
      *   [...] the packet number is masked with the remaining bytes. *)
     for i = 0 to pn_length - 1 do

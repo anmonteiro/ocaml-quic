@@ -507,7 +507,7 @@ module Writer = struct
        Frame.write_padding tmpf n_padding);
     let plaintext = Cstruct.of_bigarray (Faraday.serialize_to_bigstring tmpf) in
     (* AEAD ciphertext length is the same as the plaintext length (+ tag). *)
-    let payload_length = Cstruct.len plaintext + tag_len in
+    let payload_length = Cstruct.length plaintext + tag_len in
     let header = header_of_encryption_level header_info in
     let hf = Faraday.create 0x100 in
     Pkt.Header.write_packet_header hf ~pn_length ~header;

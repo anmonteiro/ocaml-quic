@@ -40,6 +40,7 @@ module Conntbl = Hashtbl.MakeSeeded (struct
   let equal = CID.equal
 
   let hash i k = Hashtbl.seeded_hash i k
+  let[@warning "-32"] seeded_hash = hash
 end)
 
 module Packet_number = struct

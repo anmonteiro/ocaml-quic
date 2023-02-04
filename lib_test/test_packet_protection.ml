@@ -311,7 +311,7 @@ module InitialAEAD_encryption = struct
     in
     let unprotected_header = Client_initial.unprotected_header in
     let sample = Cstruct.of_hex "655e5cd55c41f69080575d7999c25a5b" in
-    assert (Cstruct.len sample = 16);
+    assert (Cstruct.length sample = 16);
     let header =
       (* the first byte and the last 4 bytes should be encrypted *)
       AEAD.encrypt_header
@@ -357,10 +357,10 @@ module InitialAEAD_encryption = struct
       "last 4 bytes are modified (protected)"
       true
       (Cstruct.to_string
-         (Cstruct.sub header (Cstruct.len header - pn_length) pn_length)
+         (Cstruct.sub header (Cstruct.length header - pn_length) pn_length)
       <> String.sub
            unprotected_header
-           (Cstruct.len header - pn_length)
+           (Cstruct.length header - pn_length)
            pn_length);
     let decrypted_header =
       AEAD.decrypt_header client_encrypter ~sample header
@@ -394,10 +394,10 @@ module InitialAEAD_encryption = struct
       "last 4 bytes are modified (protected)"
       true
       (Cstruct.to_string
-         (Cstruct.sub header (Cstruct.len header - pn_length) pn_length)
+         (Cstruct.sub header (Cstruct.length header - pn_length) pn_length)
       <> String.sub
            unprotected_header
-           (Cstruct.len header - pn_length)
+           (Cstruct.length header - pn_length)
            pn_length);
     let decrypted_header =
       AEAD.decrypt_header server_encrypter ~sample header
@@ -582,7 +582,7 @@ module ChaCha20_encryption = struct
     in
     let unprotected_header = Client_initial.unprotected_header in
     let sample = Cstruct.of_hex "655e5cd55c41f69080575d7999c25a5b" in
-    assert (Cstruct.len sample = 16);
+    assert (Cstruct.length sample = 16);
     let header =
       (* the first byte and the last 4 bytes should be encrypted *)
       AEAD.encrypt_header
@@ -607,10 +607,10 @@ module ChaCha20_encryption = struct
       "last 4 bytes are modified (protected)"
       true
       (Cstruct.to_string
-         (Cstruct.sub header (Cstruct.len header - pn_length) pn_length)
+         (Cstruct.sub header (Cstruct.length header - pn_length) pn_length)
       <> String.sub
            unprotected_header
-           (Cstruct.len header - pn_length)
+           (Cstruct.length header - pn_length)
            pn_length);
     let decrypted_header =
       AEAD.decrypt_header client_encrypter ~sample header

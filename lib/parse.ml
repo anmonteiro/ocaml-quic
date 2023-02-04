@@ -535,7 +535,7 @@ module Packet = struct
               ; header = header_cs
               }
         } ->
-      advance (Cstruct.len header_cs) >>= fun () ->
+      advance (Cstruct.length header_cs) >>= fun () ->
       Payload.parser ~pn_length ~header ~packet_number ~payload_length plaintext
     | Unprotected ->
       (* From RFC<QUIC-TLS-RFC>§5.3:
