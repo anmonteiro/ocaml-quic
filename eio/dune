@@ -1,0 +1,4 @@
+(library
+ (name quic_eio)
+ (public_name quic-eio)
+ (libraries hex eio quic gluten-eio))

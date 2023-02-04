@@ -93,43 +93,38 @@ module Stream : sig
 end
 
 module Server_connection : sig
-  type 'a t
+  type t
   type start_stream = direction:Direction.t -> Stream.t
   type stream_handler = Stream.t -> unit
 
   val create
     :  config:Config.t
     -> (cid:string -> start_stream:start_stream -> stream_handler)
-    -> _ t
+    -> t
 
-  val next_read_operation : _ t -> [ `Read | `Yield | `Close ]
+  val next_read_operation : t -> [ `Read | `Yield | `Close ]
 
   val read
-    :  'a t
-    -> client_address:'a
+    :  t
+    -> client_address:string
     -> Bigstringaf.t
     -> off:int
     -> len:int
     -> int
 
-  val read_eof : _ t -> Bigstringaf.t -> off:int -> len:int -> int
-  val yield_reader : _ t -> (unit -> unit) -> unit
+  val read_eof : t -> Bigstringaf.t -> off:int -> len:int -> int
+  val yield_reader : t -> (unit -> unit) -> unit
 
   val next_write_operation
-    :  'a t
-    -> [ `Writev of Faraday.bigstring Faraday.iovec list * 'a * string
+    :  t
+    -> [ `Writev of Faraday.bigstring Faraday.iovec list * string * string
        | `Yield
        | `Close of int
        ]
 
-  val report_write_result
-    :  _ t
-    -> cid:string
-    -> [ `Ok of int | `Closed ]
-    -> unit
-
-  val yield_writer : _ t -> (unit -> unit) -> unit
-  val report_exn : _ t -> exn -> unit
-  val is_closed : _ t -> bool
-  val shutdown : _ t -> unit
+  val report_write_result : t -> cid:string -> [ `Ok of int | `Closed ] -> unit
+  val yield_writer : t -> (unit -> unit) -> unit
+  val report_exn : t -> exn -> unit
+  val is_closed : t -> bool
+  val shutdown : t -> unit
 end

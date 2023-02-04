@@ -38,7 +38,6 @@ module Conntbl = Hashtbl.MakeSeeded (struct
   type t = CID.t
 
   let equal = CID.equal
-
   let hash i k = Hashtbl.seeded_hash i k
   let[@warning "-32"] seeded_hash = hash
 end)
@@ -77,9 +76,10 @@ module Packet_number = struct
     List.fold_left
       (fun acc pn ->
         let cur_range = List.hd acc in
-        if Int64.compare (Int64.add cur_range.Frame.Range.last 1L) pn = 0 then
-          { cur_range with last = pn } :: List.tl acc
-        else (* start a new range, ther's a gap. *)
+        if Int64.compare (Int64.add cur_range.Frame.Range.last 1L) pn = 0
+        then { cur_range with last = pn } :: List.tl acc
+        else
+          (* start a new range, ther's a gap. *)
           { Frame.Range.first = pn; last = pn } :: acc)
       [ { Frame.Range.first; last = first } ]
       (List.tl packets)
@@ -90,10 +90,9 @@ module Packet_number = struct
 end
 
 type stream_handler = Stream.t -> unit
-
 type start_stream = direction:Direction.t -> Stream.t
 
-type 'a connection =
+type connection =
   { encdec : Crypto.encdec Encryption_level.t
   ; mutable tls_state : Qtls.t
   ; packet_number_spaces : Packet_number.t Spaces.t
@@ -106,7 +105,7 @@ type 'a connection =
      *   that each encryption level is treated as a separate CRYPTO stream of
      *   data. *)
     crypto_streams : Stream.t Spaces.t
-  ; mutable client_address : 'a
+  ; mutable client_address : string
   ; mutable client_transport_params : Transport_parameters.t
   ; recovery : Recovery.t
   ; queued_packets : (Writer.header_info * Frame.t list) Queue.t
@@ -118,19 +117,19 @@ type 'a connection =
   ; mutable next_unidirectional_stream_id : Stream_id.t
   }
 
-type 'a packet_info =
+type packet_info =
   { packet_number : int64
   ; header : Packet.Header.t
   ; outgoing_frames : Frame.t list Encryption_level.t
   ; encryption_level : Encryption_level.level
-  ; connection : 'a connection
+  ; connection : connection
   }
 
-type 'a t =
+type t =
   { reader : Reader.server
-  ; connections : 'a connection Conntbl.t
+  ; connections : connection Conntbl.t
   ; base_tls_state : Qtls.t
-  ; mutable current_client_address : 'a option
+  ; mutable current_client_address : string option
   ; mutable wakeup_writer : Optional_thunk.t
   ; mutable closed : bool
   ; handler : cid:string -> start_stream:start_stream -> stream_handler
@@ -182,10 +181,9 @@ let send_packets t ~packet_info =
           Spaces.of_encryption_level c.packet_number_spaces encryption_level
         in
         let frames =
-          if pn_space.ack_elicited then
-            Packet_number.compose_ack_frame pn_space :: frames
-          else
-            frames
+          if pn_space.ack_elicited
+          then Packet_number.compose_ack_frame pn_space :: frames
+          else frames
         in
         (* TODO: bundle e.g. a PING frame with a packet that only contains ACK
            frames. *)
@@ -193,8 +191,7 @@ let send_packets t ~packet_info =
         | [] ->
           (* Don't send invalid (payload-less) frames *)
           ()
-        | frames ->
-          send_packet c ~encryption_level (List.rev frames)))
+        | frames -> send_packet c ~encryption_level (List.rev frames)))
     outgoing_frames;
   wakeup_writer t
 
@@ -234,8 +231,7 @@ let process_tls_result t ~packet_info ~new_tls_state ~tls_packets =
           t.encdec.current <- next;
           Encryption_level.update_current
             (function
-              | None ->
-                assert false
+              | None -> assert false
               | Some encdec ->
                 Some
                   { encdec with
@@ -267,9 +263,8 @@ let process_tls_result t ~packet_info ~new_tls_state ~tls_packets =
       outgoing_frames.current
       tls_packets
   in
-  if
-    Tls.Engine.handshake_in_progress t.tls_state
-    && not (Tls.Engine.handshake_in_progress new_tls_state)
+  if Tls.Engine.handshake_in_progress t.tls_state
+     && not (Tls.Engine.handshake_in_progress new_tls_state)
   then (
     (* send the HANDSHAKE_DONE frame if we just completed the handshake.
      *
@@ -325,7 +320,7 @@ let rec exhaust_crypto_stream t ~packet_info ~stream =
           (Format.asprintf "Crypto failure: %a@." Sexplib.Sexp.pp_hum sexp)
       | Ok (tls_state', tls_packets, (`Alert _ | `Eof | `No_err)) ->
         (* TODO: send alerts as quic error *)
-        match Qtls.transport_params tls_state' with
+        (match Qtls.transport_params tls_state' with
         | Some quic_transport_params ->
           (match
              Transport_parameters.decode_and_validate
@@ -341,11 +336,9 @@ let rec exhaust_crypto_stream t ~packet_info ~stream =
               ~tls_packets
           | Error _ ->
             failwith "TODO: send connection error of TRANSPORT_PARAMETER_ERROR")
-        | None ->
-          ())
+        | None -> ()))
     | Server13
-        ( AwaitClientCertificate13 _
-        | AwaitClientCertificateVerify13 _
+        ( AwaitClientCertificate13 _ | AwaitClientCertificateVerify13 _
         | AwaitClientFinished13 _ ) ->
       assert (encryption_level = Handshake);
       assert (t.encdec.current = Handshake);
@@ -357,15 +350,11 @@ let rec exhaust_crypto_stream t ~packet_info ~stream =
       | Ok (tls_state', tls_packets, (`Alert _ | `Eof | `No_err)) ->
         (* TODO: send alerts as quic error *)
         process_tls_result t ~packet_info ~new_tls_state:tls_state' ~tls_packets)
-    | Server13 Established13 ->
-      failwith "handle key updates here"
-    | Server Established ->
-      failwith "expected tls 1.3"
-    | Client _ | Client13 _ | Server _ | Server13 _ ->
-      assert false);
+    | Server13 Established13 -> failwith "handle key updates here"
+    | Server Established -> failwith "expected tls 1.3"
+    | Client _ | Client13 _ | Server _ | Server13 _ -> assert false);
     exhaust_crypto_stream t ~packet_info ~stream
-  | None ->
-    ()
+  | None -> ()
 
 let process_crypto_frame t ~packet_info fragment =
   let { encryption_level; _ } = packet_info in
@@ -384,10 +373,9 @@ let rec process_stream_data t ~stream =
     (* Stream.Buffer.schedule_bigstring stream.consumer buffer; *)
     (* Stream.Recv.flush_recv stream; *)
     process_stream_data t ~stream
-  | None ->
-    ()
+  | None -> ()
 
-let create_stream (c : 'a connection) ~typ ~id =
+let create_stream (c : connection) ~typ ~id =
   let stream = Stream.create ~typ ~id c.wakeup_writer in
   Hashtbl.add c.streams id stream;
   stream
@@ -395,8 +383,7 @@ let create_stream (c : 'a connection) ~typ ~id =
 let process_stream_frame c ~id ~fragment ~is_fin =
   let stream =
     match Hashtbl.find_opt c.streams id with
-    | Some stream ->
-      stream
+    | Some stream -> stream
     | None ->
       let direction = Direction.classify id in
       let stream = create_stream c ~typ:(Client direction) ~id in
@@ -408,7 +395,8 @@ let process_stream_frame c ~id ~fragment ~is_fin =
 
 let frame_handler ~packet_info t frame =
   (* TODO: validate that frame can appear at current encryption level. *)
-  if Frame.is_ack_eliciting frame then
+  if Frame.is_ack_eliciting frame
+  then
     (Spaces.of_encryption_level
        t.packet_number_spaces
        packet_info.encryption_level).ack_elicited <-
@@ -424,8 +412,7 @@ let frame_handler ~packet_info t frame =
      *   The receiver of a PING frame simply needs to acknowledge the packet
      *   containing this frame. *)
     ()
-  | Ack { ranges; _ } ->
-    process_ack_frame t ~packet_info ~ranges
+  | Ack { ranges; _ } -> process_ack_frame t ~packet_info ~ranges
   | Reset_stream _ ->
     failwith
       (Format.asprintf
@@ -436,8 +423,7 @@ let frame_handler ~packet_info t frame =
       (Format.asprintf
          "frame NYI: 0x%x"
          (Frame.Type.serialize (Frame.to_frame_type frame)))
-  | Crypto fragment ->
-    process_crypto_frame t ~packet_info fragment
+  | Crypto fragment -> process_crypto_frame t ~packet_info fragment
   | New_token _ ->
     failwith
       (Format.asprintf
@@ -445,20 +431,13 @@ let frame_handler ~packet_info t frame =
          (Frame.Type.serialize (Frame.to_frame_type frame)))
   | Stream { id; fragment; is_fin } ->
     process_stream_frame t ~id ~fragment ~is_fin
-  | Max_data _
-  | Max_stream_data _
+  | Max_data _ | Max_stream_data _
   | Max_streams (_, _)
-  | Data_blocked _
-  | Stream_data_blocked _
+  | Data_blocked _ | Stream_data_blocked _
   | Streams_blocked (_, _)
-  | New_connection_id _
-  | Retire_connection_id _
-  | Path_challenge _
-  | Path_response _
-  | Connection_close_quic _
-  | Connection_close_app _
-  | Handshake_done
-  | Unknown _ ->
+  | New_connection_id _ | Retire_connection_id _ | Path_challenge _
+  | Path_response _ | Connection_close_quic _ | Connection_close_app _
+  | Handshake_done | Unknown _ ->
     failwith
       (Format.asprintf
          "frame NYI: 0x%x"
@@ -481,7 +460,10 @@ let initialize_crypto_streams () =
     ~application_data:(Stream.create_crypto ())
 
 let create_connection
-    ~client_address ~tls_state ~wakeup_writer connection_handler
+    ~client_address
+    ~tls_state
+    ~wakeup_writer
+    connection_handler
   =
   let crypto_streams = initialize_crypto_streams () in
   let source_cid =
@@ -533,12 +515,10 @@ let packet_handler t packet =
   let connection_id = Packet.destination_cid packet in
   let c =
     match Conntbl.find_opt t.connections connection_id with
-    | Some c ->
-      c
+    | Some c -> c
     | None ->
-      match Conntbl.find_opt t.connections connection_id with
-      | Some connection ->
-        connection
+      (match Conntbl.find_opt t.connections connection_id with
+      | Some connection -> connection
       | None ->
         (* Has to be a new connection. TODO: assert that. *)
         let connection =
@@ -558,9 +538,10 @@ let packet_handler t packet =
         Encryption_level.add Initial encdec connection.encdec;
         assert (not (Conntbl.mem t.connections connection_id));
         Conntbl.add t.connections connection.source_cid connection;
-        connection
+        connection)
   in
-  if CID.is_empty c.original_dest_cid then
+  if CID.is_empty c.original_dest_cid
+  then
     (* From RFC<QUIC-RFC>§7.3:
         *   Each endpoint includes the value of the Source Connection ID field
      *   from the first Initial packet it sent in the
@@ -569,15 +550,15 @@ let packet_handler t packet =
      *   Initial packet it received from the client in the
      *   original_destination_connection_id transport parameter [...]. *)
     c.original_dest_cid <- Packet.destination_cid packet;
-  if CID.is_empty c.dest_cid then
+  if CID.is_empty c.dest_cid
+  then
     (* From RFC<QUIC-RFC>§19.6:
         *   Upon receiving a packet, each endpoint sets the Destination Connection
      *   ID it sends to match the value of the Source Connection ID that it
      *   receives. *)
     c.dest_cid <- Option.get (Packet.source_cid packet);
   match packet with
-  | Packet.VersionNegotiation _ ->
-    failwith "NYI: version negotiation"
+  | Packet.VersionNegotiation _ -> failwith "NYI: version negotiation"
   | Frames { header; payload; packet_number; _ } ->
     let packet_info =
       { header
@@ -609,14 +590,12 @@ let packet_handler t packet =
                 packet_info.encryption_level
             in
             Stream.Send.remove off crypto_stream.send
-          | Stream { id = _; fragment = _; _ } ->
-            ()
+          | Stream { id = _; fragment = _; _ } -> ()
           | Ack { ranges = _; _ } ->
             (* TODO: when we track packets that need acknowledgement, update the
                largest acknowledged here. *)
             ()
-          | _other ->
-            ())
+          | _other -> ())
         acked_frames;
       (* This packet has been processed, mark it for acknowledgement. *)
       let pn_space =
@@ -629,19 +608,18 @@ let packet_handler t packet =
       send_packets t ~packet_info;
       (* Reset for the next packet. *)
       pn_space.ack_elicited <- false
-    | Error e ->
-      failwith ("Err: " ^ e))
-  | Retry _ ->
-    failwith "NYI: retry"
+    | Error e -> failwith ("Err: " ^ e))
+  | Retry _ -> failwith "NYI: retry"
 
 let create ~config connection_handler =
   let { Config.certificates; alpn_protocols } = config in
   let rec handler t packet = packet_handler (Lazy.force t) packet
   and decrypt t ~header bs ~off ~len =
-    let t : 'a t = Lazy.force t in
+    let t : t = Lazy.force t in
     let cs = Cstruct.of_bigarray ~off ~len bs in
     let connection_id = Packet.Header.destination_cid header in
-    if CID.is_empty connection_id then
+    if CID.is_empty connection_id
+    then
       (* TODO: section 5.2 says we should keep track of connections *)
       failwith "NYI: empty CID"
     else
@@ -673,9 +651,7 @@ let create ~config connection_handler =
   Lazy.force t
 
 let shutdown t = t.closed <- true
-
 let is_closed _t = false
-
 let report_exn _t _exn = ()
 
 type flush_ret =
@@ -700,12 +676,8 @@ let _flush_pending_packets t =
       let can_be_followed_by_other_packets =
         encryption_level <> Application_data
       in
-      if can_be_followed_by_other_packets then
-        inner t Wrote
-      else
-        Wrote_app_data
-    | None ->
-      acc
+      if can_be_followed_by_other_packets then inner t Wrote else Wrote_app_data
+    | None -> acc
   in
   inner t Didnt_write
 
@@ -716,7 +688,8 @@ module Streams = struct
         (match stream.Stream.typ with
         | Stream.Type.Server _ | Client Bidirectional ->
           let _flushed = Stream.Send.flush stream.Stream.send in
-          if Stream.Send.has_pending_output stream.send then (
+          if Stream.Send.has_pending_output stream.send
+          then (
             let encryption_level = Encryption_level.Application_data in
             let { Crypto.encrypter; _ } =
               Encryption_level.find_exn encryption_level t.encdec
@@ -742,13 +715,12 @@ module Streams = struct
             Writer.write_frames_packet t.writer ~header_info frames;
             on_packet_sent t ~encryption_level ~packet_number frames;
             Wrote_app_data)
-          else
-            inner acc (xs ())
+          else inner acc (xs ())
         | Client Unidirectional ->
-          (* Server can't send on unidirectional streams created by the client *)
+          (* Server can't send on unidirectional streams created by the
+             client *)
           inner acc (xs ()))
-      | Nil ->
-        acc
+      | Nil -> acc
     in
     inner Didnt_write (Hashtbl.to_seq_values streams ())
 end
@@ -765,43 +737,37 @@ let flush_pending_packets t =
         (match Streams.flush connection connection.streams with
         | Wrote_app_data ->
           Some (connection.writer, connection.client_address, CID.to_string cid)
-        | _ ->
-          inner t (xs ()))
+        | _ -> inner t (xs ()))
       | Wrote ->
         (* There might be space in this datagram for some application data
          * frames. Send them. *)
         ignore (Streams.flush connection connection.streams : flush_ret);
         Some (connection.writer, connection.client_address, CID.to_string cid))
-    | Nil ->
-      None
+    | Nil -> None
   in
   inner t (Conntbl.to_seq_values t.connections ())
 
-let next_write_operation (t : 'a t) =
-  if t.closed then
-    `Close 0
+let next_write_operation (t : t) =
+  if t.closed
+  then `Close 0
   else
     match flush_pending_packets t with
     | Some (writer, client_address, cid) ->
       (match Writer.next writer with
-      | `Write iovecs ->
-        `Writev (iovecs, client_address, cid)
-      | (`Yield | `Close _) as other ->
-        other)
-    | None ->
-      `Yield
+      | `Write iovecs -> `Writev (iovecs, client_address, cid)
+      | (`Yield | `Close _) as other -> other)
+    | None -> `Yield
 
 let report_write_result t ~cid result =
   let conn = Conntbl.find t.connections (CID.of_string cid) in
   Writer.report_result conn.writer result
 
 let yield_writer t k =
-  if t.closed then
-    failwith "on_wakeup_writer on closed conn"
-  else if Optional_thunk.is_some t.wakeup_writer then
-    failwith "on_wakeup: only one callback can be registered at a time"
-  else
-    t.wakeup_writer <- Optional_thunk.some k
+  if t.closed
+  then failwith "on_wakeup_writer on closed conn"
+  else if Optional_thunk.is_some t.wakeup_writer
+  then failwith "on_wakeup: only one callback can be registered at a time"
+  else t.wakeup_writer <- Optional_thunk.some k
 
 let yield_reader _t _k = ()
 
@@ -816,5 +782,4 @@ let read t ~client_address bs ~off ~len =
   read_with_more t bs ~off ~len Incomplete
 
 let read_eof t bs ~off ~len = read_with_more t bs ~off ~len Complete
-
 let next_read_operation _t = `Read
