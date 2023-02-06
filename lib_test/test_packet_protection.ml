@@ -1,7 +1,6 @@
 module Quic = Quic__
 
 let hex = Alcotest.of_pp Hex.pp
-
 let dest_cid = Hex.to_string (`Hex "8394c8f03e515708")
 
 module Crypto = Quic.Crypto

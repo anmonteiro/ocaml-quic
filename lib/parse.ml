@@ -41,12 +41,9 @@ let variable_length_integer =
   let encoding = first_byte lsr 6 in
   let b1 = first_byte land 0b00111111 in
   match encoding with
-  | 0 ->
-    return b1
-  | 1 ->
-    parse_remaining b1 1
-  | 2 ->
-    parse_remaining b1 3
+  | 0 -> return b1
+  | 1 -> parse_remaining b1 1
+  | 2 -> parse_remaining b1 3
   | _ ->
     assert (encoding = 3);
     parse_remaining b1 7
@@ -72,8 +69,8 @@ module Frame = struct
          variable_length_integer
          variable_length_integer)
     >>= fun ranges ->
-    (if not ecn_counts then
-       return None
+    (if not ecn_counts
+    then return None
     else
       lift3
         (fun ect0 ect1 cn -> Some (ect0, ect1, cn))
@@ -238,48 +235,27 @@ module Frame = struct
        *   [...] a PADDING frame consists of the single byte that identifies
        *   the frame as a PADDING frame. *)
       lift (fun count -> Frame.Padding count) (parse_padding_frames ())
-    | Ping ->
-      return Frame.Ping
-    | Ack { ecn_counts } ->
-      parse_ack_frame ecn_counts
-    | Reset_stream ->
-      parse_reset_stream_frame
-    | Stop_sending ->
-      parse_stop_sending_frame
-    | Crypto ->
-      parse_crypto_frame
-    | New_token ->
-      parse_new_token_frame
-    | Stream { off; len; fin } ->
-      parse_stream_frame ~off ~len ~fin
-    | Max_data ->
-      parse_max_data_frame
-    | Max_stream_data ->
-      parse_max_stream_data_frame
-    | Max_streams direction ->
-      parse_max_streams_frame direction
-    | Data_blocked ->
-      parse_data_blocked_frame
-    | Stream_data_blocked ->
-      parse_stream_data_blocked_frame
-    | Streams_blocked direction ->
-      parse_streams_blocked_frame direction
-    | New_connection_id ->
-      parse_new_connection_id_frame
-    | Retire_connection_id ->
-      parse_retire_connection_id_frame
-    | Path_challenge ->
-      parse_path_challenge_frame
-    | Path_response ->
-      parse_path_response_frame
-    | Connection_close_quic ->
-      parse_connection_close_quic_frame
-    | Connection_close_app ->
-      parse_connection_close_app_frame
-    | Handshake_done ->
-      return Frame.Handshake_done
-    | Unknown x ->
-      return (Frame.Unknown x)
+    | Ping -> return Frame.Ping
+    | Ack { ecn_counts } -> parse_ack_frame ecn_counts
+    | Reset_stream -> parse_reset_stream_frame
+    | Stop_sending -> parse_stop_sending_frame
+    | Crypto -> parse_crypto_frame
+    | New_token -> parse_new_token_frame
+    | Stream { off; len; fin } -> parse_stream_frame ~off ~len ~fin
+    | Max_data -> parse_max_data_frame
+    | Max_stream_data -> parse_max_stream_data_frame
+    | Max_streams direction -> parse_max_streams_frame direction
+    | Data_blocked -> parse_data_blocked_frame
+    | Stream_data_blocked -> parse_stream_data_blocked_frame
+    | Streams_blocked direction -> parse_streams_blocked_frame direction
+    | New_connection_id -> parse_new_connection_id_frame
+    | Retire_connection_id -> parse_retire_connection_id_frame
+    | Path_challenge -> parse_path_challenge_frame
+    | Path_response -> parse_path_response_frame
+    | Connection_close_quic -> parse_connection_close_quic_frame
+    | Connection_close_app -> parse_connection_close_app_frame
+    | Handshake_done -> return Frame.Handshake_done
+    | Unknown x -> return (Frame.Unknown x)
 
   let parser handler = skip_many (frame <* commit >>| handler)
 end
@@ -386,10 +362,8 @@ module Packet = struct
   let unprotected =
     Header.Long.parse >>= fun (version, source_cid, dest_cid) ->
     match version with
-    | Negotiation ->
-      Payload.version_negotiation ~source_cid ~dest_cid
-    | Number version ->
-      Payload.retry ~version ~source_cid ~dest_cid
+    | Negotiation -> Payload.version_negotiation ~source_cid ~dest_cid
+    | Number version -> Payload.retry ~version ~source_cid ~dest_cid
 
   (*
    *  Long Header Packet {
@@ -407,10 +381,9 @@ module Packet = struct
   let protected_long_header ~packet_type =
     Header.Long.parse >>= fun (version, source_cid, dest_cid) ->
     match version with
-    | Negotiation ->
-      assert false
+    | Negotiation -> assert false
     | Number version ->
-      match packet_type with
+      (match packet_type with
       | Packet.Type.Initial ->
         variable_length_integer >>= fun token_length ->
         lift2
@@ -425,8 +398,7 @@ module Packet = struct
             ( Packet.Header.Long { version; source_cid; dest_cid; packet_type }
             , payload_length ))
           variable_length_integer
-      | Retry ->
-        failwith "retry is unprotected"
+      | Retry -> failwith "retry is unprotected")
 
   (*
    *  Short Header Packet {
@@ -460,14 +432,12 @@ module Packet = struct
      *   All QUIC packets other than Version Negotiation and Retry packets are
      *   protected with an AEAD algorithm [AEAD]. *)
     match Packet.Header.Type.parse first_byte with
-    | Short ->
-      true
+    | Short -> true
     | Long ->
-      match Packet.Version.parse version with
-      | Negotiation ->
-        false
+      (match Packet.Version.parse version with
+      | Negotiation -> false
       | Number _ ->
-        match Packet.parse_type first_byte with Retry -> false | _ -> true
+        (match Packet.parse_type first_byte with Retry -> false | _ -> true))
 
   type protection_type =
     | Unprotected
@@ -493,7 +463,8 @@ module Packet = struct
     let first_byte = Char.code first_byte in
     available >>= fun avail ->
     Unsafe.peek avail (fun bs ~off ~len ->
-        if not (Bits.test first_byte 6) then
+        if not (Bits.test first_byte 6)
+        then
           (* From RFC<QUIC-RFC>§17.2:
            *   Fixed Bit: The next bit (0x40) of byte 0 is set to 1. Packets
            *   containing a zero value for this bit are not valid packets in
@@ -501,7 +472,8 @@ module Packet = struct
           failwith "TODO: error"
         else
           let has_header_protection = is_protected bs ~off in
-          if has_header_protection then
+          if has_header_protection
+          then
             let header, payload_length =
               match
                 Angstrom.parse_bigstring
@@ -509,21 +481,17 @@ module Packet = struct
                   protected_header
                   (Bigstringaf.sub bs ~off ~len)
               with
-              | Ok x ->
-                x
-              | Error e ->
-                failwith e
+              | Ok x -> x
+              | Error e -> failwith e
             in
             Decrypted
               { header
               ; payload_length
               ; decrypted = decrypt ~header bs ~off ~len
               }
-          else
-            Unprotected)
+          else Unprotected)
     >>= function
-    | Decrypted { decrypted = None; _ } ->
-      failwith "failed to decrypt, fix me"
+    | Decrypted { decrypted = None; _ } -> failwith "failed to decrypt, fix me"
     | Decrypted
         { header
         ; payload_length
@@ -580,12 +548,11 @@ module Reader = struct
   let is_closed t = t.closed
 
   let on_wakeup t k =
-    if is_closed t then
-      failwith "on_wakeup on closed reader"
-    else if Optional_thunk.is_some t.wakeup then
-      failwith "on_wakeup: only one callback can be registered at a time"
-    else
-      t.wakeup <- Optional_thunk.some k
+    if is_closed t
+    then failwith "on_wakeup on closed reader"
+    else if Optional_thunk.is_some t.wakeup
+    then failwith "on_wakeup: only one callback can be registered at a time"
+    else t.wakeup <- Optional_thunk.some k
 
   let wakeup t =
     let f = t.wakeup in
@@ -613,26 +580,21 @@ module Reader = struct
 
   let start t state =
     match state with
-    | AU.Done _ ->
-      failwith "Quic.Parse.unable to start parser"
-    | AU.Fail (0, marks, msg) ->
-      t.parse_state <- Fail (`Parse (marks, msg))
+    | AU.Done _ -> failwith "Quic.Parse.unable to start parser"
+    | AU.Fail (0, marks, msg) -> t.parse_state <- Fail (`Parse (marks, msg))
     | AU.Partial { committed = 0; continue } ->
       t.parse_state <- Partial continue
-    | _ ->
-      assert false
+    | _ -> assert false
 
   let rec read_with_more t bs ~off ~len more =
     let initial = match t.parse_state with Done -> true | _ -> false in
     let consumed =
       match t.parse_state with
-      | Fail _ ->
-        0
+      | Fail _ -> 0
       | Done ->
         start t (AU.parse t.parser);
         read_with_more t bs ~off ~len more
-      | Partial continue ->
-        transition t (continue bs more ~off ~len)
+      | Partial continue -> transition t (continue bs more ~off ~len)
     in
     (* Special case where the parser just started and was fed a zero-length
      * bigstring. Avoid putting them parser in an error state in this scenario.
@@ -645,12 +607,8 @@ module Reader = struct
 
   let next t =
     match t.parse_state with
-    | Fail failure ->
-      `Error failure
-    | _ when t.closed ->
-      `Close
-    | Done ->
-      `Start
-    | Partial _ ->
-      `Read
+    | Fail failure -> `Error failure
+    | _ when t.closed -> `Close
+    | Done -> `Start
+    | Partial _ -> `Read
 end

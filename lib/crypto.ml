@@ -95,10 +95,8 @@ end
 
 let[@inline] is_long header =
   match Packet.Header.Type.parse (Cstruct.get_uint8 header 0) with
-  | Long ->
-    true
-  | Short ->
-    false
+  | Long -> true
+  | Short -> false
 
 let[@inline] packet_number_length header =
   (* From RFC<QUIC-RFC>§17.2:
@@ -145,19 +143,14 @@ let decode_packet_number ~largest_pn ~truncated_pn ~pn_nbits =
   let candidate_pn =
     Int64.logor (Int64.logand expected_pn (Int64.lognot pn_mask)) truncated_pn
   in
-  if
-    Int64.compare candidate_pn (Int64.sub expected_pn pn_hwin) <= 0
-    && Int64.compare candidate_pn (Int64.sub (Int64.shift_left 1L 62) pn_win)
-       < 0
-  then
-    Int64.add candidate_pn pn_win
-  else if
-    Int64.compare candidate_pn (Int64.add expected_pn pn_hwin) > 0
-    && Int64.compare candidate_pn pn_win >= 0
-  then
-    Int64.sub candidate_pn pn_win
-  else
-    candidate_pn
+  if Int64.compare candidate_pn (Int64.sub expected_pn pn_hwin) <= 0
+     && Int64.compare candidate_pn (Int64.sub (Int64.shift_left 1L 62) pn_win)
+        < 0
+  then Int64.add candidate_pn pn_win
+  else if Int64.compare candidate_pn (Int64.add expected_pn pn_hwin) > 0
+          && Int64.compare candidate_pn pn_win >= 0
+  then Int64.sub candidate_pn pn_win
+  else candidate_pn
 
 module AEAD = struct
   type 'k aead_state =
@@ -241,7 +234,8 @@ module AEAD = struct
      *   protected header fields using exclusive OR. *)
     let mask = Cstruct.sub mask 0 5 in
     let masked_bits =
-      if is_long header then (* Long header: 4 bits masked *)
+      if is_long header
+      then (* Long header: 4 bits masked *)
         0x0f
       else (* Short header: 5 bits masked *)
         0x1f
@@ -268,8 +262,7 @@ module AEAD = struct
   let variable_length_integer header ~off =
     let rec inner r off rem =
       match rem with
-      | 0 ->
-        r
+      | 0 -> r
       | n ->
         let b = Cstruct.get_uint8 header off in
         inner ((r * 256) + b) (off + 1) (n - 1)
@@ -279,12 +272,9 @@ module AEAD = struct
     let encoding = first_byte lsr 6 in
     let b1 = first_byte land 0b00111111 in
     match encoding with
-    | 0 ->
-      1, b1
-    | 1 ->
-      2, parse_remaining b1 1
-    | 2 ->
-      4, parse_remaining b1 3
+    | 0 -> 1, b1
+    | 1 -> 2, parse_remaining b1 1
+    | 2 -> 4, parse_remaining b1 3
     | _ ->
       assert (encoding = 3);
       8, parse_remaining b1 7
@@ -318,8 +308,7 @@ module AEAD = struct
           variable_length_integer header ~off:(7 + src_cid_len + dest_cid_len)
         in
         varint_len + token_len
-      | _ ->
-        0
+      | _ -> 0
     in
     let payload_varint_len, _payload_len =
       variable_length_integer
@@ -337,8 +326,8 @@ module AEAD = struct
     7 + dest_cid_len + src_cid_len + payload_varint_len + token_length + 4
 
   let sample_offset ~conn_id_len header =
-    if is_long header then
-      parse_long_header_offset header
+    if is_long header
+    then parse_long_header_offset header
     else
       (*
        * sample_offset = 1 + len(connection_id) + 4
@@ -353,7 +342,8 @@ module AEAD = struct
      *   protected header fields using exclusive OR. *)
     let mask = Cstruct.sub mask 0 5 in
     let masked_bits =
-      if is_long header then (* Long header: 4 bits masked *)
+      if is_long header
+      then (* Long header: 4 bits masked *)
         0x0f
       else (* Short header: 5 bits masked *)
         0x1f
@@ -415,8 +405,7 @@ module AEAD = struct
     match t.ciphersuite with
     | Tls.Ciphersuite.AES_128_GCM | AES_256_GCM | AES_128_CCM | AES_256_CCM ->
       encrypt_or_decrypt_header_ecb t f
-    | CHACHA20_POLY1305 ->
-      encrypt_or_decrypt_header_chacha20 t f
+    | CHACHA20_POLY1305 -> encrypt_or_decrypt_header_chacha20 t f
 
   let encrypt_header t = encrypt_or_decrypt_header t encrypt_header
 
@@ -460,8 +449,7 @@ module AEAD = struct
         Int64.of_int
           ((Cstruct.get_uint8 header off * (1 lsl 16))
           + Cstruct.BE.get_uint16 header (off + 1))
-      | 2 ->
-        Int64.of_int (Cstruct.BE.get_uint16 header off)
+      | 2 -> Int64.of_int (Cstruct.BE.get_uint16 header off)
       | _ ->
         assert (pn_length = 1);
         Int64.of_int (Cstruct.get_uint8 header off)
@@ -488,8 +476,7 @@ module AEAD = struct
     with
     | Tls.State.AEAD { cipher; cipher_secret; _ } ->
       AEAD { cipher; key = cipher_secret }
-    | CBC _ ->
-      assert false
+    | CBC _ -> assert false
 
   let make ~ciphersuite secret =
     let ciphersuite13 = Tls.Ciphersuite.privprot13 ciphersuite in

@@ -44,8 +44,7 @@ module Version = struct
        *   Negotiation packet based on the Version field having a value of
        *   0. *)
       Negotiation
-    | other ->
-      Number other
+    | other -> Number other
 
   let serialize = function Negotiation -> Int32.zero | Number n -> n
 end
@@ -58,26 +57,17 @@ module Type = struct
     | Retry
 
   let parse = function
-    | 0x0 ->
-      Initial
-    | 0x1 ->
-      Zero_RTT
-    | 0x2 ->
-      Handshake
-    | 0x3 ->
-      Retry
-    | _ ->
-      assert false
+    | 0x0 -> Initial
+    | 0x1 -> Zero_RTT
+    | 0x2 -> Handshake
+    | 0x3 -> Retry
+    | _ -> assert false
 
   let serialize = function
-    | Initial ->
-      0x0
-    | Zero_RTT ->
-      0x1
-    | Handshake ->
-      0x2
-    | Retry ->
-      0x3
+    | Initial -> 0x0
+    | Zero_RTT -> 0x1
+    | Handshake -> 0x2
+    | Retry -> 0x3
 end
 
 module Header = struct
@@ -97,18 +87,13 @@ module Header = struct
     | Short of { dest_cid : CID.t }
 
   let long_packet_type = function
-    | Initial _ ->
-      Type.Initial
-    | Long { packet_type; _ } ->
-      packet_type
-    | Short _ ->
-      assert false
+    | Initial _ -> Type.Initial
+    | Long { packet_type; _ } -> packet_type
+    | Short _ -> assert false
 
   let source_cid = function
-    | Initial { source_cid; _ } | Long { source_cid; _ } ->
-      Some source_cid
-    | Short _ ->
-      None
+    | Initial { source_cid; _ } | Long { source_cid; _ } -> Some source_cid
+    | Short _ -> None
 
   let destination_cid = function
     | Initial { dest_cid; _ } | Long { dest_cid; _ } | Short { dest_cid; _ } ->
@@ -132,10 +117,8 @@ module Header = struct
    *   Length field and so cannot be followed by other packets in the same UDP
    *   datagram. *)
   let can_be_followed_by_other_packets = function
-    | Long { packet_type = Retry; _ } | Short _ ->
-      false
-    | Initial _ | Long _ ->
-      true
+    | Long { packet_type = Retry; _ } | Short _ -> false
+    | Initial _ | Long _ -> true
 end
 
 let parse_type first_byte =
@@ -166,16 +149,12 @@ type t =
       }
 
 let destination_cid = function
-  | VersionNegotiation { dest_cid; _ } ->
-    dest_cid
-  | Frames { header; _ } | Retry { header; _ } ->
-    Header.destination_cid header
+  | VersionNegotiation { dest_cid; _ } -> dest_cid
+  | Frames { header; _ } | Retry { header; _ } -> Header.destination_cid header
 
 let source_cid = function
-  | VersionNegotiation { source_cid; _ } ->
-    Some source_cid
-  | Frames { header; _ } | Retry { header; _ } ->
-    Header.source_cid header
+  | VersionNegotiation { source_cid; _ } -> Some source_cid
+  | Frames { header; _ } | Retry { header; _ } -> Header.source_cid header
 
 (* From RFC<QUIC-RFC>§18.2:
  *   Retry packets (Section 17.2.5), Version Negotiation packets (Section
@@ -183,7 +162,5 @@ let source_cid = function
  *   Length field and so cannot be followed by other packets in the same UDP
  *   datagram. *)
 let can_be_followed_by_other_packets = function
-  | VersionNegotiation _ | Retry _ | Frames { header = Short _; _ } ->
-    false
-  | Frames _ ->
-    true
+  | VersionNegotiation _ | Retry _ | Frames { header = Short _; _ } -> false
+  | Frames _ -> true

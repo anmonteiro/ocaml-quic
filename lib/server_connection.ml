@@ -515,35 +515,31 @@ let packet_handler t packet =
   let connection_id = Packet.destination_cid packet in
   let c =
     match Conntbl.find_opt t.connections connection_id with
-    | Some c -> c
+    | Some connection -> connection
     | None ->
-      (match Conntbl.find_opt t.connections connection_id with
-      | Some connection -> connection
-      | None ->
-        (* Has to be a new connection. TODO: assert that. *)
-        let connection =
-          create_connection
-            ~client_address:(Option.get t.current_client_address)
-            ~tls_state:t.base_tls_state
-            ~wakeup_writer:(ready_to_write t)
-            t.handler
-        in
-        let encdec =
-          { Crypto.encrypter =
-              Crypto.InitialAEAD.make ~mode:Server connection_id
-          ; decrypter =
-              Some (Crypto.InitialAEAD.make ~mode:Client connection_id)
-          }
-        in
-        Encryption_level.add Initial encdec connection.encdec;
-        assert (not (Conntbl.mem t.connections connection_id));
-        Conntbl.add t.connections connection.source_cid connection;
-        connection)
+      (* Has to be a new connection. TODO: assert that. *)
+      let connection =
+        create_connection
+          ~client_address:(Option.get t.current_client_address)
+          ~tls_state:t.base_tls_state
+          ~wakeup_writer:(ready_to_write t)
+          t.handler
+      in
+      let encdec =
+        { Crypto.encrypter = Crypto.InitialAEAD.make ~mode:Server connection_id
+        ; decrypter = Some (Crypto.InitialAEAD.make ~mode:Client connection_id)
+        }
+      in
+      Encryption_level.add Initial encdec connection.encdec;
+
+      assert (not (Conntbl.mem t.connections connection_id));
+      Conntbl.add t.connections connection.source_cid connection;
+      connection
   in
   if CID.is_empty c.original_dest_cid
   then
     (* From RFC<QUIC-RFC>§7.3:
-        *   Each endpoint includes the value of the Source Connection ID field
+     *   Each endpoint includes the value of the Source Connection ID field
      *   from the first Initial packet it sent in the
      *   initial_source_connection_id transport parameter; see Section 18.2. A
      *   server includes the Destination Connection ID field from the first
@@ -553,7 +549,7 @@ let packet_handler t packet =
   if CID.is_empty c.dest_cid
   then
     (* From RFC<QUIC-RFC>§19.6:
-        *   Upon receiving a packet, each endpoint sets the Destination Connection
+     *   Upon receiving a packet, each endpoint sets the Destination Connection
      *   ID it sends to match the value of the Source Connection ID that it
      *   receives. *)
     c.dest_cid <- Option.get (Packet.source_cid packet);

@@ -8,15 +8,13 @@ type t = State.state =
   ; fragment : Cstruct.t
   }
 
-let (<+>) = Cstruct.append
-
+let ( <+> ) = Cstruct.append
 let ( let* ) = Result.bind
 
 module Alert = struct
   open Packet
 
   let make ?level typ = ALERT, Writer.assemble_alert ?level typ
-
   let close_notify = make ~level:WARNING CLOSE_NOTIFY
 
   let handle buf =
@@ -24,23 +22,19 @@ module Alert = struct
     | Ok (_, a_type) ->
       let err = match a_type with CLOSE_NOTIFY -> `Eof | _ -> `Alert a_type in
       Ok (err, [ `Record close_notify ])
-    | Error re ->
-      Error (`Fatal (`ReaderError re))
+    | Error re -> Error (`Fatal (`ReaderError re))
 end
 
 let rec separate_handshakes buf =
   match Reader.parse_handshake_frame buf with
-  | None, rest ->
-    Ok ([], rest)
+  | None, rest -> Ok ([], rest)
   | Some hs, rest ->
     let* rt, frag = separate_handshakes rest in
     Ok (hs :: rt, frag)
 
 let handle_change_cipher_spec = function
-  | Client cs ->
-    Handshake_client.handle_change_cipher_spec cs
-  | Server ss ->
-    Handshake_server.handle_change_cipher_spec ss
+  | Client cs -> Handshake_client.handle_change_cipher_spec cs
+  | Server ss -> Handshake_server.handle_change_cipher_spec ss
   (* D.4: the client may send a CCS before its second flight (before second
      ClientHello or encrypted handshake flight) the server may send it
      immediately after its first handshake message (ServerHello or
@@ -51,16 +45,13 @@ let handle_change_cipher_spec = function
   | Server13 (AwaitClientCertificate13 _)
   | Server13 (AwaitClientFinished13 _) ->
     fun s _ -> Ok (s, [])
-  | _ ->
-    fun _ _ -> Error (`Fatal `UnexpectedCCS)
+  | _ -> fun _ _ -> Error (`Fatal `UnexpectedCCS)
 
 and handle_handshake ?embed_quic_transport_params = function
-  | Client cs ->
-    Handshake_client.handle_handshake cs
+  | Client cs -> Handshake_client.handle_handshake cs
   | Server ss ->
     Handshake_server.handle_handshake ?embed_quic_transport_params ss
-  | Client13 cs ->
-    Handshake_client13.handle_handshake cs
+  | Client13 cs -> Handshake_client13.handle_handshake cs
   | Server13 ss ->
     Handshake_server13.handle_handshake ?embed_quic_transport_params ss
 
@@ -68,12 +59,16 @@ let handle_handshake_packet hs ?embed_quic_transport_params buf =
   let* hss, hs_fragment = separate_handshakes (hs.hs_fragment <+> buf) in
   let hs = { hs with hs_fragment } in
   let* hs, items =
-    List.fold_left (fun acc raw ->
+    List.fold_left
+      (fun acc raw ->
         let* hs, items = acc in
-        let* hs', items' = handle_handshake ?embed_quic_transport_params hs.machina hs raw in
+        let* hs', items' =
+          handle_handshake ?embed_quic_transport_params hs.machina hs raw
+        in
         Ok (hs', items @ items'))
-      (Ok (hs, [])) hss
-    in
+      (Ok (hs, []))
+      hss
+  in
   Ok (hs, items, `No_err)
 
 let early_data s =
@@ -84,30 +79,28 @@ let early_data s =
   | Server13 (AwaitClientCertificate13 _)
   | Server13 (AwaitClientCertificateVerify13 _) ->
     true
-  | _ ->
-    false
+  | _ -> false
 
 let decrement_early_data hs ty buf =
   let bytes left cipher =
     let count =
-      Cstruct.length buf - fst (Ciphersuite.kn_13 (Ciphersuite.privprot13 cipher))
+      Cstruct.length buf
+      - fst (Ciphersuite.kn_13 (Ciphersuite.privprot13 cipher))
     in
     let left' = Int32.sub left (Int32.of_int count) in
     if left' < 0l then Error (`Fatal `Toomany0rttbytes) else Ok left'
   in
-  if ty = Packet.APPLICATION_DATA && early_data hs then
+  if ty = Packet.APPLICATION_DATA && early_data hs
+  then
     let cipher =
       match hs.session with
-      | `TLS13 sd :: _ ->
-        sd.ciphersuite13
-      | _ ->
-        `AES_128_GCM_SHA256
+      | `TLS13 sd :: _ -> sd.ciphersuite13
+      | _ -> `AES_128_GCM_SHA256
       (* TODO assert and ensure that all early_data states have a cipher *)
     in
     let* early_data_left = bytes hs.early_data_left cipher in
     Ok { hs with early_data_left }
-  else
-    Ok hs
+  else Ok hs
 
 let trace_handshake ?(s = "in") buf =
   let open Reader in
@@ -128,8 +121,7 @@ let trace_handshake ?(s = "in") buf =
 let trace recs =
   List.iter
     (function
-      | `Change_enc _ | `Change_dec _ ->
-        ()
+      | `Change_enc _ | `Change_dec _ -> ()
       | `Record (content_type, data) ->
         assert (content_type = Packet.HANDSHAKE);
         trace_handshake ~s:"out" data)
@@ -145,13 +137,11 @@ let handle_raw_record ?embed_quic_transport_params state buf =
   let hdr = { Core.content_type = Packet.HANDSHAKE; version = `TLS_1_2 } in
   let hs = state.handshake in
   let version = hs.protocol_version in
-  let* () = match hs.machina, version with
-    | Client (AwaitServerHello _), _ ->
-      Ok ()
-    | Server AwaitClientHello, _ ->
-      Ok ()
-    | Server13 AwaitClientHelloHRR13, _ ->
-      Ok ()
+  let* () =
+    match hs.machina, version with
+    | Client (AwaitServerHello _), _ -> Ok ()
+    | Server AwaitClientHello, _ -> Ok ()
+    | Server13 AwaitClientHelloHRR13, _ -> Ok ()
     | _, `TLS_1_3 ->
       guard (hdr.version = `TLS_1_2) (`Fatal (`BadRecordVersion hdr.version))
     | _, v ->
@@ -161,7 +151,7 @@ let handle_raw_record ?embed_quic_transport_params state buf =
   in
   let ty = hdr.content_type in
   let* handshake = decrement_early_data hs ty buf in
-  let* (handshake, items, err) =
+  let* handshake, items, err =
     handle_handshake_packet handshake ?embed_quic_transport_params buf
   in
   (* trace items; *)
@@ -191,18 +181,13 @@ let server ~certificates ~alpn_protocols =
 
 let current_cipher t : Tls.Ciphersuite.ciphersuite13 =
   match Tls.Engine.epoch t with
-  | `InitialEpoch ->
-    failwith "don't call before handshake bytes"
+  | `InitialEpoch -> failwith "don't call before handshake bytes"
   | `Epoch { ciphersuite; _ } ->
-    match ciphersuite with
-    | #Tls.Ciphersuite.ciphersuite13 as cs13 ->
-      cs13
-    | _ ->
-      assert false
+    (match ciphersuite with
+    | #Tls.Ciphersuite.ciphersuite13 as cs13 -> cs13
+    | _ -> assert false)
 
 let transport_params t =
   match Tls.Engine.epoch t with
-  | `InitialEpoch ->
-    failwith "don't call before handshake bytes"
-  | `Epoch { quic_transport_parameters; _ } ->
-    quic_transport_parameters
+  | `InitialEpoch -> failwith "don't call before handshake bytes"
+  | `Epoch { quic_transport_parameters; _ } -> quic_transport_parameters

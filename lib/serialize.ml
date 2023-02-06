@@ -35,41 +35,35 @@ let packet_number_length pn =
    *   Packet numbers are integers in the range 0 to 2^62-1 (Section 12.3).
    *   When present in long or short packet headers, they are encoded in 1 to 4
    *   bytes. *)
-  if Int64.compare pn (Int64.shift_left 1L 8) < 0 then
-    1
-  else if Int64.compare pn (Int64.shift_left 1L 16) < 0 then
-    2
-  else if Int64.compare pn (Int64.shift_left 1L 32) < 0 then
-    3
-  else
-    4
+  if Int64.compare pn (Int64.shift_left 1L 8) < 0
+  then 1
+  else if Int64.compare pn (Int64.shift_left 1L 16) < 0
+  then 2
+  else if Int64.compare pn (Int64.shift_left 1L 32) < 0
+  then 3
+  else 4
 
 let varint_encoding_length n =
-  if n < 1 lsl 6 then
-    1
-  else if n < 1 lsl 14 then
-    2
-  else if n < 1 lsl 30 then
-    4
-  else
-    8
+  if n < 1 lsl 6
+  then 1
+  else if n < 1 lsl 14
+  then 2
+  else if n < 1 lsl 30
+  then 4
+  else 8
 
 let rec decomp n acc x =
-  if n = 0 then
-    acc
-  else
-    decomp (n - 1) ((x land 0xff) :: acc) (x lsr 8)
+  if n = 0 then acc else decomp (n - 1) ((x land 0xff) :: acc) (x lsr 8)
 
 let write_variable_length_integer t n =
   let encoding_bytes, encoding =
-    if n < 1 lsl 6 then
-      1, 0
-    else if n < 1 lsl 14 then
-      2, 1
-    else if n < 1 lsl 30 then
-      4, 2
-    else
-      8, 3
+    if n < 1 lsl 6
+    then 1, 0
+    else if n < 1 lsl 14
+    then 2, 1
+    else if n < 1 lsl 30
+    then 4, 2
+    else 8, 3
   in
   let ns = decomp encoding_bytes [] n in
   let hd = List.hd ns in
@@ -117,8 +111,7 @@ module Frame = struct
       write_variable_length_integer t ect0;
       write_variable_length_integer t ect1;
       write_variable_length_integer t cn
-    | None ->
-      ()
+    | None -> ()
 
   let write_reset_stream t ~stream_id ~application_protocol_error ~final_size =
     write_variable_length_integer t stream_id;
@@ -142,10 +135,8 @@ module Frame = struct
   let write_stream t ~stream_id ~fragment =
     let { IOVec.off; len; buffer } = fragment in
     write_variable_length_integer t (Int64.to_int stream_id);
-    if off > 0 then
-      write_variable_length_integer t off;
-    if len > 0 then
-      write_variable_length_integer t len;
+    if off > 0 then write_variable_length_integer t off;
+    if len > 0 then write_variable_length_integer t len;
     Faraday.schedule_bigstring t buffer
 
   let write_max_data t ~max = write_variable_length_integer t max
@@ -155,7 +146,6 @@ module Frame = struct
     write_variable_length_integer t max
 
   let write_max_streams t ~max = write_variable_length_integer t max
-
   let write_data_blocked t ~max = write_variable_length_integer t max
 
   let write_stream_data_blocked t ~id ~max =
@@ -165,7 +155,11 @@ module Frame = struct
   let write_streams_blocked t ~max = write_variable_length_integer t max
 
   let write_new_connection_id
-      t ~cid ~stateless_reset_token ~retire_prior_to ~sequence_no
+      t
+      ~cid
+      ~stateless_reset_token
+      ~retire_prior_to
+      ~sequence_no
     =
     write_variable_length_integer t sequence_no;
     write_variable_length_integer t retire_prior_to;
@@ -176,7 +170,6 @@ module Frame = struct
     write_variable_length_integer t sequence_no
 
   let write_path_challenge t ~data = Faraday.schedule_bigstring t data
-
   let write_path_response t ~data = Faraday.schedule_bigstring t data
 
   let write_connection_close_quic t ~frame_type ~reason_phrase ~error_code =
@@ -199,34 +192,25 @@ module Frame = struct
     let frame_type = Frame.(Type.serialize (to_frame_type frame)) in
     write_variable_length_integer t frame_type;
     match frame with
-    | Padding n ->
-      write_padding t n
-    | Ping ->
-      ()
+    | Padding n -> write_padding t n
+    | Ping -> ()
     | Ack { delay; ranges; ecn_counts } ->
       write_ack t ~delay ~ranges ~ecn_counts
     | Reset_stream { stream_id; application_protocol_error; final_size } ->
       write_reset_stream t ~stream_id ~application_protocol_error ~final_size
     | Stop_sending { stream_id; application_protocol_error } ->
       write_stop_sending t ~stream_id ~application_protocol_error
-    | Crypto fragment ->
-      write_crypto t ~fragment
-    | New_token { length; data } ->
-      write_new_token t ~length ~data
-    | Stream { id; fragment; _ } ->
-      write_stream t ~stream_id:id ~fragment
-    | Max_data max ->
-      write_max_data t ~max
+    | Crypto fragment -> write_crypto t ~fragment
+    | New_token { length; data } -> write_new_token t ~length ~data
+    | Stream { id; fragment; _ } -> write_stream t ~stream_id:id ~fragment
+    | Max_data max -> write_max_data t ~max
     | Max_stream_data { stream_id; max_data } ->
       write_max_stream_data t ~stream_id ~max:max_data
-    | Max_streams (_, max) ->
-      write_max_streams t ~max
-    | Data_blocked n ->
-      write_data_blocked t ~max:n
+    | Max_streams (_, max) -> write_max_streams t ~max
+    | Data_blocked n -> write_data_blocked t ~max:n
     | Stream_data_blocked { id; max_data } ->
       write_stream_data_blocked t ~id ~max:max_data
-    | Streams_blocked (_, n) ->
-      write_streams_blocked t ~max:n
+    | Streams_blocked (_, n) -> write_streams_blocked t ~max:n
     | New_connection_id
         { cid; stateless_reset_token; retire_prior_to; sequence_no } ->
       write_new_connection_id
@@ -237,18 +221,14 @@ module Frame = struct
         ~sequence_no
     | Retire_connection_id sequence_no ->
       write_retire_connection_id t ~sequence_no
-    | Path_challenge data ->
-      write_path_challenge t ~data
-    | Path_response data ->
-      write_path_response t ~data
+    | Path_challenge data -> write_path_challenge t ~data
+    | Path_response data -> write_path_response t ~data
     | Connection_close_quic { frame_type; reason_phrase; error_code } ->
       write_connection_close_quic t ~frame_type ~reason_phrase ~error_code
     | Connection_close_app { reason_phrase; error_code } ->
       write_connection_close_app t ~reason_phrase ~error_code
-    | Handshake_done ->
-      ()
-    | Unknown _ ->
-      assert false
+    | Handshake_done -> ()
+    | Unknown _ -> assert false
 end
 
 module Pkt = struct
@@ -273,8 +253,7 @@ module Pkt = struct
          *         Packet Number and Payload fields) in bytes, encoded as a
          *         variable-length integer (Section 16). *)
         write_variable_length_integer t (pn_length + len)
-      | Short _ | Long { packet_type = Retry; _ } ->
-        ()
+      | Short _ | Long { packet_type = Retry; _ } -> ()
 
     let write_long_header t ~pn_length ~header =
       let packet_type = Packet.Header.long_packet_type header in
@@ -323,8 +302,7 @@ module Pkt = struct
       | Long { version; source_cid; dest_cid; _ } ->
         Faraday.BE.write_uint32 t version;
         write_connection_ids t ~source_cid ~dest_cid
-      | Short _ ->
-        assert false
+      | Short _ -> assert false
 
     let write_short_header t ~pn_length ~dest_cid =
       (* From RFC<QUIC-RFC>§17.3:
@@ -350,8 +328,7 @@ module Pkt = struct
       match header with
       | Packet.Header.Initial _ | Long _ ->
         write_long_header t ~pn_length ~header
-      | Short { dest_cid } ->
-        write_short_header t ~pn_length ~dest_cid
+      | Short { dest_cid } -> write_short_header t ~pn_length ~dest_cid
   end
 
   let write_version_negotiation_packet t ~versions ~source_cid ~dest_cid =
@@ -484,12 +461,10 @@ module Writer = struct
     match encryption_level with
     | Encryption_level.Initial ->
       Packet.Header.Initial { version; source_cid; dest_cid; token }
-    | Zero_RTT ->
-      Long { version; source_cid; dest_cid; packet_type = Zero_RTT }
+    | Zero_RTT -> Long { version; source_cid; dest_cid; packet_type = Zero_RTT }
     | Handshake ->
       Long { version; source_cid; dest_cid; packet_type = Handshake }
-    | Application_data ->
-      Short { dest_cid }
+    | Application_data -> Short { dest_cid }
 
   let write_frames_packet t ~header_info frames =
     assert (frames <> []);
@@ -502,9 +477,11 @@ module Writer = struct
     Pkt.write_packet_payload tmpf frames;
     let pn_offset = 4 - pn_length in
     let cur_size = Bigstringaf.length frames + tag_len in
-    (if pn_offset + (* sample size *) 16 > cur_size then (* needs padding *)
-       let n_padding = pn_offset + 16 - cur_size in
-       Frame.write_padding tmpf n_padding);
+    (if pn_offset + (* sample size *) 16 > cur_size
+    then
+      (* needs padding *)
+      let n_padding = pn_offset + 16 - cur_size in
+      Frame.write_padding tmpf n_padding);
     let plaintext = Cstruct.of_bigarray (Faraday.serialize_to_bigstring tmpf) in
     (* AEAD ciphertext length is the same as the plaintext length (+ tag). *)
     let payload_length = Cstruct.length plaintext + tag_len in
@@ -529,11 +506,8 @@ module Writer = struct
     Faraday.schedule_bigstring t.encoder (Cstruct.to_bigarray protected)
 
   let faraday t = t.encoder
-
   let flush t f = flush t.encoder f
-
   let yield t = Faraday.yield t.encoder
-
   let close t = Faraday.close t.encoder
 
   let close_and_drain t =
@@ -542,22 +516,16 @@ module Writer = struct
     t.drained_bytes <- t.drained_bytes + drained
 
   let is_closed t = Faraday.is_closed t.encoder
-
   let drained_bytes t = t.drained_bytes
 
   let report_result t result =
     match result with
-    | `Closed ->
-      close_and_drain t
-    | `Ok len ->
-      shift t.encoder len
+    | `Closed -> close_and_drain t
+    | `Ok len -> shift t.encoder len
 
   let next t =
     match Faraday.operation t.encoder with
-    | `Close ->
-      `Close (drained_bytes t)
-    | `Yield ->
-      `Yield
-    | `Writev iovecs ->
-      `Write iovecs
+    | `Close -> `Close (drained_bytes t)
+    | `Yield -> `Yield
+    | `Writev iovecs -> `Write iovecs
 end
