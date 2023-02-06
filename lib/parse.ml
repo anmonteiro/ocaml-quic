@@ -449,7 +449,8 @@ module Packet = struct
 
   let parser
       ~(decrypt :
-         header:Packet.Header.t
+         payload_length:int
+         -> header:Packet.Header.t
          -> Cstruct.buffer
          -> off:int
          -> len:int
@@ -487,7 +488,7 @@ module Packet = struct
             Decrypted
               { header
               ; payload_length
-              ; decrypted = decrypt ~header bs ~off ~len
+              ; decrypted = decrypt ~payload_length ~header bs ~off ~len
               }
           else Unprotected)
     >>= function

@@ -34,11 +34,17 @@
 
 open Lwt.Infix
 
+module Addr = struct
+  (* type t = Eio.Net.Sockaddr.datagram *)
+
+  let parse s = Marshal.from_string s 0
+  let serialize addr = Marshal.to_string addr []
+end
+
 module Buffer : sig
   type t
 
   val create : int -> t
-
   val get : t -> f:(Bigstringaf.t -> off:int -> len:int -> int) -> int
 
   val put
@@ -61,10 +67,12 @@ end = struct
     { buffer; off = 0; len = 0 }
 
   let compress t =
-    if t.len = 0 then (
+    if t.len = 0
+    then (
       t.off <- 0;
       t.len <- 0)
-    else if t.off > 0 then (
+    else if t.off > 0
+    then (
       Bigstringaf.blit t.buffer ~src_off:t.off t.buffer ~dst_off:0 ~len:t.len;
       t.off <- 0)
 
@@ -72,24 +80,21 @@ end = struct
     let n = f t.buffer ~off:t.off ~len:t.len in
     t.off <- t.off + n;
     t.len <- t.len - n;
-    if t.len = 0 then
-      t.off <- 0;
+    if t.len = 0 then t.off <- 0;
     n
 
   let put t ~f =
     compress t;
     f t.buffer ~off:(t.off + t.len) ~len:(Bigstringaf.length t.buffer - t.len)
     >|= function
-    | `Eof ->
-      `Eof
+    | `Eof -> `Eof
     | `Ok (n, _) as ret ->
       t.len <- t.len + n;
       ret
 end
 
 let _pp_addr = function
-  | Lwt_unix.ADDR_UNIX s ->
-    s
+  | Lwt_unix.ADDR_UNIX s -> s
   | ADDR_INET (addr, port) ->
     Unix.string_of_inet_addr addr ^ ":" ^ string_of_int port
 
@@ -97,8 +102,7 @@ module IO_loop = struct
   module Io = struct
     let close socket =
       match Lwt_unix.state socket with
-      | Closed ->
-        Lwt.return_unit
+      | Closed -> Lwt.return_unit
       | _ ->
         Lwt.catch
           (fun () ->
@@ -110,13 +114,12 @@ module IO_loop = struct
       Lwt.catch
         (fun () ->
           Lwt_bytes.recvfrom socket bigstring off len [] >|= function
-          | 0, _ ->
-            `Eof
-          | n, addr ->
-            `Ok (n, addr))
+          | 0, _ -> `Eof
+          | n, addr -> `Ok (n, addr))
         (function
           | Unix.Unix_error (Unix.EBADF, _, _) ->
-            (* If the socket is closed we need to feed EOF to the state machine. *)
+            (* If the socket is closed we need to feed EOF to the state
+               machine. *)
             Lwt.return `Eof
           | exn ->
             Lwt.async (fun () -> close socket);
@@ -139,14 +142,13 @@ module IO_loop = struct
         (function
           | Unix.Unix_error (Unix.EBADF, "check_descriptor", _) ->
             Lwt.return `Closed
-          | exn ->
-            Lwt.fail exn)
+          | exn -> Lwt.fail exn)
 
     let shutdown socket command =
-      if Lwt_unix.state socket <> Lwt_unix.Closed then
+      if Lwt_unix.state socket <> Lwt_unix.Closed
+      then
         try Lwt_unix.shutdown socket command with
-        | Unix.Unix_error (Unix.ENOTCONN, _, _) ->
-          ()
+        | Unix.Unix_error (Unix.ENOTCONN, _, _) -> ()
 
     let shutdown_receive socket = shutdown socket Unix.SHUTDOWN_RECEIVE
   end
@@ -170,7 +172,12 @@ module IO_loop = struct
             read_loop_step ()
           | `Ok (_, client_address) ->
             Buffer.get read_buffer ~f:(fun bigstring ~off ~len ->
-                Runtime.read t ~client_address bigstring ~off ~len)
+                Runtime.read
+                  t
+                  ~client_address:(Addr.serialize client_address)
+                  bigstring
+                  ~off
+                  ~len)
             |> ignore;
             read_loop_step () )
         | `Yield ->
@@ -191,7 +198,11 @@ module IO_loop = struct
       let rec write_loop_step () =
         match Runtime.next_write_operation t with
         | `Writev (io_vectors, client_address, cid) ->
-          Io.writev socket ~client_address io_vectors >>= fun result ->
+          Io.writev
+            socket
+            ~client_address:(Addr.parse client_address)
+            io_vectors
+          >>= fun result ->
           Runtime.report_write_result t ~cid result;
           write_loop_step ()
         | `Yield ->

@@ -422,7 +422,7 @@ module Writer = struct
       ~packet_number
       ~encryption_level
       ?(source_cid = CID.empty)
-      ?(version = 0xFF00001Dl)
+      ?(version = 0x1l)
       ?(token = "")
       dest_cid
     =

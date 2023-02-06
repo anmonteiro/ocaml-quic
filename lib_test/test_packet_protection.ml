@@ -12,7 +12,7 @@ module Keys = struct
     Alcotest.check
       hex
       "Initial Secret"
-      (`Hex "1e7e7764529715b1e0ddc8e9753c61576769605187793ed366f8bbf8c9e986eb")
+      (`Hex "7db5df06e7a69e432496adedb00851923595221596ae2ae9fb8115c1e9ed0a44")
       (Hex.of_string
          (Cstruct.to_string (InitialAEAD.get_initial_secret dest_cid)))
 
@@ -21,7 +21,7 @@ module Keys = struct
     Alcotest.check
       hex
       "client_initial_secret"
-      (`Hex "0088119288f1d866733ceeed15ff9d50902cf82952eee27e9d4d4918ea371d87")
+      (`Hex "c00cf151ca5be075ed0ebfb5c80323c42d6b7db67881289af4008f1f6c357aea")
       (Hex.of_string (Cstruct.to_string client_secret));
     let client_key, client_iv =
       Crypto.Kdf.get_key_and_iv ~hash:`SHA256 ~kn:16 ~ivn:12 client_secret
@@ -29,12 +29,12 @@ module Keys = struct
     Alcotest.check
       hex
       "client_key"
-      (`Hex "175257a31eb09dea9366d8bb79ad80ba")
+      (`Hex "1f369613dd76d5467730efcbe3b1a22d")
       (Hex.of_string (Cstruct.to_string client_key));
     Alcotest.check
       hex
       "client_iv"
-      (`Hex "6b26114b9cba2b63a9e8dd4f")
+      (`Hex "fa044b2f42a3fd3b46fb255c")
       (Hex.of_string (Cstruct.to_string client_iv));
     let client_hp =
       Crypto.Kdf.get_header_protection_key ~hash:`SHA256 ~kn:16 client_secret
@@ -42,15 +42,15 @@ module Keys = struct
     Alcotest.check
       hex
       "client_hp"
-      (`Hex "9ddd12c994c0698b89374a9c077a3077")
+      (`Hex "9f50449e04a0e810283a1e9933adedd2")
       (Hex.of_string (Cstruct.to_string client_hp))
 
   let test_server_secrets () =
     let server_secret = InitialAEAD.get_secret ~mode:Server dest_cid in
     Alcotest.check
       hex
-      "client_initial_secret"
-      (`Hex "006f881359244dd9ad1acf85f595bad67c13f9f5586f5e64e1acae1d9ea8f616")
+      "server_initial_secret"
+      (`Hex "3c199828fd139efd216c155ad844cc81fb82fa8d7446fa7d78be803acdda951b")
       (Hex.of_string (Cstruct.to_string server_secret));
     let server_key, server_iv =
       Crypto.Kdf.get_key_and_iv ~hash:`SHA256 ~kn:16 ~ivn:12 server_secret
@@ -58,12 +58,12 @@ module Keys = struct
     Alcotest.check
       hex
       "server_key"
-      (`Hex "149d0b1662ab871fbe63c49b5e655a5d")
+      (`Hex "cf3a5331653c364c88f0f379b6067e37")
       (Hex.of_string (Cstruct.to_string server_key));
     Alcotest.check
       hex
       "server_iv"
-      (`Hex "bab2b12a4c76016ace47856d")
+      (`Hex "0ac1493ca1905853b0bba03e")
       (Hex.of_string (Cstruct.to_string server_iv));
     let server_hp =
       Crypto.Kdf.get_header_protection_key ~hash:`SHA256 ~kn:16 server_secret
@@ -71,7 +71,7 @@ module Keys = struct
     Alcotest.check
       hex
       "server_hp"
-      (`Hex "c0c499a65a60024a18a250974ea01dfa")
+      (`Hex "c206b8d9b9f0f37644430b490eeaa314")
       (Hex.of_string (Cstruct.to_string server_hp))
 
   let suite =
@@ -86,18 +86,18 @@ module Client_initial = struct
     let frames =
       Hex.to_string
         (`Hex
-          "060040c4010000c003036660261ff947cea49cce6cfad687f457cf1b14531ba14131a0e8f309a1d0b9c4000006130113031302010000910000000b0009000006736572766572ff01000100000a00140012001d0017001800190100010101020103010400230000003300260024001d00204cfdfcd178b784bf328cae793b136f2aedce005ff183d7bb1495207236647037002b0003020304000d0020001e040305030603020308040805080604010501060102010402050206020202002d00020101001c00024001")
+          "060040f1010000ed0303ebf8fa56f12939b9584a3896472ec40bb863cfd3e86804fe3a47f06a2b69484c00000413011302010000c000000010000e00000b6578616d706c652e636f6dff01000100000a00080006001d0017001800100007000504616c706e000500050100000000003300260024001d00209370b2c9caa47fbabaf4559fedba753de171fa71f50f1ce15d43e994ec74d748002b0003020304000d0010000e0403050306030203080408050806002d00020101001c00024001003900320408ffffffffffffffff05048000ffff07048000ffff0801100104800075300901100f088394c8f03e51570806048000ffff")
     in
     frames
     (* Add PADDING *)
     ^ String.make (1162 - String.length frames) '\x00'
 
   let unprotected_header =
-    Hex.to_string (`Hex "c3ff00001d088394c8f03e5157080000449e00000002")
+    Hex.to_string (`Hex "c300000001088394c8f03e5157080000449e00000002")
 
   let expected_protected_packet =
     `Hex
-      "c5ff00001d088394c8f03e5157080000449e4a95245bfb66bc5f93032b7ddd89fe0ff15d9c4f7050fccdb71c1cd80512d4431643a53aafa1b0b518b44968b18b8d3e7a4d04c30b3ed9410325b2abb2dafb1c12f8b70479eb8df98abcaf95dd8f3d1c78660fbc719f88b23c8aef6771f3d50e10fdfb4c9d92386d44481b6c52d59e5538d3d3942de9f13a7f8b702dc31724180da9df22714d01003fc5e3d165c950e630b8540fbd81c9df0ee63f94997026c4f2e1887a2def79050ac2d86ba318e0b3adc4c5aa18bcf63c7cf8e85f569249813a2236a7e72269447cd1c755e451f5e77470eb3de64c8849d292820698029cfa18e5d66176fe6e5ba4ed18026f90900a5b4980e2f58e39151d5cd685b10929636d4f02e7fad2a5a458249f5c0298a6d53acbe41a7fc83fa7cc01973f7a74d1237a51974e097636b6203997f921d07bc1940a6f2d0de9f5a11432946159ed6cc21df65c4ddd1115f86427259a196c7148b25b6478b0dc7766e1c4d1b1f5159f90eabc61636226244642ee148b464c9e619ee50a5e3ddc836227cad938987c4ea3c1fa7c75bbf88d89e9ada642b2b88fe8107b7ea375b1b64889a4e9e5c38a1c896ce275a5658d250e2d76e1ed3a34ce7e3a3f383d0c996d0bed106c2899ca6fc263ef0455e74bb6ac1640ea7bfedc59f03fee0e1725ea150ff4d69a7660c5542119c71de270ae7c3ecfd1af2c4ce551986949cc34a66b3e216bfe18b347e6c05fd050f85912db303a8f054ec23e38f44d1c725ab641ae929fecc8e3cefa5619df4231f5b4c009fa0c0bbc60bc75f76d06ef154fc8577077d9d6a1d2bd9bf081dc783ece60111bea7da9e5a9748069d078b2bef48de04cabe3755b197d52b32046949ecaa310274b4aac0d008b1948c1082cdfe2083e386d4fd84c0ed0666d3ee26c4515c4fee73433ac703b690a9f7bf278a77486ace44c489a0c7ac8dfe4d1a58fb3a730b993ff0f0d61b4d89557831eb4c752ffd39c10f6b9f46d8db278da624fd800e4af85548a294c1518893a8778c4f6d6d73c93df200960104e062b388ea97dcf4016bced7f62b4f062cb6c04c20693d9a0e3b74ba8fe74cc01237884f40d765ae56a51688d985cf0ceaef43045ed8c3f0c33bced08537f6882613acd3b08d665fce9dd8aa73171e2d3771a61dba2790e491d413d93d987e2745af29418e428be34941485c93447520ffe231da2304d6a0fd5d07d0837220236966159bef3cf904d722324dd852513df39ae030d8173908da6364786d3c1bfcb19ea77a63b25f1e7fc661def480c5d00d44456269ebd84efd8e3a8b2c257eec76060682848cbf5194bc99e49ee75e4d0d254bad4bfd74970c30e44b65511d4ad0e6ec7398e08e01307eeeea14e46ccd87cf36b285221254d8fc6a6765c524ded0085dca5bd688ddf722e2c0faf9d0fb2ce7a0c3f2cee19ca0ffba461ca8dc5d2c8178b0762cf67135558494d2a96f1a139f0edb42d2af89a9c9122b07acbc29e5e722df8615c343702491098478a389c9872a10b0c9875125e257c7bfdf27eef4060bd3d00f4c14fd3e3496c38d3c5d1a5668c39350effbc2d16ca17be4ce29f02ed969504dda2a8c6b9ff919e693ee79e09089316e7d1d89ec099db3b2b268725d888536a4b8bf9aee8fb43e82a4d919d4843b1ca70a2d8d3f725ead1391377dcc0"
+      "c000000001088394c8f03e5157080000449e7b9aec34d1b1c98dd7689fb8ec11d242b123dc9bd8bab936b47d92ec356c0bab7df5976d27cd449f63300099f3991c260ec4c60d17b31f8429157bb35a1282a643a8d2262cad67500cadb8e7378c8eb7539ec4d4905fed1bee1fc8aafba17c750e2c7ace01e6005f80fcb7df621230c83711b39343fa028cea7f7fb5ff89eac2308249a02252155e2347b63d58c5457afd84d05dfffdb20392844ae812154682e9cf012f9021a6f0be17ddd0c2084dce25ff9b06cde535d0f920a2db1bf362c23e596d11a4f5a6cf3948838a3aec4e15daf8500a6ef69ec4e3feb6b1d98e610ac8b7ec3faf6ad760b7bad1db4ba3485e8a94dc250ae3fdb41ed15fb6a8e5eba0fc3dd60bc8e30c5c4287e53805db059ae0648db2f64264ed5e39be2e20d82df566da8dd5998ccabdae053060ae6c7b4378e846d29f37ed7b4ea9ec5d82e7961b7f25a9323851f681d582363aa5f89937f5a67258bf63ad6f1a0b1d96dbd4faddfcefc5266ba6611722395c906556be52afe3f565636ad1b17d508b73d8743eeb524be22b3dcbc2c7468d54119c7468449a13d8e3b95811a198f3491de3e7fe942b330407abf82a4ed7c1b311663ac69890f4157015853d91e923037c227a33cdd5ec281ca3f79c44546b9d90ca00f064c99e3dd97911d39fe9c5d0b23a229a234cb36186c4819e8b9c5927726632291d6a418211cc2962e20fe47feb3edf330f2c603a9d48c0fcb5699dbfe5896425c5bac4aee82e57a85aaf4e2513e4f05796b07ba2ee47d80506f8d2c25e50fd14de71e6c418559302f939b0e1abd576f279c4b2e0feb85c1f28ff18f58891ffef132eef2fa09346aee33c28eb130ff28f5b766953334113211996d20011a198e3fc433f9f2541010ae17c1bf202580f6047472fb36857fe843b19f5984009ddc324044e847a4f4a0ab34f719595de37252d6235365e9b84392b061085349d73203a4a13e96f5432ec0fd4a1ee65accdd5e3904df54c1da510b0ff20dcc0c77fcb2c0e0eb605cb0504db87632cf3d8b4dae6e705769d1de354270123cb11450efc60ac47683d7b8d0f811365565fd98c4c8eb936bcab8d069fc33bd801b03adea2e1fbc5aa463d08ca19896d2bf59a071b851e6c239052172f296bfb5e72404790a2181014f3b94a4e97d117b438130368cc39dbb2d198065ae3986547926cd2162f40a29f0c3c8745c0f50fba3852e566d44575c29d39a03f0cda721984b6f440591f355e12d439ff150aab7613499dbd49adabc8676eef023b15b65bfc5ca06948109f23f350db82123535eb8a7433bdabcb909271a6ecbcb58b936a88cd4e8f2e6ff5800175f113253d8fa9ca8885c2f552e657dc603f252e1a8e308f76f0be79e2fb8f5d5fbbe2e30ecadd220723c8c0aea8078cdfcb3868263ff8f0940054da48781893a7e49ad5aff4af300cd804a6b6279ab3ff3afb64491c85194aab760d58a606654f9f4400e8b38591356fbf6425aca26dc85244259ff2b19c41b9f96f3ca9ec1dde434da7d2d392b905ddf3d1f9af93d1af5950bd493f5aa731b4056df31bd267b6b90a079831aaf579be0a39013137aac6d404f518cfd46840647e78bfe706ca4cf5e9c5453e9f7cfd2b8b4c8d169a44e55c88d4a9a7f9474241e221af44860018ab0856972e194cd934"
 
   let test_encrypt_client_initial () =
     let encrypter =
@@ -113,13 +113,13 @@ module Client_initial = struct
     Alcotest.check
       hex
       "sample"
-      (`Hex "fb66bc5f93032b7ddd89fe0ff15d9c4f")
+      (`Hex "d1b1c98dd7689fb8ec11d242b123dc9b")
       (Hex.of_cstruct sample);
     let header = AEAD.encrypt_header encrypter ~sample header in
     Alcotest.check
       hex
       "header"
-      (`Hex "c5ff00001d088394c8f03e5157080000449e4a95245b")
+      (`Hex "c000000001088394c8f03e5157080000449e7b9aec34")
       (Hex.of_cstruct header);
     Alcotest.check
       hex
@@ -134,7 +134,20 @@ module Client_initial = struct
       hex
       "resulting protected packet"
       expected_protected_packet
-      (Hex.of_cstruct packet)
+      (Hex.of_cstruct packet);
+    let decrypted =
+      Crypto.AEAD.decrypt_packet
+        encrypter
+        ~largest_pn:1L
+        (Cstruct.of_string (Hex.to_string expected_protected_packet))
+    in
+    Alcotest.(check bool) "roundtrips" true (Option.is_some decrypted);
+    Alcotest.(check hex)
+      "roundtrips"
+      (Hex.of_string (unprotected_header ^ unprotected_payload))
+      (Hex.of_string
+         (Cstruct.to_string (Option.get decrypted).header
+         ^ Cstruct.to_string (Option.get decrypted).plaintext))
 
   let suite = [ "encrypt client initial", `Quick, test_encrypt_client_initial ]
 end
@@ -143,14 +156,14 @@ module Server_initial = struct
   let unprotected_payload =
     Hex.to_string
       (`Hex
-        "0d0000000018410a020000560303eefce7f7b37ba1d1632e96677825ddf73988cfc79825df566dc5430b9a045a1200130100002e00330024001d00209d3c940d89690b84d08a60993c144eca684d1081287c834d5311bcf32bb9da1a002b00020304")
+        "02000000000600405a020000560303eefce7f7b37ba1d1632e96677825ddf73988cfc79825df566dc5430b9a045a1200130100002e00330024001d00209d3c940d89690b84d08a60993c144eca684d1081287c834d5311bcf32bb9da1a002b00020304")
 
   let unprotected_header =
-    Hex.to_string (`Hex "c1ff00001d0008f067a5502a4262b50040740001")
+    Hex.to_string (`Hex "c1000000010008f067a5502a4262b50040750001")
 
   let expected_protected_packet =
     `Hex
-      "caff00001d0008f067a5502a4262b5004074aaf2f007823a5d3a1207c86ee49132824f0465243d082d868b107a38092bc80528664cbf9456ebf27673fb5fa5061ab573c9f001b81da028a00d52ab00b15bebaa70640e106cf2acd043e9c6b4411c0a79637134d8993701fe779e58c2fe753d14b0564021565ea92e57bc6faf56dfc7a40870e6"
+      "cf000000010008f067a5502a4262b5004075c0d95a482cd0991cd25b0aac406a5816b6394100f37a1c69797554780bb38cc5a99f5ede4cf73c3ec2493a1839b3dbcba3f6ea46c5b7684df3548e7ddeb9c3bf9c73cc3f3bded74b562bfb19fb84022f8ef4cdd93795d77d06edbb7aaf2f58891850abbdca3d20398c276456cbc42158407dd074ee"
 
   let test_encrypt_server_initial () =
     let encrypter =
@@ -166,13 +179,13 @@ module Server_initial = struct
     Alcotest.check
       hex
       "sample"
-      (`Hex "823a5d3a1207c86ee49132824f046524")
+      (`Hex "2cd0991cd25b0aac406a5816b6394100")
       (Hex.of_cstruct sample);
     let header = AEAD.encrypt_header encrypter ~sample header in
     Alcotest.check
       hex
       "header"
-      (`Hex "caff00001d0008f067a5502a4262b5004074aaf2")
+      (`Hex "cf000000010008f067a5502a4262b5004075c0d9")
       (Hex.of_cstruct header);
     Alcotest.check
       hex
@@ -197,7 +210,7 @@ module Retry = struct
     let data =
       Hex.to_string
         (`Hex
-          "ffff00001d0008f067a5502a4262b5746f6b656ed16926d81f6f9ca2953a8aa4575e1e49")
+          "ff000000010008f067a5502a4262b5746f6b656e04a265ba2eff4d829058fb3f0f2496ba")
     in
     let integrity_tag =
       Crypto.Retry.calculate_integrity_tag
@@ -221,7 +234,6 @@ module ChaCha = struct
            "9ac312a7f877468ebe69422748ad00a15443f18203a07d6060f688f30f21632b"))
 
   let unprotected_payload = Hex.to_cstruct (`Hex "01")
-
   let unprotected_header = `Hex "4200bff4"
 
   let expected_protected_packet =
@@ -554,8 +566,7 @@ module InitialAEAD_encryption = struct
     | Some { Crypto.AEAD.packet_number; pn_length; _ } ->
       Alcotest.(check int64) "packet number" 1L packet_number;
       Alcotest.(check int) "packet number length" 1 pn_length
-    | None ->
-      Alcotest.fail "expected packet to decrypt successfully"
+    | None -> Alcotest.fail "expected packet to decrypt successfully"
 
   let suite =
     [ ( "header encryption / decryption"

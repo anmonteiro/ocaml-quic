@@ -610,7 +610,7 @@ let packet_handler t packet =
 let create ~config connection_handler =
   let { Config.certificates; alpn_protocols } = config in
   let rec handler t packet = packet_handler (Lazy.force t) packet
-  and decrypt t ~header bs ~off ~len =
+  and decrypt t ~payload_length ~header bs ~off ~len =
     let t : t = Lazy.force t in
     let cs = Cstruct.of_bigarray ~off ~len bs in
     let connection_id = Packet.Header.destination_cid header in
@@ -632,7 +632,7 @@ let create ~config connection_handler =
           assert (Encryption_level.of_header header = Initial);
           Crypto.InitialAEAD.make ~mode:Client connection_id, 0L
       in
-      Crypto.AEAD.decrypt_packet decrypter ~largest_pn cs
+      Crypto.AEAD.decrypt_packet decrypter ~payload_length ~largest_pn cs
   and t =
     lazy
       { reader = Reader.packets ~decrypt:(decrypt t) (handler t)

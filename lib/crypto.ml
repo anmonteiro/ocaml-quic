@@ -34,10 +34,10 @@ type mode =
   | Client
   | Server
 
-(* initial_salt = 0xafbfec289993d24c9e9786f19c6111e04390a899 *)
+(* initial_salt: 0x38762cf7f55934b34d179ae6a4c80cadccbb7f0a *)
 let initial_salt =
   Cstruct.of_string
-    "\xaf\xbf\xec\x28\x99\x93\xd2\x4c\x9e\x97\x86\xf1\x9c\x61\x11\xe0\x43\x90\xa8\x99"
+    "\x38\x76\x2c\xf7\xf5\x59\x34\xb3\x4d\x17\x9a\xe6\xa4\xc8\x0c\xad\xcc\xbb\x7f\x0a"
 
 module Hkdf = struct
   include Hkdf
@@ -62,15 +62,13 @@ module Hkdf = struct
 
   (* TODO: this is called `derive_secret_no_hash` in ocaml-tls, we should use
    * that. *)
-  let expand_label ~hash ~prk ?length ?(ctx = Cstruct.empty) label =
+  let expand_label ~hash ~prk ?length label =
     let length =
       match length with
-      | None ->
-        Mirage_crypto.Hash.digest_size hash
-      | Some x ->
-        x
+      | None -> Mirage_crypto.Hash.digest_size hash
+      | Some x -> x
     in
-    let info = expand_label label ctx length in
+    let info = expand_label label Cstruct.empty length in
     let key = Hkdf.expand ~hash ~prk ~info length in
     key
 end
@@ -433,7 +431,7 @@ module AEAD = struct
     }
 
   (* Ciphertext includes header + payload *)
-  let decrypt_packet t ~largest_pn ciphertext =
+  let decrypt_packet t ~payload_length ~largest_pn ciphertext =
     let offset = sample_offset ~conn_id_len:t.conn_id_len ciphertext in
     let sample = Cstruct.sub ciphertext offset 16 in
     let header = decrypt_header t ~sample ciphertext in
@@ -458,16 +456,16 @@ module AEAD = struct
       decode_packet_number ~largest_pn ~pn_nbits:(8 * pn_length) ~truncated_pn
     in
     let header, ciphertext =
-      Cstruct.split ciphertext ~start:0 (offset - 4 + pn_length)
+      ( Cstruct.sub ciphertext 0 (off + pn_length)
+      , (* This cstruct can have coalesced packets. we just want to decrypt the
+           ciphertext of `payload_length - packet_number_length`. *)
+        Cstruct.sub ciphertext (off + pn_length) (payload_length - pn_length) )
     in
-    let plaintext_payload =
-      decrypt_payload t ~packet_number:pn ~header ciphertext
-    in
-    match plaintext_payload with
+
+    match decrypt_payload t ~packet_number:pn ~header ciphertext with
     | Some plaintext ->
       Some { pn_length; packet_number = pn; header; plaintext }
-    | None ->
-      None
+    | None -> None
 
   let get_cipher_st : Tls.Ciphersuite.aead_cipher -> Cstruct.t -> cipher_st =
    fun ciphersuite secret ->
@@ -546,9 +544,9 @@ module Retry = struct
 
   (* From RFC<QUIC-TLS-RFC>§5.8:
    *   The secret key, K, is 128 bits equal to
-   *   0xccce187ed09a09d05728155a6cb96be1.
+   *   0xbe0c690b9f66575a1d766b54e368c84e.
    *
-   *   The nonce, N, is 96 bits equal to 0xe54930f97f2136f0530a8c1c.
+   *   The nonce, N, is 96 bits equal to 0x461599d35d632bf2239825bb.
    *
    *   The plaintext, P, is empty.
    *
@@ -557,10 +555,10 @@ module Retry = struct
   let key =
     AES_GCM.of_secret
       (Cstruct.of_string
-         "\xcc\xce\x18\x7e\xd0\x9a\x09\xd0\x57\x28\x15\x5a\x6c\xb9\x6b\xe1")
+         "\xbe\x0c\x69\x0b\x9f\x66\x57\x5a\x1d\x76\x6b\x54\xe3\x68\xc8\x4e")
 
   let nonce =
-    Cstruct.of_string "\xe5\x49\x30\xf9\x7f\x21\x36\xf0\x53\x0a\x8c\x1c"
+    Cstruct.of_string "\x46\x15\x99\xd3\x5d\x63\x2b\xf2\x23\x98\x25\xbb"
 
   let calculate_integrity_tag cid pseudo0 =
     let cid_len = CID.length cid in
