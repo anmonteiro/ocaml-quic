@@ -107,8 +107,9 @@ module Connection = struct
     ; handler : Stream.t -> unit
     ; start_stream : start_stream
     ; wakeup_writer : unit -> unit
-    ; mutable next_unidirectional_stream_id : Stream_id.t
     ; shutdown : t -> unit
+    ; mutable next_unidirectional_stream_id : Stream_id.t
+    ; mutable did_send_connection_close : bool
     }
 
   type packet_info =
@@ -127,9 +128,11 @@ module Connection = struct
     let[@warning "-32"] seeded_hash = hash
   end)
 
+  let wakeup_writer t = t.wakeup_writer ()
+
   let shutdown_writer t =
     Writer.close t.writer;
-    t.wakeup_writer ()
+    wakeup_writer t
 
   let shutdown t =
     shutdown_writer t;
@@ -138,23 +141,23 @@ module Connection = struct
   let on_packet_sent t ~encryption_level ~packet_number frames =
     Recovery.on_packet_sent t.recovery ~encryption_level ~packet_number frames
 
-  let send_packet c ~encryption_level frames =
+  let send_frames t ?(encryption_level = t.encdec.current) frames =
     let packet_number =
       Packet_number.send_next
-        (Spaces.of_encryption_level c.packet_number_spaces encryption_level)
+        (Spaces.of_encryption_level t.packet_number_spaces encryption_level)
     in
     let { Crypto.encrypter; _ } =
-      Encryption_level.find_exn encryption_level c.encdec
+      Encryption_level.find_exn encryption_level t.encdec
     in
     let header_info =
       Writer.make_header_info
         ~encrypter
         ~packet_number
         ~encryption_level
-        ~source_cid:c.source_cid
-        c.dest_cid
+        ~source_cid:t.source_cid
+        t.dest_cid
     in
-    Queue.add (header_info, frames) c.queued_packets
+    Queue.add (header_info, frames) t.queued_packets
 
   let process_ack_frame t ~packet_info ~ranges =
     let { header; encryption_level; _ } = packet_info in
@@ -203,7 +206,7 @@ module Connection = struct
                              traffic_secret)
                     })
               t.encdec;
-            (* From RFC<QUIC-RFC>§7:
+            (* From RFC9000§7:
              *   The offsets used by CRYPTO frames to ensure ordered delivery
              *   of cryptographic handshake data start from zero in each
              *   packet number space. *)
@@ -229,7 +232,7 @@ module Connection = struct
     then (
       (* send the HANDSHAKE_DONE frame if we just completed the handshake.
        *
-       * From RFC<QUIC-RFC>§7.3:
+       * From RFC9000§7.3:
        *   The server uses the HANDSHAKE_DONE frame (type=0x1e) to signal
        *   confirmation of the handshake to the client. *)
       assert (t.encdec.current = Application_data);
@@ -252,7 +255,7 @@ module Connection = struct
         (match
            Qtls.handle_raw_record
              ~embed_quic_transport_params:(fun _raw_transport_params ->
-               (* From RFC<QUIC-RFC>§7.3:
+               (* From RFC9000§7.3:
                 *   When the handshake does not include a Retry (Figure 6), the
                 *   server sets original_destination_connection_id to S1 and
                 *   initial_source_connection_id to S3. In this case, the server
@@ -327,7 +330,7 @@ module Connection = struct
     let crypto_stream =
       Spaces.of_encryption_level t.crypto_streams encryption_level
     in
-    (* From RFC<QUIC-RFC>§19.6:
+    (* From RFC9000§19.6:
      *   The stream does not have an explicit end, so CRYPTO frames do not have a
      *   FIN bit. *)
     Stream.Recv.push fragment ~is_fin:false crypto_stream.recv;
@@ -359,6 +362,7 @@ module Connection = struct
     Stream.Recv.push fragment ~is_fin stream.recv;
     process_stream_data c ~stream:stream.recv
 
+  (* TODO: closing/ draining states, section 10.2 *)
   let process_connection_close_quic_frame
       (t : t)
       ~frame_type
@@ -372,6 +376,19 @@ module Connection = struct
       (Error.serialize error_code);
     shutdown t
 
+  let process_connection_close_app_frame (t : t) ~error_code reason_phrase =
+    Format.eprintf "close_app: %s %d@." reason_phrase error_code;
+    shutdown t
+
+  let process_path_challenge_frame t buf =
+    (* From RFC9000§8.2.2:
+     *   On receiving a PATH_CHALLENGE frame, an endpoint MUST respond by
+     *   echoing the data contained in the PATH_CHALLENGE frame in a
+     *   PATH_RESPONSE frame.
+     *
+     *)
+    send_frames t [ Frame.Path_response buf ]
+
   let frame_handler ~packet_info t frame =
     (* TODO: validate that frame can appear at current encryption level. *)
     if Frame.is_ack_eliciting frame
@@ -382,26 +399,24 @@ module Connection = struct
         true;
     match frame with
     | Frame.Padding _n ->
-      (* From RFC<QUIC-RFC>§19.1:
+      (* From RFC9000§19.1:
        *   The PADDING frame (type=0x00) has no semantic value. PADDING frames
        *   can be used to increase the size of a packet. *)
       ()
     | Ping ->
-      (* From RFC<QUIC-RFC>§19.2:
+      (* From RFC9000§19.2:
        *   The receiver of a PING frame simply needs to acknowledge the packet
        *   containing this frame. *)
       ()
     | Ack { ranges; _ } -> process_ack_frame t ~packet_info ~ranges
-    | Reset_stream _ ->
-      failwith
-        (Format.asprintf
-           "frame NYI: 0x%x"
-           (Frame.Type.serialize (Frame.to_frame_type frame)))
-    | Stop_sending _ ->
-      failwith
-        (Format.asprintf
-           "frame NYI: 0x%x"
-           (Frame.Type.serialize (Frame.to_frame_type frame)))
+    | Reset_stream { stream_id; application_protocol_error; final_size } ->
+      process_reset_stream_frame
+        t
+        ~stream_id
+        ~final_size
+        application_protocol_error
+    | Stop_sending { stream_id; application_protocol_error } ->
+      process_stop_sending_frame t ~stream_id application_protocol_error
     | Crypto fragment -> process_crypto_frame t ~packet_info fragment
     | New_token _ ->
       failwith
@@ -423,7 +438,13 @@ module Connection = struct
         "new conn? %s@."
         (let (`Hex x) = Hex.of_string (CID.to_string cid) in
          x)
-    | Retire_connection_id _ | Path_challenge _ | Path_response _ ->
+    | Retire_connection_id _ ->
+      failwith
+        (Format.asprintf
+           "frame NYI: 0x%x"
+           (Frame.Type.serialize (Frame.to_frame_type frame)))
+    | Path_challenge buf -> process_path_challenge_frame t buf
+    | Path_response _ ->
       failwith
         (Format.asprintf
            "frame NYI: 0x%x"
@@ -434,7 +455,9 @@ module Connection = struct
         ~frame_type
         ~error_code
         reason_phrase
-    | Connection_close_app _ | Handshake_done | Unknown _ ->
+    | Connection_close_app { reason_phrase; error_code } ->
+      process_connection_close_app_frame t ~error_code reason_phrase
+    | Handshake_done | Unknown _ ->
       failwith
         (Format.asprintf
            "frame NYI: 0x%x"
@@ -449,7 +472,7 @@ module Connection = struct
     id
 
   let initialize_crypto_streams () =
-    (* From RFC<QUIC-RFC>§19.6:
+    (* From RFC9000§19.6:
      *   The CRYPTO frame (type=0x06) is used to transmit cryptographic handshake
      *   messages. It can be sent in all packet types except 0-RTT. *)
     Spaces.create
@@ -494,9 +517,10 @@ module Connection = struct
         ; streams = Hashtbl.create ~random:true 1024
         ; handler = connection_handler ~cid:source_cid ~start_stream
         ; wakeup_writer
+        ; shutdown
         ; next_unidirectional_stream_id = 0L
         ; start_stream
-        ; shutdown
+        ; did_send_connection_close = false
         }
     and start_stream ~direction =
       let t = Lazy.force t in
@@ -614,7 +638,7 @@ let is_closed t = t.closed
 
 let send_packets t ~packet_info =
   let { connection = c; outgoing_frames; _ } = packet_info in
-  (* From RFC<QUIC-RFC>§12.2:
+  (* From RFC9000§12.2:
    *   Coalescing packets in order of increasing encryption levels (Initial,
    *   0-RTT, Handshake, 1-RTT; see Section 4.1.4 of [QUIC-TLS]) makes it more
    *   likely the receiver will be able to process all the packets in a single
@@ -640,7 +664,7 @@ let send_packets t ~packet_info =
         | [] ->
           (* Don't send invalid (payload-less) frames *)
           ()
-        | frames -> Connection.send_packet c ~encryption_level (List.rev frames)))
+        | frames -> Connection.send_frames c ~encryption_level (List.rev frames)))
     outgoing_frames;
   wakeup_writer t
 
@@ -681,7 +705,7 @@ let packet_handler t packet =
   in
   if CID.is_empty c.original_dest_cid
   then
-    (* From RFC<QUIC-RFC>§7.3:
+    (* From RFC9000§7.3:
      *   Each endpoint includes the value of the Source Connection ID field
      *   from the first Initial packet it sent in the
      *   initial_source_connection_id transport parameter; see Section 18.2. A
@@ -691,7 +715,7 @@ let packet_handler t packet =
     c.original_dest_cid <- Packet.destination_cid packet;
   if CID.is_empty c.dest_cid
   then
-    (* From RFC<QUIC-RFC>§19.6:
+    (* From RFC9000§19.6:
      *   Upon receiving a packet, each endpoint sets the Destination Connection
      *   ID it sends to match the value of the Source Connection ID that it
      *   receives. *)
@@ -843,8 +867,7 @@ let yield_writer t k =
 let yield_reader _t _k = ()
 
 let read_with_more t bs ~off ~len more =
-  let consumed = Reader.read_with_more t.reader bs ~off ~len more in
-  consumed
+  Reader.read_with_more t.reader bs ~off ~len more
 
 let read t ~client_address bs ~off ~len =
   (* let hex = Hex.of_string (Bigstringaf.substring bs ~off ~len) in *)

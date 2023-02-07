@@ -39,8 +39,8 @@ module Type = struct
 
   let classify t =
     let direction = Direction.classify t in
-    if Stream_id.is_server_initiated t then
-      Server direction
+    if Stream_id.is_server_initiated t
+    then Server direction
     else (
       assert (Stream_id.is_client_initiated t);
       Client direction)
@@ -52,14 +52,10 @@ module Type = struct
    *   0x2  Client-Initiated, Unidirectional
    *   0x3  Server-Initiated, Unidirectional *)
   let serialize = function
-    | Client Bidirectional ->
-      0x0L
-    | Server Bidirectional ->
-      0x1L
-    | Client Unidirectional ->
-      0x2L
-    | Server Unidirectional ->
-      0x3L
+    | Client Bidirectional -> 0x0L
+    | Server Bidirectional -> 0x1L
+    | Client Unidirectional -> 0x2L
+    | Server Unidirectional -> 0x3L
 
   let gen_id ~typ id = Int64.logor (Int64.shift_left id 2) (serialize typ)
 end
@@ -74,7 +70,6 @@ module Buffer = struct
     }
 
   let default_on_eof = Sys.opaque_identity (fun () -> ())
-
   let default_on_read = Sys.opaque_identity (fun _ ~off:_ ~len:_ -> ())
 
   let of_faraday faraday when_ready =
@@ -94,11 +89,8 @@ module Buffer = struct
     t
 
   let empty = create_empty ()
-
   let write_uint8 t c = Faraday.write_uint8 t.faraday c
-
   let write_char t c = Faraday.write_char t.faraday c
-
   let write_string t ?off ?len s = Faraday.write_string ?off ?len t.faraday s
 
   let write_bigstring t ?off ?len b =
@@ -123,15 +115,13 @@ module Buffer = struct
 
   let rec do_execute_read t on_eof on_read =
     match Faraday.operation t.faraday with
-    | `Yield ->
-      ()
+    | `Yield -> ()
     | `Close ->
       t.read_scheduled <- false;
       t.on_eof <- default_on_eof;
       t.on_read <- default_on_read;
       on_eof ()
-    | `Writev [] ->
-      assert false
+    | `Writev [] -> assert false
     | `Writev (iovec :: _) ->
       t.read_scheduled <- false;
       t.on_eof <- default_on_eof;
@@ -145,10 +135,10 @@ module Buffer = struct
     if t.read_scheduled then do_execute_read t t.on_eof t.on_read
 
   let schedule_read t ~on_eof ~on_read =
-    if t.read_scheduled then
-      failwith "Body.schedule_read: reader already scheduled";
-    if is_closed t then
-      do_execute_read t on_eof on_read
+    if t.read_scheduled
+    then failwith "Body.schedule_read: reader already scheduled";
+    if is_closed t
+    then do_execute_read t on_eof on_read
     else (
       t.read_scheduled <- true;
       t.on_eof <- on_eof;
@@ -156,7 +146,6 @@ module Buffer = struct
       ready t)
 
   let is_read_scheduled t = t.read_scheduled
-
   let has_pending_output t = Faraday.has_pending_output t.faraday
 
   let close_reader t =
@@ -189,6 +178,16 @@ module Recv = struct
     ; mutable fin_offset : int option
     }
 
+  module State = struct
+    type t =
+      | Recv
+      | Size_known
+      | Data_recvd
+      | Data_read
+      | Reset_recvd
+      | Reset_read
+  end
+
   let create () =
     { q = Q.empty
     ; offset = 0
@@ -198,20 +197,20 @@ module Recv = struct
 
   let push ~is_fin ({ IOVec.off; len; _ } as fragment) t =
     (match t.fin_offset with
-    | Some fin_off ->
-      assert (off <= fin_off)
-    | None ->
-      ());
+    | Some fin_off -> assert (off <= fin_off)
+    | None -> ());
     (* From RFC<QUIC-RFC>§2.2:
      *   An endpoint could receive data for a stream at the same stream offset
      *   multiple times. Data that has already been received can be discarded. *)
-    if t.offset < off + len then (
+    if t.offset < off + len
+    then (
       let q' = Q.add off fragment t.q in
       t.q <- q';
       if is_fin then t.fin_offset <- Some off)
 
   let flush t =
-    if Buffer.has_pending_output t.consumer then (
+    if Buffer.has_pending_output t.consumer
+    then (
       try Buffer.execute_read t.consumer with
       | exn ->
         (* report_exn t exn *)
@@ -221,23 +220,21 @@ module Recv = struct
   let pop t =
     match Q.pop t.q with
     | Some ((off, fragment), q') ->
-      if off = t.offset then (
+      if off = t.offset
+      then (
         t.offset <- t.offset + fragment.len;
         t.q <- q';
-        if not (Buffer.is_closed t.consumer) then (
+        if not (Buffer.is_closed t.consumer)
+        then (
           Buffer.schedule_bigstring t.consumer fragment.buffer;
           flush t;
           match t.fin_offset with
           | Some fin_offset ->
-            if fin_offset = off then
-              Buffer.close_reader t.consumer
-          | None ->
-            ());
+            if fin_offset = off then Buffer.close_reader t.consumer
+          | None -> ());
         Some fragment)
-      else
-        None
-    | None ->
-      None
+      else None
+    | None -> None
 
   let remove off t =
     let q' = Q.remove off t.q in
@@ -251,6 +248,16 @@ module Send = struct
     ; producer : Buffer.t
     ; mutable fin_offset : int option
     }
+
+  module State = struct
+    type t =
+      | Ready
+      | Send
+      | Data_sent
+      | Data_recvd
+      | Reset_sent
+      | Reset_recvd
+  end
 
   let push buffer t =
     let len = Bigstringaf.length buffer in
@@ -266,22 +273,18 @@ module Send = struct
       t.q <- q';
       let is_fin =
         match t.fin_offset with
-        | None ->
-          false
+        | None -> false
         | Some fin_offset ->
           assert (fin_offset = t.offset);
           Q.is_empty q'
       in
       Some (fragment, is_fin)
-    | None ->
-      None
+    | None -> None
 
   let pop_exn t =
     match pop t with
-    | Some ret ->
-      ret
-    | None ->
-      failwith "Quic.Stream.Send.pop_exn"
+    | Some ret -> ret
+    | None -> failwith "Quic.Stream.Send.pop_exn"
 
   let remove off t =
     let q' = Q.remove off t.q in
@@ -307,15 +310,13 @@ module Send = struct
   let flush ?(max_bytes = Int.max_int) t =
     let faraday = t.producer.faraday in
     match Faraday.operation faraday with
-    | `Yield ->
-      0
+    | `Yield -> 0
     | `Close ->
       (match t.fin_offset with
       | None ->
         t.fin_offset <- Some t.offset;
         ignore (push Bigstringaf.empty t : Frame.fragment)
-      | Some _ ->
-        ());
+      | Some _ -> ());
       0
     | `Writev iovecs ->
       let lengthv = IOVec.lengthv iovecs in
@@ -329,6 +330,13 @@ module Send = struct
         iovecs;
       Faraday.shift faraday writev_len;
       writev_len
+
+  let final_size t =
+    (* From RFC9000§4.5:
+     *   More generally, this is one higher than the offset of the byte with
+     *   the largest offset sent on the stream, or zero if no bytes were sent.
+     *)
+    if t.offset = 0 then 0 else t.offset + 1
 end
 
 type t =
@@ -354,9 +362,7 @@ let direction { typ; _ } =
 
 (* Public (application layer) API *)
 let write_uint8 t c = Buffer.write_uint8 t.send.producer c
-
 let write_char t c = Buffer.write_char t.send.producer c
-
 let write_string t ?off ?len s = Buffer.write_string t.send.producer ?off ?len s
 
 let write_bigstring t ?off ?len b =
@@ -366,9 +372,7 @@ let schedule_bigstring t ?off ?len (b : Bigstringaf.t) =
   Buffer.schedule_bigstring t.send.producer ?off ?len b
 
 let unsafe_faraday t = Buffer.unsafe_faraday t.send.producer
-
 let flush t k = Buffer.flush t.send.producer k
-
 let close_writer t = Buffer.close_writer t.send.producer
 
 let schedule_read t ~on_eof ~on_read =
