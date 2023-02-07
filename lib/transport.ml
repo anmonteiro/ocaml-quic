@@ -30,7 +30,6 @@
  *  POSSIBILITY OF SUCH DAMAGE.
  *---------------------------------------------------------------------------*)
 
-module Result = Stdlib.Result
 module Reader = Parse.Reader
 module Writer = Serialize.Writer
 
@@ -87,6 +86,7 @@ type start_stream = direction:Direction.t -> Stream.t
 module Connection = struct
   type t =
     { encdec : Crypto.encdec Encryption_level.t
+    ; mode : Crypto.Mode.t
     ; mutable tls_state : Qtls.t
     ; packet_number_spaces : Packet_number.t Spaces.t
     ; mutable source_cid : CID.t
@@ -185,15 +185,15 @@ module Connection = struct
         ])
 
   let process_reset_stream_frame t ~stream_id ~final_size:_ _application_error =
-    (* From RFC9000§19.4:
-     *   An endpoint that receives a RESET_STREAM frame for a send-only stream
-     *   MUST terminate the connection with error STREAM_STATE_ERROR.
-     *)
     match Hashtbl.find_opt t.streams stream_id with
     | Some stream ->
-      (match stream.typ with
-      (* | TODO: Client Unidirectional (when client) *)
-      | Server Unidirectional ->
+      (match stream.typ, t.mode with
+      | Client Unidirectional, Client | Server Unidirectional, Server ->
+        (* From RFC9000§19.4:
+         *   An endpoint that receives a RESET_STREAM frame for a send-only
+         *   stream MUST terminate the connection with error
+         *   STREAM_STATE_ERROR.
+         *)
         report_error
           t
           ~frame_type:Frame.Type.Reset_stream
@@ -209,13 +209,13 @@ module Connection = struct
   let process_stop_sending_frame t ~stream_id application_protocol_error =
     match Hashtbl.find_opt t.streams stream_id with
     | Some stream ->
-      (* From RFC9000§19.5:
-       *   An endpoint that receives a STOP_SENDING frame for a receive-only
-       *   stream MUST terminate the connection with error STREAM_STATE_ERROR.
-       *)
-      (match stream.typ with
-      (* | TODO: Client Unidirectional (when client) *)
-      | Server Unidirectional ->
+      (match stream.typ, t.mode with
+      | Client Unidirectional, Client | Server Unidirectional, Server ->
+        (* From RFC9000§19.5:
+         *   An endpoint that receives a STOP_SENDING frame for a receive-only
+         *   stream MUST terminate the connection with error
+         *   STREAM_STATE_ERROR.
+         *)
         report_error
           t
           ~frame_type:Frame.Type.Reset_stream
@@ -549,6 +549,7 @@ module Connection = struct
       ~application_data:(Stream.create_crypto ())
 
   let create_connection
+      ~mode
       ~client_address
       ~tls_state
       ~wakeup_writer
@@ -567,6 +568,7 @@ module Connection = struct
     let rec t =
       lazy
         { encdec = Encryption_level.create ~current:Initial
+        ; mode
         ; packet_number_spaces =
             Spaces.create
               ~initial:(Packet_number.create ())
@@ -755,6 +757,7 @@ let packet_handler t packet =
       (* Has to be a new connection. TODO: assert that. *)
       let connection =
         Connection.create_connection
+          ~mode:t.mode
           ~client_address:(Option.get t.current_client_address)
           ~tls_state:t.base_tls_state
           ~wakeup_writer:(ready_to_write t)
