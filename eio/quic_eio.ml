@@ -109,7 +109,7 @@ module IO_loop = struct
       | exception End_of_file -> `Closed
   end
 
-  module Runtime = Quic.Server_connection
+  module Runtime = Quic.Transport
 
   let start
       :  sw:Eio.Switch.t -> read_buffer_size:int -> cancel:unit Promise.t
@@ -187,7 +187,7 @@ module Server = struct
         listen_address
     in
     let never, _ = Promise.create () in
-    let connection = Quic.Server_connection.Server.create ~config handler in
+    let connection = Quic.Transport.Server.create ~config handler in
     IO_loop.start
       connection
       ~sw
@@ -207,7 +207,7 @@ module Client = struct
         listen_address
     in
     let never, _ = Promise.create () in
-    let connection = Quic.Server_connection.Client.create ~config handler in
+    let connection = Quic.Transport.Client.create ~config handler in
     IO_loop.start
       connection
       ~sw

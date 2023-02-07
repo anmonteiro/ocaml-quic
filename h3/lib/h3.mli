@@ -39,6 +39,10 @@ module Status : sig
        and type standard := Httpaf.Status.standard
        and type t := Httpaf.Status.t
 
+  type client_error =
+    [ Httpaf.Status.client_error
+    | `Misdirected_request
+    ]
   (** The 4xx (Client Error) class of status code indicates that the client
       seems to have erred.
 
@@ -48,11 +52,11 @@ module Status : sig
       In addition to http/af, this type also includes the 421 (Misdirected
       Request) tag. See {{:https://tools.ietf.org/html/rfc7540#section-9.1.2}
       RFC7540§9.1.2} for more details. *)
-  type client_error =
-    [ Httpaf.Status.client_error
-    | `Misdirected_request
-    ]
 
+  type standard =
+    [ Httpaf.Status.standard
+    | client_error
+    ]
   (** The status codes defined in the HTTP/1.1 RFCs, excluding the
       [Switching Protocols] status and including the [Misdirected Request] as
       per the HTTP/2 RFC.
@@ -60,16 +64,12 @@ module Status : sig
       See {{:https://tools.ietf.org/html/rfc7540#section-8.1.1} RFC7540§8.1.1}
       and {{:https://tools.ietf.org/html/rfc7540#section-9.1.2} RFC7540§9.1.2}
       for more details. *)
-  type standard =
-    [ Httpaf.Status.standard
-    | client_error
-    ]
 
-  (** The standard codes along with support for custom codes. *)
   type t =
     [ standard
     | `Code of int
     ]
+  (** The standard codes along with support for custom codes. *)
 
   val default_reason_phrase : standard -> string
   (** [default_reason_phrase standard] is the example reason phrase provided by
@@ -113,21 +113,19 @@ module Status : sig
       Server Error class of status codes. *)
 
   val to_string : t -> string
-
   val of_string : string -> t
-
   val pp_hum : Format.formatter -> t -> unit
 end
 
 module Headers : sig
-  (** The type of a group of header fields. *)
   type t
+  (** The type of a group of header fields. *)
 
-  (** The type of a lowercase header name. *)
   type name = string
+  (** The type of a lowercase header name. *)
 
-  (** The type of a header value. *)
   type value = string
+  (** The type of a header value. *)
 
   (** {3 Constructor} *)
 
@@ -238,13 +236,11 @@ module Headers : sig
   (** {3 Iteration} *)
 
   val iter : f:(name -> value -> unit) -> t -> unit
-
   val fold : f:(name -> value -> 'a -> 'a) -> init:'a -> t -> 'a
 
   (** {3 Utilities} *)
 
   val to_string : t -> string
-
   val pp_hum : Format.formatter -> t -> unit
 end
 
@@ -386,11 +382,8 @@ module Reqd : sig
   type t
 
   val request : t -> Request.t
-
   val request_body : t -> [ `read ] Body.t
-
   val response : t -> Response.t option
-
   val response_exn : t -> Response.t
 
   (** {3 Responding}
@@ -403,7 +396,6 @@ module Reqd : sig
       HTTP request/response exchange fully consumes a single stream. *)
 
   val respond_with_string : t -> Response.t -> string -> unit
-
   val respond_with_bigstring : t -> Response.t -> Bigstringaf.t -> unit
 
   val respond_with_streaming
@@ -438,7 +430,6 @@ module Reqd : sig
   (** {3 Exception Handling} *)
 
   val report_exn : t -> exn -> unit
-
   val try_with : t -> (unit -> unit) -> (unit, exn) result
 end
 
@@ -458,8 +449,8 @@ module Server_connection : sig
     :  ?error_handler:error_handler
     -> request_handler
     -> cid:string
-    -> start_stream:Quic.Server_connection.start_stream
-    -> Quic.Server_connection.stream_handler
+    -> start_stream:Quic.Transport.start_stream
+    -> Quic.Transport.stream_handler
   (** [create ?config ?error_handler ~request_handler] creates a connection
       handler that will service individual requests with [request_handler]. *)
 

@@ -32,7 +32,7 @@
 
 module Config = Config
 module Direction = Direction
-module Server_connection = Server_connection
+module Transport = Transport
 module IOVec = IOVec
 module Stream = Stream
 module Stream_id = Stream_id

@@ -42,8 +42,8 @@ module Server : sig
     -> Eio.Net.Sockaddr.datagram
     -> (cid:(* Unix.sockaddr -> *)
             string
-        -> start_stream:Server_connection.start_stream
-        -> Server_connection.stream_handler)
+        -> start_stream:Transport.start_stream
+        -> Transport.stream_handler)
     -> unit
 end
 
@@ -57,7 +57,7 @@ module Client : sig
     -> Eio.Net.Sockaddr.datagram
     -> (cid:(* Unix.sockaddr -> *)
             string
-        -> start_stream:Server_connection.start_stream
-        -> Server_connection.stream_handler)
+        -> start_stream:Transport.start_stream
+        -> Transport.stream_handler)
     -> unit
 end

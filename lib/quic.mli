@@ -92,7 +92,7 @@ module Stream : sig
   val unsafe_faraday : t -> Faraday.t
 end
 
-module Server_connection : sig
+module Transport : sig
   type t
   type start_stream = direction:Direction.t -> Stream.t
   type stream_handler = Stream.t -> unit

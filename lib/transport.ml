@@ -796,9 +796,21 @@ let packet_handler t packet =
   match packet with
   | Packet.VersionNegotiation _ -> failwith "NYI: version negotiation"
   | Frames { header; payload; packet_number; _ } ->
+    let encryption_level = Encryption_level.of_header header in
+    (* (match encryption_level with *)
+    (* | Initial -> *)
+    (* c.packet_number_spaces.initial.received <- *)
+    (* Int64.max c.packet_number_spaces.initial.received packet_number *)
+    (* | Handshake -> *)
+    (* c.packet_number_spaces.handshake.received <- *)
+    (* Int64.max c.packet_number_spaces.handshake.received packet_number *)
+    (* | Application_data | Zero_RTT -> *)
+    (* c.packet_number_spaces.application_data.received <- *)
+    (* Int64.max c.packet_number_spaces.application_data.received
+       packet_number); *)
     let packet_info =
       { header
-      ; encryption_level = Encryption_level.of_header header
+      ; encryption_level
       ; packet_number
       ; outgoing_frames = create_outgoing_frames ~current:c.encdec.current
       ; connection = c
