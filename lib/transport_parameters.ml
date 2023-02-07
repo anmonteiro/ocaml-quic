@@ -147,15 +147,13 @@ module Encoding = struct
       lift
         (fun exponent -> Ack_delay_exponent exponent)
         Parse.variable_length_integer
-    | 0x0b ->
-      lift (fun max -> Max_ack_delay max) Parse.variable_length_integer
+    | 0x0b -> lift (fun max -> Max_ack_delay max) Parse.variable_length_integer
     | 0x0c ->
       (* From RFC<QUIC-RFC>§18.2:
        *   This parameter is a zero-length value. *)
       assert (length = 0);
       return (Disable_active_migration true)
-    | 0x0d ->
-      lift (fun addr -> Preferred_address addr) Preferred_address.parse
+    | 0x0d -> lift (fun addr -> Preferred_address addr) Preferred_address.parse
     | 0x0e ->
       lift
         (fun limit -> Active_connection_id_limit limit)
@@ -168,8 +166,7 @@ module Encoding = struct
       lift
         (fun cid -> Retry_source_connection_id (CID.of_string cid))
         (take length)
-    | _other ->
-      fail "other"
+    | _other -> fail "other"
 
   (* From RFC<QUIC-RFC>§18.1:
    *   Transport parameters with an identifier of the form 31 * N + 27 for
@@ -189,40 +186,23 @@ module Encoding = struct
 
   module Type = struct
     let serialize = function
-      | Original_destination_connection_id _ ->
-        0x00
-      | Max_idle_timeout _ ->
-        0x01
-      | Stateless_reset_token _ ->
-        0x02
-      | Max_udp_payload_size _ ->
-        0x03
-      | Initial_max_data _ ->
-        0x04
-      | Initial_max_stream_data_bidi_local _ ->
-        0x05
-      | Initial_max_stream_data_bidi_remote _ ->
-        0x06
-      | Initial_max_stream_data_uni _ ->
-        0x07
-      | Initial_max_streams_bidi _ ->
-        0x08
-      | Initial_max_streams_uni _ ->
-        0x09
-      | Ack_delay_exponent _ ->
-        0x0a
-      | Max_ack_delay _ ->
-        0x0b
-      | Disable_active_migration _ ->
-        0x0c
-      | Preferred_address _ ->
-        0x0d
-      | Active_connection_id_limit _ ->
-        0x0e
-      | Initial_source_connection_id _ ->
-        0x0f
-      | Retry_source_connection_id _ ->
-        0x10
+      | Original_destination_connection_id _ -> 0x00
+      | Max_idle_timeout _ -> 0x01
+      | Stateless_reset_token _ -> 0x02
+      | Max_udp_payload_size _ -> 0x03
+      | Initial_max_data _ -> 0x04
+      | Initial_max_stream_data_bidi_local _ -> 0x05
+      | Initial_max_stream_data_bidi_remote _ -> 0x06
+      | Initial_max_stream_data_uni _ -> 0x07
+      | Initial_max_streams_bidi _ -> 0x08
+      | Initial_max_streams_uni _ -> 0x09
+      | Ack_delay_exponent _ -> 0x0a
+      | Max_ack_delay _ -> 0x0b
+      | Disable_active_migration _ -> 0x0c
+      | Preferred_address _ -> 0x0d
+      | Active_connection_id_limit _ -> 0x0e
+      | Initial_source_connection_id _ -> 0x0f
+      | Retry_source_connection_id _ -> 0x10
   end
 
   let serialize f t =
@@ -413,7 +393,7 @@ let default =
 
 exception Local
 
-let decode_and_validate ~(perspective : Crypto.mode) enc =
+let decode_and_validate ~(perspective : Crypto.Mode.t) enc =
   let bs = Cstruct.to_bigarray enc in
   match Angstrom.parse_bigstring ~consume:All Encoding.parser bs with
   | Ok (_ :: _ as t) ->
@@ -451,18 +431,15 @@ let decode_and_validate ~(perspective : Crypto.mode) enc =
                   *   This transport parameter MUST NOT be sent by a client,
                   *   but MAY be sent by a server. *)
                  raise Local
-               | Client ->
-                 { acc with stateless_reset_token = Some token })
+               | Client -> { acc with stateless_reset_token = Some token })
              | Max_udp_payload_size max ->
                (* From RFC<QUIC-RFC>§18.2:
                 *   The default for this parameter is the maximum permitted
                 *   UDP payload of 65527. Values below 1200 are invalid. *)
-               if max < 1200 || max > 65527 then
-                 raise Local
-               else
-                 { acc with max_udp_payload_size = max }
-             | Initial_max_data max ->
-               { acc with initial_max_data = max }
+               if max < 1200 || max > 65527
+               then raise Local
+               else { acc with max_udp_payload_size = max }
+             | Initial_max_data max -> { acc with initial_max_data = max }
              | Initial_max_stream_data_bidi_local max ->
                { acc with initial_max_stream_data_bidi_local = max }
              | Initial_max_stream_data_bidi_remote max ->
@@ -476,8 +453,8 @@ let decode_and_validate ~(perspective : Crypto.mode) enc =
              | Ack_delay_exponent exp ->
                (* From RFC<QUIC-RFC>§18.2:
                 *   Values above 20 are invalid. *)
-               if exp > 20 then
-                 raise Local
+               if exp > 20
+               then raise Local
                else
                  { acc with
                    ack_delay_exponent = int_of_float (2. ** float_of_int exp)
@@ -485,10 +462,9 @@ let decode_and_validate ~(perspective : Crypto.mode) enc =
              | Max_ack_delay max ->
                (* From RFC<QUIC-RFC>§18.2:
                 *   Values of 2^14 or greater are invalid. *)
-               if max > 1 lsl 14 then
-                 raise Local
-               else
-                 { acc with max_ack_delay = max }
+               if max > 1 lsl 14
+               then raise Local
+               else { acc with max_ack_delay = max }
              | Disable_active_migration disable_active_migration ->
                assert disable_active_migration;
                { acc with disable_active_migration }
@@ -504,20 +480,17 @@ let decode_and_validate ~(perspective : Crypto.mode) enc =
                (* From RFC<QUIC-RFC>§18.2:
                 *   The value of the active_connection_id_limit parameter MUST
                 *   be at least 2. *)
-               if limit < 2 then
-                 raise Local
-               else
-                 { acc with active_connection_id_limit = limit }
+               if limit < 2
+               then raise Local
+               else { acc with active_connection_id_limit = limit }
              | Initial_source_connection_id cid ->
                { acc with initial_source_connection_id = Some cid }
              | Retry_source_connection_id cid ->
                (* From RFC<QUIC-RFC>§18.2:
                 *   This transport parameter is only sent by a server. *)
-               match perspective with
-               | Server ->
-                 raise Local
-               | Client ->
-                 { acc with retry_source_connection_id = Some cid })
+               (match perspective with
+               | Server -> raise Local
+               | Client -> { acc with retry_source_connection_id = Some cid }))
            default
            t
        in
@@ -531,15 +504,11 @@ let decode_and_validate ~(perspective : Crypto.mode) enc =
          , perspective
          , params.original_destination_connection_id )
        with
-       | None, _, _ ->
-         Error Error.Transport_parameter_error
-       | Some _, Client, None ->
-         Error Error.Transport_parameter_error
-       | Some _, _, _ ->
-         Ok params
+       | None, _, _ -> Error Error.Transport_parameter_error
+       | Some _, Client, None -> Error Error.Transport_parameter_error
+       | Some _, _, _ -> Ok params
      with
-    | Local ->
-      Error Transport_parameter_error)
+    | Local -> Error Transport_parameter_error)
   | Ok []
   (* for the same reason as above -- if there's no
    * initial_source_connection_id, it's an error *)

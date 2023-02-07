@@ -30,9 +30,13 @@
  *  POSSIBILITY OF SUCH DAMAGE.
  *---------------------------------------------------------------------------*)
 
-type mode =
-  | Client
-  | Server
+module Mode = struct
+  type t =
+    | Client
+    | Server
+
+  let peer = function Client -> Server | Server -> Client
+end
 
 (* initial_salt: 0x38762cf7f55934b34d179ae6a4c80cadccbb7f0a *)
 let initial_salt =
@@ -501,7 +505,7 @@ module InitialAEAD = struct
   let get_secret ~mode dest_connection_id =
     let initial_secret = get_initial_secret dest_connection_id in
     match mode with
-    | Client ->
+    | Mode.Client ->
       (* From RFC<QUIC-TLS-RFC>§A.1:
        *
        *   client_initial_secret = HKDF-Expand-Label(initial_secret,

@@ -97,11 +97,6 @@ module Server_connection : sig
   type start_stream = direction:Direction.t -> Stream.t
   type stream_handler = Stream.t -> unit
 
-  val create
-    :  config:Config.t
-    -> (cid:string -> start_stream:start_stream -> stream_handler)
-    -> t
-
   val next_read_operation : t -> [ `Read | `Yield | `Close ]
 
   val read
@@ -127,4 +122,18 @@ module Server_connection : sig
   val report_exn : t -> exn -> unit
   val is_closed : t -> bool
   val shutdown : t -> unit
+
+  module Server : sig
+    val create
+      :  config:Config.t
+      -> (cid:string -> start_stream:start_stream -> stream_handler)
+      -> t
+  end
+
+  module Client : sig
+    val create
+      :  config:Config.t
+      -> (cid:string -> start_stream:start_stream -> stream_handler)
+      -> t
+  end
 end

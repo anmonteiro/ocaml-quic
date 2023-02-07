@@ -546,19 +546,17 @@ module Reader = struct
          -> off:int
          -> len:int
          -> AU.more
-         -> (unit, 'error) result AU.state)
+         -> (unit, error) result AU.state)
 
-  type 'error t =
-    { parser : (unit, 'error) result Angstrom.t
-    ; mutable parse_state : 'error parse_state
+  type t =
+    { parser : (unit, error) result Angstrom.t
+    ; mutable parse_state : error parse_state
           (* The state of the parse for the current request *)
     ; mutable closed : bool
           (* Whether the input source has left the building, indicating that no
            * further input will be received. *)
     ; mutable wakeup : Optional_thunk.t
     }
-
-  type server = error t
 
   let create parser =
     { parser; parse_state = Done; closed = false; wakeup = Optional_thunk.none }

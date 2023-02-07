@@ -187,7 +187,27 @@ module Server = struct
         listen_address
     in
     let never, _ = Promise.create () in
-    let connection = Quic.Server_connection.create ~config handler in
+    let connection = Quic.Server_connection.Server.create ~config handler in
+    IO_loop.start
+      connection
+      ~sw
+      ~read_buffer_size:0x1000
+      ~cancel:never
+      server_fd
+end
+
+module Client = struct
+  let connect env ~sw ~config listen_address handler =
+    let server_fd =
+      Eio.Net.datagram_socket
+        ~reuse_addr:true
+        ~reuse_port:true
+        ~sw
+        (Eio.Stdenv.net env)
+        listen_address
+    in
+    let never, _ = Promise.create () in
+    let connection = Quic.Server_connection.Client.create ~config handler in
     IO_loop.start
       connection
       ~sw

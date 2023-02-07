@@ -171,6 +171,74 @@ module Connection = struct
       (List.length ranges);
     ()
 
+  let report_error ?frame_type t error =
+    if not t.did_send_connection_close
+    then (
+      t.did_send_connection_close <- true;
+      send_frames
+        t
+        [ Frame.Connection_close_quic
+            { frame_type = Option.value ~default:Frame.Type.Padding frame_type
+            ; reason_phrase = ""
+            ; error_code = error
+            }
+        ])
+
+  let process_reset_stream_frame t ~stream_id ~final_size:_ _application_error =
+    (* From RFC9000§19.4:
+     *   An endpoint that receives a RESET_STREAM frame for a send-only stream
+     *   MUST terminate the connection with error STREAM_STATE_ERROR.
+     *)
+    match Hashtbl.find_opt t.streams stream_id with
+    | Some stream ->
+      (match stream.typ with
+      (* | TODO: Client Unidirectional (when client) *)
+      | Server Unidirectional ->
+        report_error
+          t
+          ~frame_type:Frame.Type.Reset_stream
+          Error.Stream_state_error
+      | _ ->
+        (* TODO: stream state transitions 3.1 / 3.2 *)
+        Hashtbl.remove t.streams stream_id)
+    | None -> ()
+
+  (* TODO: Receiving a STOP_SENDING frame for a locally initiated stream that *)
+  (* has not yet been created MUST be treated as a connection error of type *)
+  (* STREAM_STATE_ERROR. *)
+  let process_stop_sending_frame t ~stream_id application_protocol_error =
+    match Hashtbl.find_opt t.streams stream_id with
+    | Some stream ->
+      (* From RFC9000§19.5:
+       *   An endpoint that receives a STOP_SENDING frame for a receive-only
+       *   stream MUST terminate the connection with error STREAM_STATE_ERROR.
+       *)
+      (match stream.typ with
+      (* | TODO: Client Unidirectional (when client) *)
+      | Server Unidirectional ->
+        report_error
+          t
+          ~frame_type:Frame.Type.Reset_stream
+          Error.Stream_state_error
+      | _ ->
+        (* A STOP_SENDING frame requests that the receiving endpoint send a
+           RESET_STREAM frame. An endpoint that receives a STOP_SENDING frame
+           MUST send a RESET_STREAM frame if the stream is in the "Ready" or
+           "Send" state. *)
+        send_frames
+          t
+          [ Frame.Reset_stream
+              { stream_id
+              ; (* From RFC9000§19.5:
+                 *   An endpoint SHOULD copy the error code from the
+                 *   STOP_SENDING frame to the RESET_STREAM frame it sends, but
+                 *   it can use any application error code. *)
+                application_protocol_error
+              ; final_size = Stream.Send.final_size stream.send
+              }
+          ])
+    | None -> ()
+
   let process_tls_result t ~packet_info ~new_tls_state ~tls_packets =
     let { outgoing_frames; _ } = packet_info in
     let current_cipher = Qtls.current_cipher new_tls_state in
@@ -612,7 +680,8 @@ type packet_info = Connection.packet_info =
   }
 
 type t =
-  { reader : Reader.server
+  { reader : Reader.t
+  ; mode : Crypto.Mode.t
   ; connections : Connection.t Connection.Table.t
   ; base_tls_state : Qtls.t
   ; mutable current_client_address : string option
@@ -693,8 +762,12 @@ let packet_handler t packet =
           t.handler
       in
       let encdec =
-        { Crypto.encrypter = Crypto.InitialAEAD.make ~mode:Server connection_id
-        ; decrypter = Some (Crypto.InitialAEAD.make ~mode:Client connection_id)
+        { Crypto.encrypter = Crypto.InitialAEAD.make ~mode:t.mode connection_id
+        ; decrypter =
+            Some
+              (Crypto.InitialAEAD.make
+                 ~mode:(Crypto.Mode.peer t.mode)
+                 connection_id)
         }
       in
       Encryption_level.add Initial encdec connection.encdec;
@@ -774,7 +847,7 @@ let packet_handler t packet =
     | Error e -> failwith ("Err: " ^ e))
   | Retry _ -> failwith "NYI: retry"
 
-let create ~config connection_handler =
+let create ~mode ~config connection_handler =
   let { Config.certificates; alpn_protocols } = config in
   let rec handler t packet = packet_handler (Lazy.force t) packet
   and decrypt t ~payload_length ~header bs ~off ~len =
@@ -797,12 +870,14 @@ let create ~config connection_handler =
           , connection.packet_number_spaces.initial.received )
         | None ->
           assert (Encryption_level.of_header header = Initial);
-          Crypto.InitialAEAD.make ~mode:Client connection_id, 0L
+          ( Crypto.InitialAEAD.make ~mode:(Crypto.Mode.peer t.mode) connection_id
+          , 0L )
       in
       Crypto.AEAD.decrypt_packet decrypter ~payload_length ~largest_pn cs
   and t =
     lazy
       { reader = Reader.packets ~decrypt:(decrypt t) (handler t)
+      ; mode
       ; connections = Connection.Table.create ~random:true 1024
       ; base_tls_state = Qtls.server ~certificates ~alpn_protocols
       ; current_client_address = None
@@ -812,6 +887,16 @@ let create ~config connection_handler =
       }
   in
   Lazy.force t
+
+module Server = struct
+  let create ~config connection_handler =
+    create ~mode:Server ~config connection_handler
+end
+
+module Client = struct
+  let create ~config connection_handler =
+    create ~mode:Client ~config connection_handler
+end
 
 let report_exn _t _exn = ()
 

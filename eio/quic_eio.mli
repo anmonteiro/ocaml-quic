@@ -46,3 +46,18 @@ module Server : sig
         -> Server_connection.stream_handler)
     -> unit
 end
+
+module Client : sig
+  (* XXX: Alternative: ~conn_handler:(conn -> stream_handler) called for each
+   * connection. *)
+  val connect
+    :  Eio.Stdenv.t
+    -> sw:Eio.Switch.t
+    -> config:Config.t
+    -> Eio.Net.Sockaddr.datagram
+    -> (cid:(* Unix.sockaddr -> *)
+            string
+        -> start_stream:Server_connection.start_stream
+        -> Server_connection.stream_handler)
+    -> unit
+end
