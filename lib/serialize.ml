@@ -114,12 +114,12 @@ module Frame = struct
     | None -> ()
 
   let write_reset_stream t ~stream_id ~application_protocol_error ~final_size =
-    write_variable_length_integer t stream_id;
+    write_variable_length_integer t (Int64.to_int stream_id);
     write_variable_length_integer t application_protocol_error;
     write_variable_length_integer t final_size
 
   let write_stop_sending t ~stream_id ~application_protocol_error =
-    write_variable_length_integer t stream_id;
+    write_variable_length_integer t (Int64.to_int stream_id);
     write_variable_length_integer t application_protocol_error
 
   let write_crypto t ~fragment =
@@ -142,7 +142,7 @@ module Frame = struct
   let write_max_data t ~max = write_variable_length_integer t max
 
   let write_max_stream_data t ~stream_id ~max =
-    write_variable_length_integer t stream_id;
+    write_variable_length_integer t (Int64.to_int stream_id);
     write_variable_length_integer t max
 
   let write_max_streams t ~max = write_variable_length_integer t max

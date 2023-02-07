@@ -92,7 +92,7 @@ module Connection = struct
     ; mutable source_cid : CID.t
     ; mutable original_dest_cid : CID.t
     ; mutable dest_cid : CID.t
-    ; (* From RFC<QUIC-RFC>§19.6:
+    ; (* From RFC9000§19.6:
        *   There is a separate flow of cryptographic handshake data in each
        *   encryption level, each of which starts at an offset of 0. This implies
        *   that each encryption level is treated as a separate CRYPTO stream of

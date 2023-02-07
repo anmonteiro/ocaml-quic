@@ -61,7 +61,7 @@ module Type = struct
     | 0x1 -> Zero_RTT
     | 0x2 -> Handshake
     | 0x3 -> Retry
-    | _ -> assert false
+    | _ -> raise Not_found
 
   let serialize = function
     | Initial -> 0x0
@@ -128,6 +128,9 @@ let parse_type first_byte =
   let masked = first_byte land 0b00110000 in
   let type_ = masked lsr 4 in
   Type.parse type_
+
+let parse_type_opt first_byte =
+  try Some (parse_type first_byte) with Not_found -> None
 
 type t =
   | VersionNegotiation of

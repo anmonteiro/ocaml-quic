@@ -228,12 +228,12 @@ type t =
       ; ecn_counts : (int * int * int) option
       }
   | Reset_stream of
-      { stream_id : int
+      { stream_id : Stream_id.t
       ; application_protocol_error : int
       ; final_size : int
       }
   | Stop_sending of
-      { stream_id : int
+      { stream_id : Stream_id.t
       ; application_protocol_error : int
       }
   | Crypto of fragment
@@ -248,7 +248,7 @@ type t =
       }
   | Max_data of int
   | Max_stream_data of
-      { stream_id : int
+      { stream_id : Stream_id.t
       ; max_data : int
       }
   | Max_streams of Direction.t * int
