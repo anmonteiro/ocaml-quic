@@ -148,110 +148,63 @@ module Type = struct
     | Unknown of int
 
   let serialize = function
-    | Padding ->
-      0x00
-    | Ping ->
-      0x01
-    | Ack { ecn_counts } ->
-      if ecn_counts then 0x03 else 0x02
-    | Reset_stream ->
-      0x04
-    | Stop_sending ->
-      0x05
-    | Crypto ->
-      0x06
-    | New_token ->
-      0x07
+    | Padding -> 0x00
+    | Ping -> 0x01
+    | Ack { ecn_counts } -> if ecn_counts then 0x03 else 0x02
+    | Reset_stream -> 0x04
+    | Stop_sending -> 0x05
+    | Crypto -> 0x06
+    | New_token -> 0x07
     | Stream { off; len; fin } ->
       let base = 0x08 in
       let with_off = if off then base + 0x04 else base in
       let with_len = if len then with_off + 0x02 else with_off in
       let with_fin = if fin then with_len + 0x01 else with_len in
       with_fin
-    | Max_data ->
-      0x10
-    | Max_stream_data ->
-      0x11
-    | Max_streams Bidirectional ->
-      0x12
-    | Max_streams Unidirectional ->
-      0x13
-    | Data_blocked ->
-      0x14
-    | Stream_data_blocked ->
-      0x15
-    | Streams_blocked Bidirectional ->
-      0x16
-    | Streams_blocked Unidirectional ->
-      0x17
-    | New_connection_id ->
-      0x18
-    | Retire_connection_id ->
-      0x19
-    | Path_challenge ->
-      0x1A
-    | Path_response ->
-      0x1B
-    | Connection_close_quic ->
-      0x1c
-    | Connection_close_app ->
-      0x1d
-    | Handshake_done ->
-      0x1e
-    | Unknown x ->
-      x
+    | Max_data -> 0x10
+    | Max_stream_data -> 0x11
+    | Max_streams Bidirectional -> 0x12
+    | Max_streams Unidirectional -> 0x13
+    | Data_blocked -> 0x14
+    | Stream_data_blocked -> 0x15
+    | Streams_blocked Bidirectional -> 0x16
+    | Streams_blocked Unidirectional -> 0x17
+    | New_connection_id -> 0x18
+    | Retire_connection_id -> 0x19
+    | Path_challenge -> 0x1A
+    | Path_response -> 0x1B
+    | Connection_close_quic -> 0x1c
+    | Connection_close_app -> 0x1d
+    | Handshake_done -> 0x1e
+    | Unknown x -> x
 
   let parse = function
-    | 0x00 ->
-      Padding
-    | 0x01 ->
-      Ping
-    | 0x02 ->
-      Ack { ecn_counts = false }
-    | 0x03 ->
-      Ack { ecn_counts = true }
-    | 0x04 ->
-      Reset_stream
-    | 0x05 ->
-      Stop_sending
-    | 0x06 ->
-      Crypto
-    | 0x07 ->
-      New_token
+    | 0x00 -> Padding
+    | 0x01 -> Ping
+    | 0x02 -> Ack { ecn_counts = false }
+    | 0x03 -> Ack { ecn_counts = true }
+    | 0x04 -> Reset_stream
+    | 0x05 -> Stop_sending
+    | 0x06 -> Crypto
+    | 0x07 -> New_token
     | x when x >= 0x08 && x <= 0x0f ->
       Stream { off = Bits.test x 2; len = Bits.test x 1; fin = Bits.test x 0 }
-    | 0x10 ->
-      Max_data
-    | 0x11 ->
-      Max_stream_data
-    | 0x12 ->
-      Max_streams Bidirectional
-    | 0x13 ->
-      Max_streams Unidirectional
-    | 0x14 ->
-      Data_blocked
-    | 0x15 ->
-      Stream_data_blocked
-    | 0x16 ->
-      Streams_blocked Bidirectional
-    | 0x17 ->
-      Streams_blocked Unidirectional
-    | 0x18 ->
-      New_connection_id
-    | 0x19 ->
-      Retire_connection_id
-    | 0x1A ->
-      Path_challenge
-    | 0x1B ->
-      Path_response
-    | 0x1c ->
-      Connection_close_quic
-    | 0x1d ->
-      Connection_close_app
-    | 0x1e ->
-      Handshake_done
-    | x ->
-      Unknown x
+    | 0x10 -> Max_data
+    | 0x11 -> Max_stream_data
+    | 0x12 -> Max_streams Bidirectional
+    | 0x13 -> Max_streams Unidirectional
+    | 0x14 -> Data_blocked
+    | 0x15 -> Stream_data_blocked
+    | 0x16 -> Streams_blocked Bidirectional
+    | 0x17 -> Streams_blocked Unidirectional
+    | 0x18 -> New_connection_id
+    | 0x19 -> Retire_connection_id
+    | 0x1A -> Path_challenge
+    | 0x1B -> Path_response
+    | 0x1c -> Connection_close_quic
+    | 0x1d -> Connection_close_app
+    | 0x1e -> Handshake_done
+    | x -> Unknown x
 end
 
 type fragment = Bigstringaf.t IOVec.t
@@ -317,7 +270,7 @@ type t =
   | Connection_close_quic of
       { frame_type : Type.t
       ; reason_phrase : string
-      ; error_code : int
+      ; error_code : Error.t
       }
   | Connection_close_app of
       { reason_phrase : string
@@ -327,50 +280,29 @@ type t =
   | Unknown of int
 
 let to_frame_type = function
-  | Padding _ ->
-    Type.Padding
-  | Ping ->
-    Ping
-  | Ack { ecn_counts; _ } ->
-    Ack { ecn_counts = Option.is_some ecn_counts }
-  | Reset_stream _ ->
-    Reset_stream
-  | Stop_sending _ ->
-    Stop_sending
-  | Crypto _ ->
-    Crypto
-  | New_token _ ->
-    New_token
+  | Padding _ -> Type.Padding
+  | Ping -> Ping
+  | Ack { ecn_counts; _ } -> Ack { ecn_counts = Option.is_some ecn_counts }
+  | Reset_stream _ -> Reset_stream
+  | Stop_sending _ -> Stop_sending
+  | Crypto _ -> Crypto
+  | New_token _ -> New_token
   | Stream { fragment = { IOVec.len; off; _ }; is_fin; _ } ->
     Stream { off = off <> 0; len = len <> 0; fin = is_fin }
-  | Max_data _ ->
-    Max_data
-  | Max_stream_data _ ->
-    Max_stream_data
-  | Max_streams (direction, _) ->
-    Max_streams direction
-  | Data_blocked _ ->
-    Data_blocked
-  | Stream_data_blocked _ ->
-    Stream_data_blocked
-  | Streams_blocked (direction, _) ->
-    Streams_blocked direction
-  | New_connection_id _ ->
-    New_connection_id
-  | Retire_connection_id _ ->
-    Retire_connection_id
-  | Path_challenge _ ->
-    Path_challenge
-  | Path_response _ ->
-    Path_response
-  | Connection_close_quic _ ->
-    Connection_close_quic
-  | Connection_close_app _ ->
-    Connection_close_app
-  | Handshake_done ->
-    Handshake_done
-  | Unknown x ->
-    Unknown x
+  | Max_data _ -> Max_data
+  | Max_stream_data _ -> Max_stream_data
+  | Max_streams (direction, _) -> Max_streams direction
+  | Data_blocked _ -> Data_blocked
+  | Stream_data_blocked _ -> Stream_data_blocked
+  | Streams_blocked (direction, _) -> Streams_blocked direction
+  | New_connection_id _ -> New_connection_id
+  | Retire_connection_id _ -> Retire_connection_id
+  | Path_challenge _ -> Path_challenge
+  | Path_response _ -> Path_response
+  | Connection_close_quic _ -> Connection_close_quic
+  | Connection_close_app _ -> Connection_close_app
+  | Handshake_done -> Handshake_done
+  | Unknown x -> Unknown x
 
 (* From RFC<QUIC-RFC>§1.2:
  *   Ack-eliciting Packet: A QUIC packet that contains frames other than ACK,
@@ -378,7 +310,6 @@ let to_frame_type = function
 let is_ack_eliciting = function
   | Ack _ | Padding _ | Connection_close_quic _ | Connection_close_app _ ->
     false
-  | _all_other ->
-    true
+  | _all_other -> true
 
 let is_any_ack_eliciting frames = List.exists is_ack_eliciting frames

@@ -209,7 +209,7 @@ module Frame = struct
     lift
       (fun reason_phrase ->
         Frame.Connection_close_quic
-          { error_code
+          { error_code = Error.parse error_code
           ; frame_type = Frame.Type.parse frame_type
           ; reason_phrase
           })

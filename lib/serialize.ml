@@ -224,6 +224,7 @@ module Frame = struct
     | Path_challenge data -> write_path_challenge t ~data
     | Path_response data -> write_path_response t ~data
     | Connection_close_quic { frame_type; reason_phrase; error_code } ->
+      let error_code = Error.serialize error_code in
       write_connection_close_quic t ~frame_type ~reason_phrase ~error_code
     | Connection_close_app { reason_phrase; error_code } ->
       write_connection_close_app t ~reason_phrase ~error_code

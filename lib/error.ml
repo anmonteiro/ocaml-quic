@@ -45,73 +45,50 @@ type t =
   | Invalid_token
   | Application_error
   | Crypto_buffer_exceeded
+  | Key_update_error
+  | AEAD_limit_reached
+  | No_viable_path
   | Crypto_error of int
   | Other of int
 
 let parse = function
-  | 0x0 ->
-    No_error
-  | 0x1 ->
-    Internal_error
-  | 0x2 ->
-    Connection_refused
-  | 0x3 ->
-    Flow_control_error
-  | 0x4 ->
-    Stream_limit_error
-  | 0x5 ->
-    Stream_state_error
-  | 0x6 ->
-    Final_size_error
-  | 0x7 ->
-    Frame_encoding_error
-  | 0x8 ->
-    Transport_parameter_error
-  | 0x9 ->
-    Connection_id_limit_error
-  | 0xa ->
-    Protocol_violation
-  | 0xb ->
-    Invalid_token
-  | 0xc ->
-    Application_error
-  | 0xd ->
-    Crypto_buffer_exceeded
-  | x when x >= 0x100 && x <= 0x1ff ->
-    Crypto_error (x - 0x100)
-  | other ->
-    Other other
+  | 0x0 -> No_error
+  | 0x1 -> Internal_error
+  | 0x2 -> Connection_refused
+  | 0x3 -> Flow_control_error
+  | 0x4 -> Stream_limit_error
+  | 0x5 -> Stream_state_error
+  | 0x6 -> Final_size_error
+  | 0x7 -> Frame_encoding_error
+  | 0x8 -> Transport_parameter_error
+  | 0x9 -> Connection_id_limit_error
+  | 0xa -> Protocol_violation
+  | 0xb -> Invalid_token
+  | 0xc -> Application_error
+  | 0xd -> Crypto_buffer_exceeded
+  | 0xe -> Key_update_error
+  | 0xf -> AEAD_limit_reached
+  | 0x10 -> No_viable_path
+  | x when x >= 0x100 && x <= 0x1ff -> Crypto_error (x - 0x100)
+  | other -> Other other
 
 let serialize = function
-  | No_error ->
-    0x0
-  | Internal_error ->
-    0x1
-  | Connection_refused ->
-    0x2
-  | Flow_control_error ->
-    0x3
-  | Stream_limit_error ->
-    0x4
-  | Stream_state_error ->
-    0x5
-  | Final_size_error ->
-    0x6
-  | Frame_encoding_error ->
-    0x7
-  | Transport_parameter_error ->
-    0x8
-  | Connection_id_limit_error ->
-    0x9
-  | Protocol_violation ->
-    0xa
-  | Invalid_token ->
-    0xb
-  | Application_error ->
-    0xc
-  | Crypto_buffer_exceeded ->
-    0xd
-  | Crypto_error x ->
-    x + 0x100
-  | Other other ->
-    other
+  | No_error -> 0x0
+  | Internal_error -> 0x1
+  | Connection_refused -> 0x2
+  | Flow_control_error -> 0x3
+  | Stream_limit_error -> 0x4
+  | Stream_state_error -> 0x5
+  | Final_size_error -> 0x6
+  | Frame_encoding_error -> 0x7
+  | Transport_parameter_error -> 0x8
+  | Connection_id_limit_error -> 0x9
+  | Protocol_violation -> 0xa
+  | Invalid_token -> 0xb
+  | Application_error -> 0xc
+  | Crypto_buffer_exceeded -> 0xd
+  | Key_update_error -> 0xe
+  | AEAD_limit_reached -> 0xf
+  | No_viable_path -> 0x10
+  | Crypto_error x -> x + 0x100
+  | Other other -> other
