@@ -140,6 +140,10 @@ module Client_initial = struct
         encrypter
         ~largest_pn:1L
         (Cstruct.of_string (Hex.to_string expected_protected_packet))
+        ~payload_length:
+          (String.length (Hex.to_string expected_protected_packet)
+          - String.length unprotected_header
+          + 4)
     in
     Alcotest.(check bool) "roundtrips" true (Option.is_some decrypted);
     Alcotest.(check hex)
@@ -212,16 +216,32 @@ module Retry = struct
         (`Hex
           "ff000000010008f067a5502a4262b5746f6b656e04a265ba2eff4d829058fb3f0f2496ba")
     in
-    let integrity_tag =
-      Crypto.Retry.calculate_integrity_tag
-        (Quic.CID.of_string dest_cid)
-        (Bigstringaf.of_string ~off:0 ~len:(String.length data - 16) data)
-    in
-    Alcotest.check
-      hex
-      "integrity tag"
-      (Hex.of_string (String.sub data (String.length data - 16) 16))
-      (Hex.of_cstruct integrity_tag)
+    match
+      Angstrom.parse_string ~consume:All Quic__.Parse.Packet.Payload.retry data
+    with
+    | Ok
+        (Retry
+          { header : Quic.Packet.Header.t = _
+          ; token : string = _
+          ; pseudo : Bigstringaf.t
+          ; tag : Bigstringaf.t = _
+          }) ->
+      Alcotest.check
+        hex
+        "pseudo"
+        (Hex.of_string (String.sub data 0 (String.length data - 16)))
+        (Hex.of_bigstring pseudo);
+      let integrity_tag =
+        Crypto.Retry.calculate_integrity_tag
+          (Quic.CID.of_string dest_cid)
+          (Bigstringaf.of_string ~off:0 ~len:(String.length data - 16) data)
+      in
+      Alcotest.check
+        hex
+        "integrity tag"
+        (Hex.of_string (String.sub data (String.length data - 16) 16))
+        (Hex.of_cstruct integrity_tag)
+    | _ -> assert false
 
   let suite = [ "check retry integrity", `Quick, test_retry_integrity_check ]
 end
@@ -449,6 +469,10 @@ module InitialAEAD_encryption = struct
         (Crypto.AEAD.decrypt_packet
            client_encrypter
            ~largest_pn:0L
+           ~payload_length:
+             (Cstruct.length protected_packet
+             - Cstruct.length unprotected_header
+             + 4)
            protected_packet)
     in
     Alcotest.check
@@ -492,6 +516,10 @@ module InitialAEAD_encryption = struct
         (Crypto.AEAD.decrypt_packet
            server_encrypter
            ~largest_pn:0L
+           ~payload_length:
+             (Cstruct.length protected_packet
+             - Cstruct.length unprotected_header
+             + 2)
            protected_packet)
     in
     Alcotest.check
@@ -525,7 +553,14 @@ module InitialAEAD_encryption = struct
         }
       =
       Option.get
-        (Crypto.AEAD.decrypt_packet encrypter ~largest_pn:0L protected_packet)
+        (Crypto.AEAD.decrypt_packet
+           encrypter
+           ~largest_pn:0L
+           ~payload_length:
+             (Cstruct.length protected_packet
+             - String.length (Hex.to_string unprotected_header)
+             + 4)
+           protected_packet)
     in
     Alcotest.check
       hex
@@ -560,7 +595,11 @@ module InitialAEAD_encryption = struct
       Cstruct.of_bigarray (Faraday.serialize_to_bigstring writer.encoder)
     in
     let ret =
-      Crypto.AEAD.decrypt_packet encrypter ~largest_pn:0L protected_packet
+      Crypto.AEAD.decrypt_packet
+        encrypter
+        ~largest_pn:0L
+        ~payload_length:22
+        protected_packet
     in
     match ret with
     | Some { Crypto.AEAD.packet_number; pn_length; _ } ->
@@ -660,6 +699,7 @@ module ChaCha20_encryption = struct
         (Crypto.AEAD.decrypt_packet
            encrypter
            ~largest_pn:(Int64.sub packet_number 100L)
+           ~payload_length:20
            protected_packet)
     in
     Alcotest.check

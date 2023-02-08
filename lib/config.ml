@@ -32,5 +32,7 @@
 
 type t =
   { certificates : Tls.Config.own_cert
-  ; alpn_protocols : string list
+  ; alpn_protocols : string list (* ; authenticator : X509.Authenticator.t *)
   }
+
+let null_auth ?ip:_ ~host:_ _certs = Ok None

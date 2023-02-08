@@ -80,10 +80,15 @@ module Packet_number = struct
     Frame.Ack { delay = 0; ranges; ecn_counts = None }
 end
 
-type stream_handler = Stream.t -> unit
+type stream_handler = F of (Stream.t -> unit)
 type start_stream = direction:Direction.t -> Stream.t
 
 module Connection = struct
+  type handler =
+    | Uninitialized of
+        (cid:string -> start_stream:start_stream -> stream_handler)
+    | Initialized of stream_handler
+
   type t =
     { encdec : Crypto.encdec Encryption_level.t
     ; mode : Crypto.Mode.t
@@ -98,19 +103,30 @@ module Connection = struct
        *   that each encryption level is treated as a separate CRYPTO stream of
        *   data. *)
       crypto_streams : Stream.t Spaces.t
-    ; mutable client_address : string
+    ; mutable peer_address : string
     ; mutable client_transport_params : Transport_parameters.t
     ; recovery : Recovery.t
     ; queued_packets : (Writer.header_info * Frame.t list) Queue.t
     ; writer : Writer.t
     ; streams : (Stream_id.t, Stream.t) Hashtbl.t
-    ; handler : Stream.t -> unit
+    ; mutable handler : handler
     ; start_stream : start_stream
     ; wakeup_writer : unit -> unit
     ; shutdown : t -> unit
     ; mutable next_unidirectional_stream_id : Stream_id.t
     ; mutable did_send_connection_close : bool
+    ; (* TODO: should be retry or initial? *)
+      mutable processed_retry_packet : bool
+    ; mutable token_value : string
     }
+
+  let invoke_handler t ~cid ~start_stream stream =
+    match t.handler with
+    | Uninitialized f ->
+      let (F stream_handler as handler_f) = f ~cid ~start_stream in
+      t.handler <- Initialized handler_f;
+      stream_handler stream
+    | Initialized (F stream_handler) -> stream_handler stream
 
   type packet_info =
     { packet_number : int64
@@ -155,6 +171,7 @@ module Connection = struct
         ~packet_number
         ~encryption_level
         ~source_cid:t.source_cid
+        ~token:t.token_value
         t.dest_cid
     in
     Queue.add (header_info, frames) t.queued_packets
@@ -423,8 +440,20 @@ module Connection = struct
       | Some stream -> stream
       | None ->
         let direction = Direction.classify id in
-        let stream = create_stream c ~typ:(Client direction) ~id in
-        c.handler stream;
+        let stream =
+          create_stream
+            c
+            ~typ:
+              (match c.mode with
+              | Server -> Client direction
+              | Client -> Server direction)
+            ~id
+        in
+        invoke_handler
+          c
+          ~cid:(CID.to_string c.source_cid)
+          ~start_stream:c.start_stream
+          stream;
         stream
     in
     Stream.Recv.push fragment ~is_fin stream.recv;
@@ -548,56 +577,81 @@ module Connection = struct
       ~handshake:(Stream.create_crypto ())
       ~application_data:(Stream.create_crypto ())
 
-  let create_connection
+  let create
       ~mode
-      ~client_address
+      ~peer_address
       ~tls_state
       ~wakeup_writer
       ~shutdown
-      connection_handler
+      ~connection_handler
+      connection_id
     =
     let crypto_streams = initialize_crypto_streams () in
     let source_cid =
-      let id =
-        (* needs to match CID.src_length. *)
-        Hex.to_string (`Hex "c3eaeabd54582a4ee2cb75bff63b8f0a874a51ad")
-      in
-      assert (String.length id = CID.src_length);
-      id
+      (* let id = *)
+      (* (* needs to match CID.src_length. *) *)
+      (* Hex.to_string (`Hex "c3eaeabd54582a4ee2cb75bff63b8f0a874a51ad") *)
+      (* in *)
+      assert (String.length (CID.to_string connection_id) = CID.src_length);
+      connection_id
     in
     let rec t =
-      lazy
-        { encdec = Encryption_level.create ~current:Initial
-        ; mode
-        ; packet_number_spaces =
-            Spaces.create
-              ~initial:(Packet_number.create ())
-              ~handshake:(Packet_number.create ())
-              ~application_data:(Packet_number.create ())
-        ; crypto_streams
-        ; tls_state
-        ; source_cid = CID.of_string source_cid
-        ; original_dest_cid = CID.empty
-        ; dest_cid = CID.empty
-        ; client_address
-        ; client_transport_params = Transport_parameters.default
-        ; recovery = Recovery.create ()
-        ; queued_packets = Queue.create ()
-        ; writer = Writer.create 0x1000
-        ; streams = Hashtbl.create ~random:true 1024
-        ; handler = connection_handler ~cid:source_cid ~start_stream
-        ; wakeup_writer
-        ; shutdown
-        ; next_unidirectional_stream_id = 0L
-        ; start_stream
-        ; did_send_connection_close = false
-        }
-    and start_stream ~direction =
-      let t = Lazy.force t in
-      let id = next_unidirectional_stream_id t ~direction in
-      create_stream t ~typ:(Server direction) ~id
+      { encdec = Encryption_level.create ~current:Initial
+      ; mode
+      ; packet_number_spaces =
+          Spaces.create
+            ~initial:(Packet_number.create ())
+            ~handshake:(Packet_number.create ())
+            ~application_data:(Packet_number.create ())
+      ; crypto_streams
+      ; tls_state
+      ; source_cid
+      ; original_dest_cid = CID.empty
+      ; dest_cid = CID.empty
+      ; peer_address
+      ; client_transport_params = Transport_parameters.default
+      ; recovery = Recovery.create ()
+      ; queued_packets = Queue.create ()
+      ; writer = Writer.create 0x1000
+      ; streams = Hashtbl.create ~random:true 1024
+      ; handler = Uninitialized connection_handler
+      ; wakeup_writer
+      ; shutdown
+      ; next_unidirectional_stream_id = 0L
+      ; start_stream =
+          (fun ~direction ->
+            let id = next_unidirectional_stream_id t ~direction in
+            create_stream t ~typ:(Server direction) ~id)
+      ; did_send_connection_close = false
+      ; processed_retry_packet = false
+      ; token_value = ""
+      }
     in
-    Lazy.force t
+    t
+
+  let send_handshake_bytes t =
+    match t.tls_state.handshake.machina with
+    | Client (Tls.State.AwaitServerHello (_, _, [ raw_record ]))
+    (* | Client13 (AwaitServerHello13 (_, _, raw)) *) ->
+      let current_encryption_level = t.encdec.current in
+      assert (current_encryption_level = Initial);
+      (* [(Packet.HANDSHAKE, raw)] *)
+      let crypto_stream =
+        Spaces.of_encryption_level t.crypto_streams current_encryption_level
+      in
+      let fragment =
+        Stream.Send.push (Cstruct.to_bigarray raw_record) crypto_stream.send
+      in
+      send_frames
+        t
+        ~encryption_level:current_encryption_level
+        [ Frame.Crypto fragment ]
+    | Client _ | Client13 _ -> assert false
+    | Server _ | Server13 _ -> assert false
+
+  let establish_connection t =
+    send_handshake_bytes t;
+    wakeup_writer t
 
   type flush_ret =
     | Didnt_write
@@ -653,6 +707,7 @@ module Connection = struct
                   ~packet_number
                   ~encryption_level
                   ~source_cid:t.source_cid
+                  ~token:t.token_value
                   t.dest_cid
               in
               let fragment, is_fin = Stream.Send.pop_exn stream.send in
@@ -684,12 +739,13 @@ type packet_info = Connection.packet_info =
 type t =
   { reader : Reader.t
   ; mode : Crypto.Mode.t
+  ; config : Config.t
   ; connections : Connection.t Connection.Table.t
-  ; base_tls_state : Qtls.t
-  ; mutable current_client_address : string option
+  ; mutable current_peer_address : string option
   ; mutable wakeup_writer : Optional_thunk.t
   ; mutable closed : bool
-  ; handler : cid:string -> start_stream:start_stream -> stream_handler
+  ; connection_handler :
+      cid:string -> start_stream:start_stream -> stream_handler
   }
 
 let wakeup_writer t =
@@ -744,26 +800,129 @@ let create_outgoing_frames ~current =
   List.iter (fun lvl -> Encryption_level.add lvl [] r) Encryption_level.all;
   r
 
-let packet_handler t packet =
-  (* TODO: track received packet number. *)
+let create_new_connection
+    ?(src_cid = CID.generate ())
+    ~peer_address
+    ~tls_state
+    ~connection_handler
+    ~encdec
+    t
+  =
   let shutdown_connection (c : Connection.t) =
     Connection.Table.remove t.connections c.source_cid
   in
+  let connection =
+    Connection.create
+      ~mode:t.mode
+      ~peer_address
+      ~tls_state
+      ~wakeup_writer:(ready_to_write t)
+      ~shutdown:shutdown_connection
+      ~connection_handler
+      src_cid
+  in
+  Encryption_level.add Initial encdec connection.encdec;
+
+  assert (not (Connection.Table.mem t.connections src_cid));
+  Connection.Table.add t.connections connection.source_cid connection;
+  connection
+
+let process_retry_packet
+    t
+    (c : Connection.t)
+    ~(header : Packet.Header.t)
+    ~token
+    ~pseudo
+    ~tag
+  =
+  assert (t.mode = Client);
+  match c.processed_retry_packet with
+  | true ->
+    (* From RFC9000§17.2.5.2:
+     *   A client MUST accept and process at most one Retry packet for each
+     *   connection attempt. After the client has received and processed an
+     *   Initial or Retry packet from the server, it MUST discard any
+     *   subsequent Retry packets that it receives.
+     *)
+    ()
+  | false ->
+    (match header with
+    | Long { source_cid = pkt_src_cid; _ } ->
+      if CID.equal pkt_src_cid c.dest_cid
+      then
+        (* From RFC9000§7.3:
+         *   A client MUST discard a Retry packet that contains a Source
+         *   Connection ID field that is identical to the Destination Connection
+         *   ID field of its Initial packet. *)
+        ()
+      else
+        let connection_id = c.dest_cid in
+        let retry_identity_tag =
+          Crypto.Retry.calculate_integrity_tag connection_id pseudo
+          |> Cstruct.to_bigarray
+        in
+        (match
+           Cstruct.equal
+             (Cstruct.of_bigarray retry_identity_tag)
+             (Cstruct.of_bigarray tag)
+         with
+        | false ->
+          (* From RFC9000§17.2.5.2:
+           *   Clients MUST discard Retry packets that have a Retry Integrity Tag
+           *   that cannot be validated; [...]. *)
+          ()
+        | true ->
+          (match String.length token with
+          | 0 ->
+            (* From RFC9000§17.2.5.2:
+             *   A client MUST discard a Retry packet with a zero-length Retry
+             *   Token field. *)
+            ()
+          | _ ->
+            (* From RFC9000§17.2.5.1:
+             *   The client MUST use the value from the Source Connection ID field of
+             *   the Retry packet in the Destination Connection ID field of
+             *   subsequent packets that it sends. *)
+            c.dest_cid <- pkt_src_cid;
+
+            (* From RFC9000§17.2.5.2:
+             *   The client responds to a Retry packet with an Initial packet
+             *   that includes the provided Retry token to continue connection
+             *   establishment. *)
+            c.token_value <- token;
+
+            let encdec =
+              (* From RFC9000§17.2.5.2:
+               *   Changing the Destination Connection ID field also results in
+               *   a change to the keys used to protect the Initial packet. *)
+              { Crypto.encrypter =
+                  Crypto.InitialAEAD.make ~mode:t.mode c.dest_cid
+              ; decrypter =
+                  Some
+                    (Crypto.InitialAEAD.make
+                       ~mode:(Crypto.Mode.peer t.mode)
+                       c.dest_cid)
+              }
+            in
+            Encryption_level.add Initial encdec c.encdec;
+
+            Connection.send_handshake_bytes c;
+
+            c.processed_retry_packet <- true;
+            wakeup_writer t))
+    | Initial _ | Short _ -> assert false)
+
+let packet_handler t packet =
+  (* TODO: track received packet number. *)
   let connection_id = Packet.destination_cid packet in
   let c =
     match Connection.Table.find_opt t.connections connection_id with
     | Some connection -> connection
     | None ->
       (* Has to be a new connection. TODO: assert that. *)
-      let connection =
-        Connection.create_connection
-          ~mode:t.mode
-          ~client_address:(Option.get t.current_client_address)
-          ~tls_state:t.base_tls_state
-          ~wakeup_writer:(ready_to_write t)
-          ~shutdown:shutdown_connection
-          t.handler
-      in
+      assert (t.mode = Server);
+      let { Config.certificates; alpn_protocols } = t.config in
+
       let encdec =
         { Crypto.encrypter = Crypto.InitialAEAD.make ~mode:t.mode connection_id
         ; decrypter =
@@ -773,11 +932,13 @@ let packet_handler t packet =
                  connection_id)
         }
       in
-      Encryption_level.add Initial encdec connection.encdec;
-
-      assert (not (Connection.Table.mem t.connections connection_id));
-      Connection.Table.add t.connections connection.source_cid connection;
-      connection
+      let tls_state = Qtls.server ~certificates ~alpn_protocols in
+      create_new_connection
+        t
+        ~peer_address:(Option.get t.current_peer_address)
+        ~tls_state
+        ~connection_handler:t.connection_handler
+        ~encdec
   in
   if CID.is_empty c.original_dest_cid
   then
@@ -789,17 +950,12 @@ let packet_handler t packet =
      *   Initial packet it received from the client in the
      *   original_destination_connection_id transport parameter [...]. *)
     c.original_dest_cid <- Packet.destination_cid packet;
-  if CID.is_empty c.dest_cid
-  then
-    (* From RFC9000§19.6:
-     *   Upon receiving a packet, each endpoint sets the Destination Connection
-     *   ID it sends to match the value of the Source Connection ID that it
-     *   receives. *)
-    c.dest_cid <- Option.get (Packet.source_cid packet);
+
   match packet with
   | Packet.VersionNegotiation _ -> failwith "NYI: version negotiation"
   | Frames { header; payload; packet_number; _ } ->
     let encryption_level = Encryption_level.of_header header in
+
     (* (match encryption_level with *)
     (* | Initial -> *)
     (* c.packet_number_spaces.initial.received <- *)
@@ -811,6 +967,20 @@ let packet_handler t packet =
     (* c.packet_number_spaces.application_data.received <- *)
     (* Int64.max c.packet_number_spaces.application_data.received
        packet_number); *)
+    (match Packet.source_cid packet with
+    | Some src_cid ->
+      (* From RFC9000§19.6:
+       *   Upon receiving a packet, each endpoint sets the Destination Connection
+       *   ID it sends to match the value of the Source Connection ID that it
+       *   receives. *)
+      c.dest_cid <- src_cid
+    | None ->
+      (* TODO: short packets will fail here? *)
+      assert (
+        match packet with
+        | Frames { header = Packet.Header.Short _; _ } -> true
+        | _ -> false));
+
     let packet_info =
       { header
       ; encryption_level
@@ -819,6 +989,7 @@ let packet_handler t packet =
       ; connection = c
       }
     in
+
     (match
        Angstrom.parse_bigstring
          ~consume:All
@@ -860,11 +1031,11 @@ let packet_handler t packet =
       (* Reset for the next packet. *)
       pn_space.ack_elicited <- false
     | Error e -> failwith ("Err: " ^ e))
-  | Retry _ -> failwith "NYI: retry"
+  | Retry { header; token; pseudo; tag } ->
+    process_retry_packet t c ~header ~token ~pseudo ~tag
 
 let create ~mode ~config connection_handler =
-  let { Config.certificates; alpn_protocols } = config in
-  let rec handler t packet = packet_handler (Lazy.force t) packet
+  let rec reader_packet_handler t packet = packet_handler (Lazy.force t) packet
   and decrypt t ~payload_length ~header bs ~off ~len =
     let t : t = Lazy.force t in
     let cs = Cstruct.of_bigarray ~off ~len bs in
@@ -891,14 +1062,14 @@ let create ~mode ~config connection_handler =
       Crypto.AEAD.decrypt_packet decrypter ~payload_length ~largest_pn cs
   and t =
     lazy
-      { reader = Reader.packets ~decrypt:(decrypt t) (handler t)
+      { reader = Reader.packets ~decrypt:(decrypt t) (reader_packet_handler t)
       ; mode
+      ; config
       ; connections = Connection.Table.create ~random:true 1024
-      ; base_tls_state = Qtls.server ~certificates ~alpn_protocols
-      ; current_client_address = None
+      ; current_peer_address = None
       ; wakeup_writer = Optional_thunk.none
       ; closed = false
-      ; handler = connection_handler
+      ; connection_handler
       }
   in
   Lazy.force t
@@ -913,6 +1084,51 @@ module Client = struct
     create ~mode:Client ~config connection_handler
 end
 
+let connect t ~address connection_handler =
+  let { Config.alpn_protocols; _ } = t.config in
+  let dest_cid = CID.generate () in
+  let src_cid = CID.generate () in
+  let encdec =
+    (* From RFC9001§5.2:
+     *   Initial packets apply the packet protection process, but use a secret
+     *   derived from the Destination Connection ID field from the client's
+     *   first Initial packet. *)
+    { Crypto.encrypter = Crypto.InitialAEAD.make ~mode:t.mode dest_cid
+    ; decrypter =
+        Some (Crypto.InitialAEAD.make ~mode:(Crypto.Mode.peer t.mode) dest_cid)
+    }
+  in
+  Format.eprintf
+    "client IDs: %s -> %s@."
+    (let (`Hex x) = Hex.of_string (CID.to_string src_cid) in
+     x)
+    (let (`Hex x) = Hex.of_string (CID.to_string dest_cid) in
+     x);
+  let transport_params =
+    (* TODO 7.3 authenticating connection ids *)
+    Transport_parameters.(
+      encode
+        [ (* Encoding.Original_destination_connection_id dest_cid *)
+          (* ; *)
+          Encoding.Initial_source_connection_id src_cid
+        ; Active_connection_id_limit 2
+        ])
+  in
+  let tls_state =
+    Qtls.client ~authenticator:Config.null_auth ~alpn_protocols transport_params
+  in
+  let new_connection =
+    create_new_connection
+      t
+      ~peer_address:address
+      ~tls_state
+      ~src_cid
+      ~connection_handler
+      ~encdec
+  in
+  new_connection.dest_cid <- dest_cid;
+  Connection.establish_connection new_connection
+
 let report_exn _t _exn = ()
 
 let flush_pending_packets t =
@@ -922,11 +1138,11 @@ let flush_pending_packets t =
       (match Connection._flush_pending_packets connection with
       | Wrote_app_data ->
         (* Can't write anything else in this datagram. *)
-        Some (connection.writer, connection.client_address, CID.to_string cid)
+        Some (connection.writer, connection.peer_address, CID.to_string cid)
       | Didnt_write ->
         (match Connection.Streams.flush connection connection.streams with
         | Wrote_app_data ->
-          Some (connection.writer, connection.client_address, CID.to_string cid)
+          Some (connection.writer, connection.peer_address, CID.to_string cid)
         | _ -> inner t (xs ()))
       | Wrote ->
         (* There might be space in this datagram for some application data
@@ -934,7 +1150,7 @@ let flush_pending_packets t =
         ignore
           (Connection.Streams.flush connection connection.streams
             : Connection.flush_ret);
-        Some (connection.writer, connection.client_address, CID.to_string cid))
+        Some (connection.writer, connection.peer_address, CID.to_string cid))
     | Nil -> None
   in
   inner t (Connection.Table.to_seq_values t.connections ())

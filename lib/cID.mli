@@ -33,23 +33,14 @@
 type t
 
 val empty : t
-
 val length : t -> int
-
 val src_length : int
-
 val is_unset : t -> bool
-
 val is_empty : t -> bool
-
 val parse : t Angstrom.t
-
 val serialize : Faraday.t -> t -> unit
-
 val to_string : t -> string
-
 val of_string : string -> t
-
 val compare : t -> t -> int
-
 val equal : t -> t -> bool
+val generate : unit -> t

@@ -148,7 +148,7 @@ type t =
       { header : Header.t
       ; token : string
       ; pseudo : Bigstringaf.t
-      ; tag : string
+      ; tag : Bigstringaf.t
       }
 
 let destination_cid = function

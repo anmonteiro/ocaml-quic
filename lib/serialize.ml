@@ -359,7 +359,7 @@ module Pkt = struct
 
   let write_retry_payload t ~token ~tag =
     Faraday.write_string t token;
-    Faraday.write_string t tag
+    Faraday.schedule_bigstring t tag
 
   let write_packet t packet =
     match packet with
@@ -424,7 +424,7 @@ module Writer = struct
       ~encryption_level
       ?(source_cid = CID.empty)
       ?(version = 0x1l)
-      ?(token = "")
+      ~token
       dest_cid
     =
     { encrypter

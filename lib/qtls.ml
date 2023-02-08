@@ -1,5 +1,4 @@
-open Tls
-open State
+module State = Tls.State
 
 type t = State.state =
   { handshake : State.handshake_state
@@ -12,13 +11,13 @@ let ( <+> ) = Cstruct.append
 let ( let* ) = Result.bind
 
 module Alert = struct
-  open Packet
+  open Tls.Packet
 
-  let make ?level typ = ALERT, Writer.assemble_alert ?level typ
+  let make ?level typ = ALERT, Tls.Writer.assemble_alert ?level typ
   let close_notify = make ~level:WARNING CLOSE_NOTIFY
 
   let handle buf =
-    match Reader.parse_alert buf with
+    match Tls.Reader.parse_alert buf with
     | Ok (_, a_type) ->
       let err = match a_type with CLOSE_NOTIFY -> `Eof | _ -> `Alert a_type in
       Ok (err, [ `Record close_notify ])
@@ -26,15 +25,15 @@ module Alert = struct
 end
 
 let rec separate_handshakes buf =
-  match Reader.parse_handshake_frame buf with
+  match Tls.Reader.parse_handshake_frame buf with
   | None, rest -> Ok ([], rest)
   | Some hs, rest ->
     let* rt, frag = separate_handshakes rest in
     Ok (hs :: rt, frag)
 
 let handle_change_cipher_spec = function
-  | Client cs -> Handshake_client.handle_change_cipher_spec cs
-  | Server ss -> Handshake_server.handle_change_cipher_spec ss
+  | Tls.State.Client cs -> Tls.Handshake_client.handle_change_cipher_spec cs
+  | Server ss -> Tls.Handshake_server.handle_change_cipher_spec ss
   (* D.4: the client may send a CCS before its second flight (before second
      ClientHello or encrypted handshake flight) the server may send it
      immediately after its first handshake message (ServerHello or
@@ -48,19 +47,25 @@ let handle_change_cipher_spec = function
   | _ -> fun _ _ -> Error (`Fatal `UnexpectedCCS)
 
 and handle_handshake ?embed_quic_transport_params = function
-  | Client cs -> Handshake_client.handle_handshake cs
+  | Tls.State.Client cs -> Tls.Handshake_client.handle_handshake cs
   | Server ss ->
-    Handshake_server.handle_handshake ?embed_quic_transport_params ss
-  | Client13 cs -> Handshake_client13.handle_handshake cs
+    Tls.Handshake_server.handle_handshake ?embed_quic_transport_params ss
+  | Client13 cs -> Tls.Handshake_client13.handle_handshake cs
   | Server13 ss ->
-    Handshake_server13.handle_handshake ?embed_quic_transport_params ss
+    Tls.Handshake_server13.handle_handshake ?embed_quic_transport_params ss
 
-let handle_handshake_packet hs ?embed_quic_transport_params buf =
+let handle_handshake_packet
+    (hs : Tls.State.handshake_state)
+    ?embed_quic_transport_params
+    buf
+  =
   let* hss, hs_fragment = separate_handshakes (hs.hs_fragment <+> buf) in
   let hs = { hs with hs_fragment } in
   let* hs, items =
     List.fold_left
-      (fun acc raw ->
+      (fun (acc :
+             (State.handshake_state * State.rec_resp list, State.failure) result)
+           raw ->
         let* hs, items = acc in
         let* hs', items' =
           handle_handshake ?embed_quic_transport_params hs.machina hs raw
@@ -71,7 +76,7 @@ let handle_handshake_packet hs ?embed_quic_transport_params buf =
   in
   Ok (hs, items, `No_err)
 
-let early_data s =
+let early_data (s : Tls.State.handshake_state) =
   match s.machina with
   | Server13 AwaitClientHelloHRR13
   | Server13 (AwaitEndOfEarlyData13 _)
@@ -85,12 +90,12 @@ let decrement_early_data hs ty buf =
   let bytes left cipher =
     let count =
       Cstruct.length buf
-      - fst (Ciphersuite.kn_13 (Ciphersuite.privprot13 cipher))
+      - fst (Tls.Ciphersuite.kn_13 (Tls.Ciphersuite.privprot13 cipher))
     in
     let left' = Int32.sub left (Int32.of_int count) in
     if left' < 0l then Error (`Fatal `Toomany0rttbytes) else Ok left'
   in
-  if ty = Packet.APPLICATION_DATA && early_data hs
+  if ty = Tls.Packet.APPLICATION_DATA && early_data hs
   then
     let cipher =
       match hs.session with
@@ -103,19 +108,19 @@ let decrement_early_data hs ty buf =
   else Ok hs
 
 let trace_handshake ?(s = "in") buf =
-  let open Reader in
+  let open Tls.Reader in
   match parse_handshake buf with
   | Ok handshake ->
     Format.eprintf
       "handshake-%s: %a@."
       s
       Sexplib.Sexp.pp_hum
-      (Core.sexp_of_tls_handshake handshake)
+      (Tls.Core.sexp_of_tls_handshake handshake)
   | Error e ->
     Format.eprintf
       "READER ERR: %a@."
       Sexplib.Sexp.pp_hum
-      (Reader.sexp_of_error e);
+      (Tls.Reader.sexp_of_error e);
     assert false
 
 let trace recs =
@@ -123,7 +128,7 @@ let trace recs =
     (function
       | `Change_enc _ | `Change_dec _ -> ()
       | `Record (content_type, data) ->
-        assert (content_type = Packet.HANDSHAKE);
+        assert (content_type = Tls.Packet.HANDSHAKE);
         trace_handshake ~s:"out" data)
     recs
 
@@ -134,7 +139,9 @@ let handle_raw_record ?embed_quic_transport_params state buf =
   (* From RFC<QUIC-TLS-RFC>§4.1.3:
    *   QUIC is only capable of conveying TLS handshake records in CRYPTO
    *   frames. *)
-  let hdr = { Core.content_type = Packet.HANDSHAKE; version = `TLS_1_2 } in
+  let hdr =
+    { Tls.Core.content_type = Tls.Packet.HANDSHAKE; version = `TLS_1_2 }
+  in
   let hs = state.handshake in
   let version = hs.protocol_version in
   let* () =
@@ -146,7 +153,7 @@ let handle_raw_record ?embed_quic_transport_params state buf =
       guard (hdr.version = `TLS_1_2) (`Fatal (`BadRecordVersion hdr.version))
     | _, v ->
       guard
-        (Core.version_eq hdr.version v)
+        (Tls.Core.version_eq hdr.version v)
         (`Fatal (`BadRecordVersion hdr.version))
   in
   let ty = hdr.content_type in
@@ -169,8 +176,8 @@ let ciphersuites =
 
 let server ~certificates ~alpn_protocols =
   let server =
-    Engine.server
-      (Config.server
+    Tls.Engine.server
+      (Tls.Config.server
          ~ciphers:ciphersuites
          ~certificates
          ~version:(`TLS_1_3, `TLS_1_3)
@@ -178,6 +185,23 @@ let server ~certificates ~alpn_protocols =
          ())
   in
   (server : t)
+
+let client ~authenticator ~alpn_protocols quic_transport_parameters =
+  let client, _nonce =
+    Tls.Engine.client
+      ~quic_transport_parameters
+      (Tls.Config.client
+         ~authenticator
+         ~ciphers:ciphersuites
+         ~version:(`TLS_1_3, `TLS_1_3)
+         ~alpn_protocols
+         ~peer_name:
+           (Domain_name.of_string "localhost"
+           |> Result.get_ok
+           |> Domain_name.host_exn)
+         ())
+  in
+  (client : t)
 
 let current_cipher t : Tls.Ciphersuite.ciphersuite13 =
   match Tls.Engine.epoch t with

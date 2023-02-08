@@ -44,7 +44,7 @@ type error =
   ]
 
 type error_handler =
-  ?request:Request.t -> error -> (Headers.t -> [ `write ] Body.t) -> unit
+  ?request:Request.t -> error -> (Headers.t -> Body.Writer.t) -> unit
 
 type stream =
   { stream : Stream.t
@@ -75,30 +75,26 @@ type t =
 let default_error_handler ?request:_ error handle =
   let message =
     match error with
-    | `Exn exn ->
-      Printexc.to_string exn
+    | `Exn exn -> Printexc.to_string exn
     | (#Status.client_error | #Status.server_error) as error ->
       Status.to_string error
   in
   let body = handle Headers.empty in
-  Body.write_string body message;
-  Body.close_writer body
+  Body.Writer.write_string body message;
+  Body.Writer.close body
 
 let handle_headers t { stream; writer; _ } headers =
   let stream_id = Stream.id stream in
   match Headers.method_path_and_scheme_or_malformed headers with
-  | `Malformed ->
-    Format.eprintf "wat: %a@." Headers.pp_hum headers;
-    failwith "`Bad_request ProtocolError"
+  | `Malformed -> failwith "`Bad_request ProtocolError"
   | `Valid (meth, path, scheme) ->
-    match Message.body_length headers with
-    | `Error _e ->
-      failwith "ProtocolError"
+    (match Message.body_length headers with
+    | `Error _e -> failwith "ProtocolError"
     | _body_length ->
       let request =
         Request.create ~scheme ~headers (Httpaf.Method.of_string meth) path
       in
-      let request_body = Body.create stream in
+      let request_body = Body.Reader.create stream in
       let reqd =
         Reqd.create
           t.error_handler
@@ -110,7 +106,7 @@ let handle_headers t { stream; writer; _ } headers =
           stream
           writer
       in
-      t.request_handler reqd
+      t.request_handler reqd)
 
 let process_headers_frame t stream headers_block =
   let stream_id = Stream.id stream.stream in
@@ -123,19 +119,15 @@ let process_headers_frame t stream headers_block =
     with
     | Ok (Ok (headers, _instructions)) ->
       handle_headers t stream (Headers.of_qpack_list headers)
-    | Ok (Error _) | Error _ ->
-      assert false
+    | Ok (Error _) | Error _ -> assert false
   in
   match
     Qdecoder.decode_header_block t.qpack_decoder ~stream_id headers_block f
   with
-  | _ ->
-    ()
+  | _ -> ()
 
 let process_data_frame _t _bs = failwith "NYI: process_data"
-
 let process_settings_frame _t _settings_list = failwith "NYI: settings"
-
 let process_goaway_frame _t _id = failwith "NYI: goaway"
 
 (* TODO: need to schedule read again. *)
@@ -156,23 +148,15 @@ let frame_handler t (stream : stream) r =
     (* report_error t e *)
     ()
   | Ok frame ->
-    match frame with
-    | Frame.Headers header_block ->
-      process_headers_frame t stream header_block
-    | Data bs ->
-      process_data_frame t bs
-    | Settings settings ->
-      process_settings_frame t settings
-    | Push_promise _ ->
-      assert false
-    | Cancel_push _ ->
-      ()
-    | Max_push_id _ ->
-      ()
-    | GoAway id ->
-      process_goaway_frame t id
-    | Ignored _ | Unknown _ ->
-      ()
+    (match frame with
+    | Frame.Headers header_block -> process_headers_frame t stream header_block
+    | Data bs -> process_data_frame t bs
+    | Settings settings -> process_settings_frame t settings
+    | Push_promise _ -> assert false
+    | Cancel_push _ -> ()
+    | Max_push_id _ -> ()
+    | GoAway id -> process_goaway_frame t id
+    | Ignored _ | Unknown _ -> ())
 
 let start_unidirectional_stream ~start_stream unitype =
   let stream = start_stream ~direction:Quic.Direction.Unidirectional in
@@ -240,31 +224,31 @@ let create
     ; critical_streams = { control = None; qencoder = None; qdecoder = None }
     }
   in
-  fun quic_stream ->
-    let id = Stream.id quic_stream in
-    let direction = Stream.direction quic_stream in
-    let stream =
-      match Hashtbl.find_opt t.streams id with
-      | Some _stream ->
-        assert false
-      | None ->
-        { stream = quic_stream
-        ; direction
-        ; reqd = None
-        ; writer = Writer.create quic_stream
-        }
-    in
-    let reader =
-      match direction with
-      | Quic.Direction.Unidirectional ->
-        Reader.unirectional_frames
-          (unistream_frame_handler t ~start_stream stream)
-      | Bidirectional ->
-        Format.eprintf "bidi: %Ld@." id;
-        Reader.bidirectional_frames (frame_handler t stream)
-    in
-    Stream.schedule_read
-      stream.stream
-      ~on_eof:(read_eof t stream ~reader)
-      ~on_read:(read t stream ~reader);
-    Hashtbl.add t.streams id stream
+  Quic.Transport.F
+    (fun quic_stream ->
+      let id = Stream.id quic_stream in
+      let direction = Stream.direction quic_stream in
+      let stream =
+        match Hashtbl.find_opt t.streams id with
+        | Some _stream -> assert false
+        | None ->
+          { stream = quic_stream
+          ; direction
+          ; reqd = None
+          ; writer = Writer.create quic_stream
+          }
+      in
+      let reader =
+        match direction with
+        | Quic.Direction.Unidirectional ->
+          Reader.unirectional_frames
+            (unistream_frame_handler t ~start_stream stream)
+        | Bidirectional ->
+          Format.eprintf "bidi: %Ld@." id;
+          Reader.bidirectional_frames (frame_handler t stream)
+      in
+      Stream.schedule_read
+        stream.stream
+        ~on_eof:(read_eof t stream ~reader)
+        ~on_read:(read t stream ~reader);
+      Hashtbl.add t.streams id stream)

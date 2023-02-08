@@ -95,7 +95,7 @@ end
 module Transport : sig
   type t
   type start_stream = direction:Direction.t -> Stream.t
-  type stream_handler = Stream.t -> unit
+  type stream_handler = F of (Stream.t -> unit)
 
   val next_read_operation : t -> [ `Read | `Yield | `Close ]
 
@@ -136,4 +136,10 @@ module Transport : sig
       -> (cid:string -> start_stream:start_stream -> stream_handler)
       -> t
   end
+
+  val connect
+    :  t
+    -> address:string
+    -> (cid:string -> start_stream:start_stream -> stream_handler)
+    -> unit
 end

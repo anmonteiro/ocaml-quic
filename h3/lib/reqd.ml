@@ -39,19 +39,19 @@ type error =
   ]
 
 type error_handler =
-  ?request:Request.t -> error -> (Headers.t -> [ `write ] Body.t) -> unit
+  ?request:Request.t -> error -> (Headers.t -> Body.Writer.t) -> unit
 
 module Writer = Serialize.Writer
 
 type response_state =
   | Waiting
-  | Streaming of Response.t * [ `write ] Body.t
+  | Streaming of Response.t * Body.Writer.t
   | Complete of Response.t
 
 type t =
   { id : Quic.Stream_id.t
   ; request : Request.t
-  ; request_body : [ `read ] Body.t
+  ; request_body : Body.Reader.t
   ; stream : Quic.Stream.t
   ; writer : Writer.t
   ; encoder : Qpack.Encoder.t
@@ -84,39 +84,30 @@ let create
   }
 
 let request t = t.request
-
 let request_body t = t.request_body
 
 let response t =
   match t.response_state with
-  | Waiting ->
-    None
-  | Streaming (response, _) | Complete response ->
-    Some response
+  | Waiting -> None
+  | Streaming (response, _) | Complete response -> Some response
 
 let response_exn t =
   match t.response_state with
-  | Waiting ->
-    failwith "h2.Reqd.response_exn: response has not started"
-  | Streaming (response, _) | Complete response ->
-    response
+  | Waiting -> failwith "h2.Reqd.response_exn: response has not started"
+  | Streaming (response, _) | Complete response -> response
 
 let write_buffer_data writer buffer =
   match buffer with
-  | `String str ->
-    Writer.write_data writer str
-  | `Bigstring bstr ->
-    Writer.schedule_data writer bstr
+  | `String str -> Writer.write_data writer str
+  | `Bigstring bstr -> Writer.schedule_data writer bstr
 
 let unsafe_respond_with_data t response data =
   match t.response_state with
   | Waiting ->
     let iovec, length =
       match data with
-      | `String s ->
-        `String s, String.length s
-      | `Bigstring b ->
-        `Bigstring b, Bigstringaf.length b
+      | `String s -> `String s, String.length s
+      | `Bigstring b -> `Bigstring b, Bigstringaf.length b
     in
     Writer.write_response_headers
       t.writer
@@ -124,27 +115,26 @@ let unsafe_respond_with_data t response data =
       ~encoder_stream:t.encoder_stream
       ~stream_id:t.id
       response;
-    if length > 0 then
-      write_buffer_data t.writer iovec;
+    if length > 0 then write_buffer_data t.writer iovec;
     (* From RFC<HTTP3-RFC>§4.1:
      *   An HTTP request/response exchange fully consumes a client-initiated
      *   bidirectional QUIC stream. [...] After sending a final response, the
      *   server MUST close the stream for sending. *)
     Quic.Stream.close_writer t.stream;
     t.response_state <- Complete response
-  | Streaming _ ->
-    failwith "h3.Reqd.respond_with_*: response already started"
-  | Complete _ ->
-    failwith "h3.Reqd.respond_with_*: response already complete"
+  | Streaming _ -> failwith "h3.Reqd.respond_with_*: response already started"
+  | Complete _ -> failwith "h3.Reqd.respond_with_*: response already complete"
 
 let respond_with_string t response str =
-  if fst t.error_code <> `Ok then
+  if fst t.error_code <> `Ok
+  then
     failwith
       "h3.Reqd.respond_with_string: invalid state, currently handling error";
   unsafe_respond_with_data t response (`String str)
 
 let respond_with_bigstring t response bstr =
-  if fst t.error_code <> `Ok then
+  if fst t.error_code <> `Ok
+  then
     failwith
       "h3.Reqd.respond_with_bigstring: invalid state, currently handling error";
   unsafe_respond_with_data t response (`Bigstring bstr)
@@ -152,7 +142,7 @@ let respond_with_bigstring t response bstr =
 let unsafe_respond_with_streaming ~flush_headers_immediately:_ t response =
   match t.response_state with
   | Waiting ->
-    let response_body = Body.create t.stream in
+    let response_body = Body.Writer.create t.stream in
     Writer.write_response_headers
       t.writer
       t.encoder
@@ -167,7 +157,8 @@ let unsafe_respond_with_streaming ~flush_headers_immediately:_ t response =
     failwith "h3.Reqd.respond_with_streaming: response already complete"
 
 let respond_with_streaming t ?(flush_headers_immediately = false) response =
-  if fst t.error_code <> `Ok then
+  if fst t.error_code <> `Ok
+  then
     failwith
       "h2.Reqd.respond_with_streaming: invalid state, currently handling error";
   unsafe_respond_with_streaming ~flush_headers_immediately t response
@@ -194,7 +185,7 @@ let respond_with_streaming t ?(flush_headers_immediately = false) response =
    t.error_code, Some error_code; reset_stream t error_code *)
 
 let report_error t _exn _error_code =
-  Body.close_reader t.request_body;
+  Body.Reader.close t.request_body;
   (* TODO: *)
   (* _report_error t stream ~request exn error_code; *)
   ()

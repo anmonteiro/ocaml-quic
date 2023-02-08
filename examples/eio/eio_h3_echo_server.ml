@@ -12,10 +12,11 @@ let connection_handler clock =
     match request.Request.target with
     | "/streaming" ->
       let response_body = Reqd.respond_with_streaming reqd response in
-      Body.write_string response_body "hello, ";
+      Body.Writer.write_string response_body "hello, ";
       set_interval ~clock 1. ~f:(fun () ->
-          Body.write_string response_body "world.";
-          Body.flush response_body (fun () -> Body.close_writer response_body))
+          Body.Writer.write_string response_body "world.";
+          Body.Writer.flush response_body (fun () ->
+              Body.Writer.close response_body))
     | _ -> Reqd.respond_with_string reqd response "hello"
   in
   H3.Server_connection.create request_handler

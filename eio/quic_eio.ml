@@ -196,22 +196,34 @@ module Server = struct
       server_fd
 end
 
+type t = Quic.Transport.t
+
 module Client = struct
-  let connect env ~sw ~config listen_address handler =
-    let server_fd =
+  let create env ~sw ~config handler =
+    let fd =
       Eio.Net.datagram_socket
         ~reuse_addr:true
         ~reuse_port:true
         ~sw
         (Eio.Stdenv.net env)
-        listen_address
+        `UdpV4
     in
-    let never, _ = Promise.create () in
     let connection = Quic.Transport.Client.create ~config handler in
-    IO_loop.start
-      connection
-      ~sw
-      ~read_buffer_size:0x1000
-      ~cancel:never
-      server_fd
+    let _shutdown_p, shutdown_u = Promise.create () in
+    let cancel_reader, _resolve_cancel_reader = Promise.create () in
+    Fiber.fork ~sw (fun () ->
+        Fun.protect ~finally:(Promise.resolve shutdown_u) (fun () ->
+            Switch.run (fun sw ->
+                Fiber.fork ~sw (fun () ->
+                    IO_loop.start
+                      ~sw
+                      ~cancel:cancel_reader
+                      ~read_buffer_size:0x1000
+                      connection
+                      fd))));
+    connection
 end
+
+let connect t ~address f =
+  let address = Addr.serialize address in
+  Quic.Transport.connect t ~address f

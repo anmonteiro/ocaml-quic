@@ -324,30 +324,52 @@ module Packet = struct
      *    Retry Integrity Tag (128),
      *  }
      *)
-    let retry ~version ~source_cid ~dest_cid =
+    let retry =
       (* From RFC9000§12.2:
        *   Retry packets (Section 17.2.5), Version Negotiation packets (Section
        *   17.2.1), and packets with a short header (Section 17.3) do not contain a
        *   Length field and so cannot be followed by other packets in the same UDP
        *   datagram. *)
       available >>= fun remaining_size ->
+      Unsafe.peek remaining_size (fun bs ~off ~len ->
+          match
+            Angstrom.parse_bigstring
+              ~consume:Prefix
+              ( advance 1 *> Header.Long.parse
+              >>= fun (version, source_cid, dest_cid) ->
+                return
+                  ( version
+                  , source_cid
+                  , dest_cid
+                  , 1 + 4 + 1 + 1 + CID.length source_cid + CID.length dest_cid
+                  )
+                >>| fun (v, s, d, l) ->
+                Format.eprintf "n: %d %d@." l remaining_size;
+                v, s, d, l )
+              (Bigstringaf.sub bs ~off ~len)
+          with
+          | Ok x -> x
+          | Error e -> failwith e)
+      >>= fun (version, source_cid, dest_cid, header_size) ->
       (* take until the last 128 bits, reserved for the integrity tag *)
-      take (remaining_size - 16) >>= fun retry_token ->
-      pos >>= fun position ->
-      (* XXX(anmonteiro): terrible hack, do better here *)
-      Unsafe.take 0 (fun bs ~off:_ ~len:_ ->
-          Bigstringaf.sub bs ~off:0 ~len:position)
-      >>= fun pseudo ->
-      lift
-        (fun tag ->
-          Packet.Retry
-            { header =
-                Long { version; source_cid; dest_cid; packet_type = Retry }
-            ; token = retry_token
-            ; pseudo
-            ; tag
-            })
-        (take 16)
+      take_bigstring (remaining_size - 16) >>= fun pseudo_packet_suffix ->
+      take_bigstring 16 >>| fun integrity_tag ->
+      Packet.Retry
+        { header =
+            Long
+              { version = Packet.Version.serialize version
+              ; source_cid
+              ; dest_cid
+              ; packet_type = Retry
+              }
+        ; token =
+            Bigstringaf.substring
+              pseudo_packet_suffix
+              ~off:header_size
+              ~len:(Bigstringaf.length pseudo_packet_suffix - header_size)
+        ; pseudo = pseudo_packet_suffix
+        ; tag = integrity_tag
+        }
 
     let parser ~payload_length ~header ~packet_number plaintext =
       let plaintext = Cstruct.to_bigarray plaintext in
@@ -358,10 +380,14 @@ module Packet = struct
   end
 
   let unprotected =
-    advance 1 *> Header.Long.parse >>= fun (version, source_cid, dest_cid) ->
-    match version with
-    | Negotiation -> Payload.version_negotiation ~source_cid ~dest_cid
-    | Number version -> Payload.retry ~version ~source_cid ~dest_cid
+    peek_char_fail >>= fun first_byte ->
+    match Packet.parse_type (Char.code first_byte) with
+    | Retry -> Payload.retry
+    | _ ->
+      advance 1 *> Header.Long.parse >>= fun (version, source_cid, dest_cid) ->
+      (match version with
+      | Negotiation -> Payload.version_negotiation ~source_cid ~dest_cid
+      | Number _ -> Payload.retry)
 
   (*
    *  Long Header Packet {

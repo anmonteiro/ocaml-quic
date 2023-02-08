@@ -32,27 +32,27 @@
  *  POSSIBILITY OF SUCH DAMAGE.
  *---------------------------------------------------------------------------*)
 
-type _ t = Quic.Stream.t
+module Reader = struct
+  type t = Quic.Stream.t
 
-let create writer = writer
+  let create stream = stream
 
-let write_char = Serialize.write_data_frame_char
+  let schedule_read t ~on_eof ~on_read =
+    Quic.Stream.schedule_read t ~on_eof ~on_read
 
-let write_string = Serialize.write_data_frame
+  let is_closed t = Quic.Stream.is_closed t
+  let close t = Quic.Stream.close_reader t
+end
 
-let write_bigstring = Serialize.write_data_frame_bigstring
+module Writer = struct
+  type t = Quic.Stream.t
 
-let schedule_bigstring = Serialize.schedule_data_frame
-
-let flush t kontinue = Quic.Stream.flush t kontinue
-
-let is_closed t = Quic.Stream.is_closed t
-
-let close_writer t = Quic.Stream.close_writer t
-
-let unsafe_faraday t = Quic.Stream.unsafe_faraday t
-
-let schedule_read t ~on_eof ~on_read =
-  Quic.Stream.schedule_read t ~on_eof ~on_read
-
-let close_reader t = Quic.Stream.close_reader t
+  let create writer = writer
+  let write_char = Serialize.write_data_frame_char
+  let write_string = Serialize.write_data_frame
+  let write_bigstring = Serialize.write_data_frame_bigstring
+  let schedule_bigstring = Serialize.schedule_data_frame
+  let flush t kontinue = Quic.Stream.flush t kontinue
+  let is_closed t = Quic.Stream.is_closed t
+  let close t = Quic.Stream.close_writer t
+end

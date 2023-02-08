@@ -56,3 +56,7 @@ let to_string t = t
 let of_string t = t
 let compare = String.compare
 let equal = String.equal
+
+let generate () =
+  let random_bytes n = Mirage_crypto_rng.generate n |> Cstruct.to_string in
+  random_bytes 20
