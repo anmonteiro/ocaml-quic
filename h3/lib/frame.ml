@@ -43,42 +43,25 @@ module Type = struct
     | Unknown of int
 
   let parse = function
-    | 0x0 ->
-      Data
-    | 0x1 ->
-      Headers
-    | 0x3 ->
-      Cancel_push
-    | 0x4 ->
-      Settings
-    | 0x5 ->
-      Push_promise
-    | 0x7 ->
-      GoAway
-    | 0xd ->
-      Max_push_id
-    | x when (x - 0x21) / 0x1f > 0 ->
-      Ignored x
-    | x ->
-      Unknown x
+    | 0x0 -> Data
+    | 0x1 -> Headers
+    | 0x3 -> Cancel_push
+    | 0x4 -> Settings
+    | 0x5 -> Push_promise
+    | 0x7 -> GoAway
+    | 0xd -> Max_push_id
+    | x when (x - 0x21) / 0x1f > 0 -> Ignored x
+    | x -> Unknown x
 
   let serialize = function
-    | Data ->
-      0x0
-    | Headers ->
-      0x1
-    | Cancel_push ->
-      0x3
-    | Settings ->
-      0x4
-    | Push_promise ->
-      0x5
-    | GoAway ->
-      0x7
-    | Max_push_id ->
-      0xd
-    | Ignored x | Unknown x ->
-      x
+    | Data -> 0x0
+    | Headers -> 0x1
+    | Cancel_push -> 0x3
+    | Settings -> 0x4
+    | Push_promise -> 0x5
+    | GoAway -> 0x7
+    | Max_push_id -> 0xd
+    | Ignored x | Unknown x -> x
 end
 
 type t =
@@ -94,3 +77,14 @@ type t =
   | Max_push_id of int
   | Ignored of int
   | Unknown of int
+
+let to_frame_type = function
+  | Data _ -> Type.Data
+  | Headers _ -> Headers
+  | Cancel_push _ -> Cancel_push
+  | Settings _ -> Settings
+  | Push_promise _ -> Push_promise
+  | GoAway _ -> GoAway
+  | Max_push_id _ -> Max_push_id
+  | Ignored x -> Ignored x
+  | Unknown x -> Unknown x

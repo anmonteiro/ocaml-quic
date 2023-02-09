@@ -71,7 +71,7 @@ let parse_cancel_push_frame length =
       Frame.Cancel_push (Int64.of_int i))
     variable_length_integer
 
-let parse_settings_frame length =
+let parse_settings =
   fix (fun m ->
       lift3
         (fun k v (settings, acc) ->
@@ -80,7 +80,7 @@ let parse_settings_frame length =
           in
           match k with
           | x when Settings.Type.is_unknown x ->
-            (* From RFC<HTTP3-RFC>§7.2.4.1:
+            (* From RFC9114§7.2.4.1:
              *   Setting identifiers of the format 0x1f * N + 0x21 for
              *   non-negative integer values of N are reserved to exercise the
              *   requirement that unknown identifiers be ignored. Such settings
@@ -89,7 +89,7 @@ let parse_settings_frame length =
              *   consider such settings to have any meaning upon receipt. *)
             settings, acc'
           | 0x6 ->
-            (* From RFC<HTTP3-RFC>§7.2.4.1:
+            (* From RFC9114§7.2.4.1:
              *   SETTINGS_MAX_FIELD_SECTION_SIZE (0x6): The default value is
              *   unlimited. See Section 4.1.1 for usage. *)
             { Settings.max_field_section_size = v }, acc'
@@ -98,6 +98,9 @@ let parse_settings_frame length =
         variable_length_integer
         m
       <|> return (Settings.default, 0))
+
+let parse_settings_frame length =
+  (match length with 0 -> return (Settings.default, 0) | _n -> parse_settings)
   >>| fun (settings, total_length) ->
   assert (total_length = length);
   Frame.Settings settings
@@ -138,18 +141,18 @@ let parse_frame =
   | Unknown x -> advance length *> return (Frame.Unknown x)
 
 let unidirectional_stream_header =
-  (* From RFC<HTTP3-RFC>§6.2:
+  (* From RFC9114§6.2:
    *   Unidirectional streams, in either direction, are used for a range of
    *   purposes. The purpose is indicated by a stream type, which is sent as a
    *   variable-length integer at the start of the stream. *)
   variable_length_integer >>= function
   | 0x00 ->
-    (* From RFC<HTTP3-RFC>§6.2.1:
+    (* From RFC9114§6.2.1:
      *   A control stream is indicated by a stream type of 0x00. Data on this
      *   stream consists of HTTP/3 frames, as defined in Section 7.2. *)
     return Unidirectional_stream.Control
   | 0x01 ->
-    (* From RFC<HTTP3-RFC>§6.2.2:
+    (* From RFC9114§6.2.2:
      *   A push stream is indicated by a stream type of 0x01, followed by the
      *   Push ID of the promise that it fulfills, encoded as a variable-length
      *   integer. *)
@@ -165,7 +168,7 @@ let unidirectional_stream_header =
      *   an unframed sequence of decoder instructions from decoder to encoder. *)
     return Unidirectional_stream.Qdecoder
   | x when Settings.Type.is_unknown x ->
-    (* From RFC<HTTP3-RFC>§8.1:
+    (* From RFC9114§8.1:
      *   Stream types of the format 0x1f * N + 0x21 for non-negative integer
      *   values of N are reserved to exercise the requirement that unknown
      *   types be ignored. These streams have no semantics, and can be sent
@@ -197,7 +200,7 @@ module Reader = struct
   let ignored_stream = skip_many (any_char <* commit) >>| fun () -> Ok ()
 
   let http3_frames handler =
-    skip_many (parse_frame <* commit >>| fun frame -> handler (Ok frame))
+    skip_many (parse_frame <* commit >>| fun frame -> handler frame)
     >>| fun () -> Ok ()
 
   let unirectional_frames select_stream_parser =
@@ -219,7 +222,7 @@ module Reader = struct
       (* t.parse_state <- Fail error; *)
       assert false
     | Fail (_unconsumed, _marks, _msg) -> t.parse_state
-    | Partial continue -> continue (`Bigstring bs)
+    | Partial _continue -> AB.feed t.parse_state (`Bigstring bs)
 
   let read_with_more t bs more =
     t.parse_state <- transition t bs;

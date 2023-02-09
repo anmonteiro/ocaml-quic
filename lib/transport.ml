@@ -460,10 +460,7 @@ module Connection = struct
 
   let rec process_stream_data t ~stream =
     match Stream.Recv.pop stream with
-    | Some _ ->
-      (* Stream.Buffer.schedule_bigstring stream.consumer buffer; *)
-      (* Stream.Recv.flush_recv stream; *)
-      process_stream_data t ~stream
+    | Some _ -> process_stream_data t ~stream
     | None -> ()
 
   let create_stream (c : t) ~typ ~id =

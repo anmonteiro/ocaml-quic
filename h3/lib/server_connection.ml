@@ -54,9 +54,12 @@ type stream =
   }
 
 type critical_streams =
-  { mutable control : stream option
-  ; mutable qencoder : Stream.t option
-  ; mutable qdecoder : Stream.t option
+  { mutable control : stream
+  ; mutable peer_control : stream option
+  ; mutable qencoder : stream
+  ; mutable peer_qencoder : Stream.t option
+  ; mutable qdecoder : stream
+  ; mutable peer_qdecoder : Stream.t option
   }
 
 type t =
@@ -100,7 +103,7 @@ let handle_headers t { stream; writer; _ } headers =
           t.error_handler
           ~stream_id
           ~encoder:t.qpack_encoder
-          ~encoder_stream:(Option.get t.critical_streams.qencoder)
+          ~encoder_stream:t.critical_streams.qencoder.stream
           request
           request_body
           stream
@@ -127,7 +130,28 @@ let process_headers_frame t stream headers_block =
   | _ -> ()
 
 let process_data_frame _t _bs = failwith "NYI: process_data"
-let process_settings_frame _t _settings_list = failwith "NYI: settings"
+
+let process_settings_frame t stream _settings_list =
+  match t.saw_control_settings with
+  | false ->
+    (match t.critical_streams.peer_control with
+    | Some control_stream
+      when Stream.id stream.stream = Stream.id control_stream.stream ->
+      t.saw_control_settings <- true;
+      () (* TODO: actually process settings *)
+    | _ ->
+      (* From RFC9114§7.2.4:
+       *   If an endpoint receives a SETTINGS frame on a different stream, the
+       *   endpoint MUST respond with a connection error of type
+       *   H3_FRAME_UNEXPECTED. *)
+      failwith "TODO: report error")
+  | true ->
+    (* From RFC9114§7.2.4:
+     *   If an endpoint receives a second SETTINGS frame on the control stream,
+     *   the endpoint MUST respond with a connection error of type
+     *   H3_FRAME_UNEXPECTED. *)
+    failwith "TODO: report error"
+
 let process_goaway_frame _t _id = failwith "NYI: goaway"
 
 (* TODO: need to schedule read again. *)
@@ -142,21 +166,17 @@ let read_eof _t _stream ~reader () =
  *   After the QUIC connection is established, a SETTINGS frame (Section
  *   7.2.4) MUST be sent by each endpoint as the initial frame of their
  *   respective HTTP control stream; see Section 6.2.1. *)
-let frame_handler t (stream : stream) r =
-  match r with
-  | Error _e ->
-    (* report_error t e *)
-    ()
-  | Ok frame ->
-    (match frame with
-    | Frame.Headers header_block -> process_headers_frame t stream header_block
-    | Data bs -> process_data_frame t bs
-    | Settings settings -> process_settings_frame t settings
-    | Push_promise _ -> assert false
-    | Cancel_push _ -> ()
-    | Max_push_id _ -> ()
-    | GoAway id -> process_goaway_frame t id
-    | Ignored _ | Unknown _ -> ())
+let frame_handler t (stream : stream) frame =
+  Format.eprintf "FR: %d@." (Frame.to_frame_type frame |> Frame.Type.serialize);
+  match frame with
+  | Frame.Headers header_block -> process_headers_frame t stream header_block
+  | Data bs -> process_data_frame t bs
+  | Settings settings -> process_settings_frame t stream settings
+  | Push_promise _ -> assert false
+  | Cancel_push _ -> ()
+  | Max_push_id _ -> ()
+  | GoAway id -> process_goaway_frame t id
+  | Ignored _ | Unknown _ -> ()
 
 let start_unidirectional_stream
     ~(start_stream : Quic.Transport.start_stream)
@@ -166,36 +186,32 @@ let start_unidirectional_stream
   Writer.write_unidirectional_stream_type stream unitype;
   stream
 
-let unistream_frame_handler t ~start_stream (stream : stream) unitype =
+let start_unidirectional_stream ~start_stream typ =
+  let quic_stream = start_unidirectional_stream ~start_stream typ in
+  let control_stream =
+    { stream = quic_stream
+    ; direction = Unidirectional
+    ; writer = Writer.create quic_stream
+    ; reqd = None
+    }
+  in
+  control_stream
+
+let unistream_frame_handler t (stream : stream) unitype =
   (* TODO: check that these are only called once. The client shouldn't open more
      than one of these streams. *)
   let open Angstrom in
   match unitype with
   | Unidirectional_stream.Qencoder ->
-    t.critical_streams.qencoder <-
-      Some (start_unidirectional_stream ~start_stream unitype);
+    t.critical_streams.peer_qencoder <- Some stream.stream;
     skip_many (Qpack.Encoder.Instruction.parser t.qpack_encoder) >>| fun () ->
     Ok ()
   | Qdecoder ->
-    let stream = start_unidirectional_stream ~start_stream unitype in
-    t.critical_streams.qdecoder <- Some stream;
-    let f = Stream.unsafe_faraday stream in
+    t.critical_streams.peer_qdecoder <- Some stream.stream;
+    let f = Stream.unsafe_faraday stream.stream in
     Qdecoder.parse_instructions t.qpack_decoder f >>| fun () -> Ok ()
   | Control ->
-    let quic_stream = start_unidirectional_stream ~start_stream unitype in
-    let control_stream =
-      { stream = quic_stream
-      ; reqd = None
-      ; direction = Unidirectional
-      ; writer = Writer.create quic_stream
-      }
-    in
-    t.critical_streams.control <- Some control_stream;
-    (* From RFC9114§6.2.1:
-     *   Each side MUST initiate a single control stream at the beginning of
-     *   the connection and send its SETTINGS frame as the first frame on this
-     *   stream. *)
-    Writer.write_settings control_stream.writer Settings.default;
+    t.critical_streams.peer_control <- Some stream;
     Reader.http3_frames (frame_handler t stream)
   | Push _ ->
     (* Client shouldn't send push frames. *)
@@ -224,9 +240,22 @@ let create
     ; error_handler
     ; qpack_encoder = Qpack.Encoder.create 0
     ; qpack_decoder = Qdecoder.create ~max_size:0 ~max_blocked_streams:100
-    ; critical_streams = { control = None; qencoder = None; qdecoder = None }
+    ; critical_streams =
+        { control = start_unidirectional_stream ~start_stream Control
+        ; peer_control = None
+        ; qencoder = start_unidirectional_stream ~start_stream Qencoder
+        ; peer_qencoder = None
+        ; qdecoder = start_unidirectional_stream ~start_stream Qdecoder
+        ; peer_qdecoder = None
+        }
     }
   in
+  (* From RFC9114§6.2.1:
+   *   Each side MUST initiate a single control stream at the beginning of
+   *   the connection and send its SETTINGS frame as the first frame on this
+   *   stream. *)
+  Writer.write_settings t.critical_streams.control.writer Settings.default;
+
   Quic.Transport.F
     (fun quic_stream ->
       let id = Stream.id quic_stream in
@@ -244,8 +273,7 @@ let create
       let reader =
         match direction with
         | Quic.Direction.Unidirectional ->
-          Reader.unirectional_frames
-            (unistream_frame_handler t ~start_stream stream)
+          Reader.unirectional_frames (unistream_frame_handler t stream)
         | Bidirectional ->
           Format.eprintf "bidi: %Ld@." id;
           Reader.bidirectional_frames (frame_handler t stream)
