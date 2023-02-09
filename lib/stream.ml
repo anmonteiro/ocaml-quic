@@ -269,7 +269,7 @@ module Send = struct
 
   let pop t =
     match Q.pop t.q with
-    | Some ((_, fragment), q') ->
+    | Some ((_off, fragment), q') ->
       t.q <- q';
       let is_fin =
         match t.fin_offset with

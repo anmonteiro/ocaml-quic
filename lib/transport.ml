@@ -104,7 +104,7 @@ module Connection = struct
        *   data. *)
       crypto_streams : Stream.t Spaces.t
     ; mutable peer_address : string
-    ; mutable client_transport_params : Transport_parameters.t
+    ; mutable peer_transport_params : Transport_parameters.t
     ; recovery : Recovery.t
     ; queued_packets : (Writer.header_info * Frame.t list) Queue.t
     ; writer : Writer.t
@@ -256,64 +256,79 @@ module Connection = struct
           ])
     | None -> ()
 
-  let process_tls_result t ~packet_info ~new_tls_state ~tls_packets =
-    let { outgoing_frames; _ } = packet_info in
+  let process_tls_result t ~new_tls_state ~tls_packets =
     let current_cipher = Qtls.current_cipher new_tls_state in
-    let (_ : Encryption_level.level) =
-      List.fold_left
-        (fun cur_encryption_level item ->
-          match item with
-          | `Change_enc { Tls.State.traffic_secret; _ } ->
-            let next = Encryption_level.next cur_encryption_level in
-            Encryption_level.add
-              next
-              { Crypto.encrypter =
-                  Crypto.AEAD.make ~ciphersuite:current_cipher traffic_secret
-              ; decrypter = None
-              }
-              t.encdec;
-            cur_encryption_level
-          | `Change_dec { Tls.State.traffic_secret; _ } ->
-            (* decryption change signals switching to a new encryption level *)
-            let next = Encryption_level.next outgoing_frames.current in
-            outgoing_frames.current <- next;
-            t.encdec.current <- next;
-            Encryption_level.update_current
-              (function
-                | None -> assert false
-                | Some encdec ->
-                  Some
-                    { encdec with
-                      Crypto.decrypter =
-                        Some
-                          (Crypto.AEAD.make
-                             ~ciphersuite:current_cipher
-                             traffic_secret)
-                    })
-              t.encdec;
-            (* From RFC9000§7:
-             *   The offsets used by CRYPTO frames to ensure ordered delivery
-             *   of cryptographic handshake data start from zero in each
-             *   packet number space. *)
-            next
-          | `Record ((ct : Tls.Packet.content_type), cs) ->
-            assert (ct = HANDSHAKE);
-            let crypto_stream =
-              Spaces.of_encryption_level t.crypto_streams cur_encryption_level
-            in
-            let fragment =
-              Stream.Send.push (Cstruct.to_bigarray cs) crypto_stream.send
-            in
-            Encryption_level.update_exn
-              cur_encryption_level
-              (fun xs -> Some (Frame.Crypto fragment :: xs))
-              outgoing_frames;
-            cur_encryption_level)
-        outgoing_frames.current
-        tls_packets
+
+    let rec process_packets
+        cur_encryption_level
+        (packets : Qtls.State.rec_resp list)
+      =
+      match packets with
+      | `Change_enc enc :: `Change_dec dec :: xs
+      | `Change_dec dec :: `Change_enc enc :: xs ->
+        let next = Encryption_level.next cur_encryption_level in
+        t.encdec.current <- next;
+        Encryption_level.add
+          next
+          { Crypto.encrypter =
+              Crypto.AEAD.make ~ciphersuite:current_cipher enc.traffic_secret
+          ; decrypter =
+              Some
+                (Crypto.AEAD.make
+                   ~ciphersuite:current_cipher
+                   dec.traffic_secret)
+          }
+          t.encdec;
+        process_packets next xs
+      | `Change_enc enc :: xs ->
+        let next = Encryption_level.next cur_encryption_level in
+        t.encdec.current <- next;
+        Encryption_level.add
+          next
+          { Crypto.encrypter =
+              Crypto.AEAD.make ~ciphersuite:current_cipher enc.traffic_secret
+          ; decrypter = None
+          }
+          t.encdec;
+        process_packets next xs
+      | `Change_dec dec :: xs ->
+        Encryption_level.update_current
+          (function
+            | None -> assert false
+            | Some encdec ->
+              Some
+                { encdec with
+                  Crypto.decrypter =
+                    Some
+                      (Crypto.AEAD.make
+                         ~ciphersuite:current_cipher
+                         dec.traffic_secret)
+                })
+          t.encdec;
+        process_packets cur_encryption_level xs
+      | `Record ((ct : Tls.Packet.content_type), cs) :: xs ->
+        assert (ct = HANDSHAKE);
+        let crypto_stream =
+          Spaces.of_encryption_level t.crypto_streams cur_encryption_level
+        in
+        let _fragment =
+          Stream.Send.push (Cstruct.to_bigarray cs) crypto_stream.send
+        in
+        (* Encryption_level.update_exn *)
+        (* cur_encryption_level *)
+        (* (fun xs -> Some (Frame.Crypto fragment :: xs)) *)
+        (* outgoing_frames; *)
+        process_packets cur_encryption_level xs
+      | [] -> cur_encryption_level
     in
-    if Tls.Engine.handshake_in_progress t.tls_state
-       && not (Tls.Engine.handshake_in_progress new_tls_state)
+    let _next_enc : Encryption_level.level =
+      process_packets t.encdec.current tls_packets
+    in
+    let is_handshake_done =
+      Tls.Engine.handshake_in_progress t.tls_state
+      && not (Tls.Engine.handshake_in_progress new_tls_state)
+    in
+    if is_handshake_done && t.mode = Server
     then (
       (* send the HANDSHAKE_DONE frame if we just completed the handshake.
        *
@@ -321,16 +336,12 @@ module Connection = struct
        *   The server uses the HANDSHAKE_DONE frame (type=0x1e) to signal
        *   confirmation of the handshake to the client. *)
       assert (t.encdec.current = Application_data);
-      assert (outgoing_frames.current = Application_data);
-      assert (Encryption_level.find_current_exn outgoing_frames = []);
-      Encryption_level.update_current_exn
-        (fun xs -> Some (Frame.Handshake_done :: xs))
-        outgoing_frames);
+      send_frames t [ Frame.Handshake_done ]);
     t.tls_state <- new_tls_state
 
-  let rec exhaust_crypto_stream t ~packet_info ~stream =
+  let rec exhaust_crypto_stream t ~packet_info ~(stream : Stream.t) =
     let { encryption_level; _ } = packet_info in
-    match Stream.Recv.pop stream with
+    match Stream.Recv.pop stream.recv with
     | Some { buffer; _ } ->
       let fragment_cstruct = Cstruct.of_bigarray buffer in
       (match t.tls_state.handshake.machina with
@@ -377,12 +388,8 @@ module Connection = struct
                  quic_transport_params
              with
             | Ok transport_params ->
-              t.client_transport_params <- transport_params;
-              process_tls_result
-                t
-                ~packet_info
-                ~new_tls_state:tls_state'
-                ~tls_packets
+              t.peer_transport_params <- transport_params;
+              process_tls_result t ~new_tls_state:tls_state' ~tls_packets
             | Error _ ->
               failwith
                 "TODO: send connection error of TRANSPORT_PARAMETER_ERROR")
@@ -390,6 +397,31 @@ module Connection = struct
       | Server13
           ( AwaitClientCertificate13 _ | AwaitClientCertificateVerify13 _
           | AwaitClientFinished13 _ ) ->
+        assert (encryption_level = Handshake);
+        (match Qtls.handle_raw_record t.tls_state fragment_cstruct with
+        | Error e ->
+          let sexp = Tls.State.sexp_of_failure e in
+          failwith
+            (Format.asprintf "Crypto failure: %a@." Sexplib.Sexp.pp_hum sexp)
+        | Ok (tls_state', tls_packets, (`Alert _ | `Eof | `No_err)) ->
+          (* TODO: send alerts as quic error *)
+          process_tls_result t ~new_tls_state:tls_state' ~tls_packets)
+      | Server13 Established13 -> failwith "handle key updates here"
+      | Server Established -> failwith "expected tls 1.3"
+      | Client (AwaitServerHello (_, _, _)) ->
+        assert (encryption_level = Initial);
+        assert (t.encdec.current = Initial);
+        (match Qtls.handle_raw_record t.tls_state fragment_cstruct with
+        | Error e ->
+          let sexp = Tls.State.sexp_of_failure e in
+          failwith
+            (Format.asprintf "Crypto failure: %a@." Sexplib.Sexp.pp_hum sexp)
+        | Ok (tls_state', tls_packets, (`Alert _ | `Eof | `No_err)) ->
+          (* TODO: send alerts as quic error *)
+          process_tls_result t ~new_tls_state:tls_state' ~tls_packets)
+      | Client13
+          ( AwaitServerEncryptedExtensions13 _ (* | AwaitServerFinished13 _ *)
+          | AwaitServerCertificateRequestOrCertificate13 _ ) ->
         assert (encryption_level = Handshake);
         assert (t.encdec.current = Handshake);
         (match Qtls.handle_raw_record t.tls_state fragment_cstruct with
@@ -399,14 +431,9 @@ module Connection = struct
             (Format.asprintf "Crypto failure: %a@." Sexplib.Sexp.pp_hum sexp)
         | Ok (tls_state', tls_packets, (`Alert _ | `Eof | `No_err)) ->
           (* TODO: send alerts as quic error *)
-          process_tls_result
-            t
-            ~packet_info
-            ~new_tls_state:tls_state'
-            ~tls_packets)
-      | Server13 Established13 -> failwith "handle key updates here"
-      | Server Established -> failwith "expected tls 1.3"
-      | Client _ | Client13 _ | Server _ | Server13 _ -> assert false);
+          process_tls_result t ~new_tls_state:tls_state' ~tls_packets)
+      | Client _ | Client13 _ -> assert false
+      | Server _ | Server13 _ -> assert false);
       exhaust_crypto_stream t ~packet_info ~stream
     | None -> ()
 
@@ -419,7 +446,7 @@ module Connection = struct
      *   The stream does not have an explicit end, so CRYPTO frames do not have a
      *   FIN bit. *)
     Stream.Recv.push fragment ~is_fin:false crypto_stream.recv;
-    exhaust_crypto_stream t ~packet_info ~stream:crypto_stream.recv
+    exhaust_crypto_stream t ~packet_info ~stream:crypto_stream
 
   let rec process_stream_data t ~stream =
     match Stream.Recv.pop stream with
@@ -476,6 +503,30 @@ module Connection = struct
   let process_connection_close_app_frame (t : t) ~error_code reason_phrase =
     Format.eprintf "close_app: %s %d@." reason_phrase error_code;
     shutdown t
+
+  let process_handshake_done_frame (t : t) =
+    (* From RFC9000§19.20:
+     *   A server MUST treat receipt of a HANDSHAKE_DONE frame as a connection
+     *   error of type PROTOCOL_VIOLATION. *)
+    match t.mode with
+    | Server -> report_error t ~frame_type:Handshake_done Protocol_violation
+    | Client ->
+      (match Qtls.transport_params t.tls_state with
+      | None ->
+        (* From RFC9001§8.2:
+         *   endpoints that receive ClientHello or EncryptedExtensions messages
+         *   without the quic_transport_parameters extension MUST close the
+         *   connection with an error of type 0x016d (equivalent to a fatal TLS
+         *   missing_extension alert, see Section 4.8). *)
+        report_error t ~frame_type:Handshake_done (Crypto_error 0x6d)
+      | Some transport_params ->
+        (match
+           Transport_parameters.decode_and_validate
+             ~perspective:t.mode
+             transport_params
+         with
+        | Ok transport_params -> t.peer_transport_params <- transport_params
+        | Error err -> report_error t ~frame_type:Handshake_done err))
 
   let process_path_challenge_frame t buf =
     (* From RFC9000§8.2.2:
@@ -554,7 +605,8 @@ module Connection = struct
         reason_phrase
     | Connection_close_app { reason_phrase; error_code } ->
       process_connection_close_app_frame t ~error_code reason_phrase
-    | Handshake_done | Unknown _ ->
+    | Handshake_done -> process_handshake_done_frame t
+    | Unknown _ ->
       failwith
         (Format.asprintf
            "frame NYI: 0x%x"
@@ -609,7 +661,7 @@ module Connection = struct
       ; original_dest_cid = CID.empty
       ; dest_cid = CID.empty
       ; peer_address
-      ; client_transport_params = Transport_parameters.default
+      ; peer_transport_params = Transport_parameters.default
       ; recovery = Recovery.create ()
       ; queued_packets = Queue.create ()
       ; writer = Writer.create 0x1000
@@ -635,17 +687,25 @@ module Connection = struct
     (* | Client13 (AwaitServerHello13 (_, _, raw)) *) ->
       let current_encryption_level = t.encdec.current in
       assert (current_encryption_level = Initial);
-      (* [(Packet.HANDSHAKE, raw)] *)
       let crypto_stream =
         Spaces.of_encryption_level t.crypto_streams current_encryption_level
       in
-      let fragment =
-        Stream.Send.push (Cstruct.to_bigarray raw_record) crypto_stream.send
-      in
-      send_frames
-        t
-        ~encryption_level:current_encryption_level
-        [ Frame.Crypto fragment ]
+      (match t.processed_retry_packet with
+      | false ->
+        (* Very first initial packet for the connection, push to the crypto
+           stream. *)
+        let _fragment =
+          Stream.Send.push (Cstruct.to_bigarray raw_record) crypto_stream.send
+        in
+        ()
+      | true ->
+        send_frames
+          t
+          ~encryption_level:current_encryption_level
+          [ Frame.Crypto
+              (let buffer = Cstruct.to_bigarray raw_record in
+               { IOVec.off = 0; len = Bigstringaf.length buffer; buffer })
+          ])
     | Client _ | Client13 _ -> assert false
     | Server _ | Server13 _ -> assert false
 
@@ -666,10 +726,11 @@ module Connection = struct
           ( ({ Writer.encryption_level; packet_number; _ } as header_info)
           , frames ) ->
         Format.eprintf
-          "Sending %d frames at encryption level: %a@."
+          "Sending %d frames at encryption level: %a %Ld@."
           (List.length frames)
           Encryption_level.pp_hum
-          encryption_level;
+          encryption_level
+          packet_number;
         Writer.write_frames_packet t.writer ~header_info frames;
         on_packet_sent t ~encryption_level ~packet_number frames;
         let can_be_followed_by_other_packets =
@@ -683,23 +744,30 @@ module Connection = struct
     inner t Didnt_write
 
   module Streams = struct
+    type t =
+      [ `Crypto
+      | `Data
+      ]
+
     let flush t streams =
       let rec inner acc = function
-        | Seq.Cons (stream, xs) ->
-          (match stream.Stream.typ with
-          | Stream.Type.Server _ | Client Bidirectional ->
+        | Seq.Cons ((encryption_level, stream_type, stream), xs) ->
+          (match t.mode, stream.Stream.typ with
+          | Server, Stream.Type.Server Unidirectional
+          | Client, Client Unidirectional
+          | _, Stream.Type.Server Bidirectional
+          | _, Client Bidirectional ->
             let _flushed = Stream.Send.flush stream.Stream.send in
             if Stream.Send.has_pending_output stream.send
             then (
-              let encryption_level = Encryption_level.Application_data in
-              let { Crypto.encrypter; _ } =
-                Encryption_level.find_exn encryption_level t.encdec
-              in
               let packet_number =
                 Packet_number.send_next
                   (Spaces.of_encryption_level
                      t.packet_number_spaces
                      encryption_level)
+              in
+              let { Crypto.encrypter; _ } =
+                Encryption_level.find_exn encryption_level t.encdec
               in
               let header_info =
                 Writer.make_header_info
@@ -712,19 +780,42 @@ module Connection = struct
               in
               let fragment, is_fin = Stream.Send.pop_exn stream.send in
               let frames =
-                [ Frame.Stream { id = stream.id; fragment; is_fin } ]
+                match stream_type with
+                | `Data -> [ Frame.Stream { id = stream.id; fragment; is_fin } ]
+                | `Crypto ->
+                  [ Frame.Crypto fragment ]
               in
               Writer.write_frames_packet t.writer ~header_info frames;
               on_packet_sent t ~encryption_level ~packet_number frames;
-              Wrote_app_data)
+              let can_be_followed_by_other_packets =
+                encryption_level <> Application_data
+              in
+              if can_be_followed_by_other_packets
+              then inner Wrote (xs ())
+              else Wrote_app_data)
             else inner acc (xs ())
-          | Client Unidirectional ->
+          | Client, Server Unidirectional | Server, Client Unidirectional ->
             (* Server can't send on unidirectional streams created by the
                client *)
             inner acc (xs ()))
         | Nil -> acc
       in
-      inner Didnt_write (Hashtbl.to_seq_values streams ())
+      let crypto_streams =
+        Spaces.to_list t.crypto_streams
+        |> List.map (fun (enc_level, stream) -> enc_level, `Crypto, stream)
+        |> List.to_seq
+      in
+      let all_streams =
+        let app_streams =
+          Seq.map
+            (fun stream -> Encryption_level.Application_data, `Data, stream)
+            (Hashtbl.to_seq_values streams)
+        in
+        Seq.append crypto_streams app_streams
+      in
+
+      let ret = inner Didnt_write (all_streams ()) in
+      ret
   end
 end
 
@@ -905,10 +996,8 @@ let process_retry_packet
               }
             in
             Encryption_level.add Initial encdec c.encdec;
-
-            Connection.send_handshake_bytes c;
-
             c.processed_retry_packet <- true;
+            Connection.send_handshake_bytes c;
             wakeup_writer t))
     | Initial _ | Short _ -> assert false)
 
@@ -1112,8 +1201,15 @@ let connect t ~address connection_handler =
           (* ; *)
           Encoding.Initial_source_connection_id src_cid
         ; Active_connection_id_limit 2
+        ; Initial_max_data (1 lsl 27)
+        ; Initial_max_stream_data_bidi_local (1 lsl 27)
+        ; Initial_max_stream_data_bidi_remote (1 lsl 27)
+        ; Initial_max_stream_data_uni (1 lsl 27)
+        ; Initial_max_streams_bidi (1 lsl 8)
+        ; Initial_max_streams_uni (1 lsl 8)
         ])
   in
+
   let tls_state =
     Qtls.client ~authenticator:Config.null_auth ~alpn_protocols transport_params
   in
@@ -1141,7 +1237,7 @@ let flush_pending_packets t =
         Some (connection.writer, connection.peer_address, CID.to_string cid)
       | Didnt_write ->
         (match Connection.Streams.flush connection connection.streams with
-        | Wrote_app_data ->
+        | Wrote | Wrote_app_data ->
           Some (connection.writer, connection.peer_address, CID.to_string cid)
         | _ -> inner t (xs ()))
       | Wrote ->

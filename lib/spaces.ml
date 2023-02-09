@@ -50,9 +50,12 @@ let create ~initial ~handshake ~application_data =
   { initial; handshake; application_data }
 
 let of_encryption_level t = function
-  | Encryption_level.Initial ->
-    t.initial
-  | Handshake ->
-    t.handshake
-  | Zero_RTT | Application_data ->
-    t.application_data
+  | Encryption_level.Initial -> t.initial
+  | Handshake -> t.handshake
+  | Zero_RTT | Application_data -> t.application_data
+
+let to_list { initial; handshake; application_data } =
+  [ Encryption_level.Initial, initial
+  ; Handshake, handshake
+  ; Application_data, application_data
+  ]

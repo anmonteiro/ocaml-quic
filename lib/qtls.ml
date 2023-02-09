@@ -205,7 +205,14 @@ let client ~authenticator ~alpn_protocols quic_transport_parameters =
 
 let current_cipher t : Tls.Ciphersuite.ciphersuite13 =
   match Tls.Engine.epoch t with
-  | `InitialEpoch -> failwith "don't call before handshake bytes"
+  | `InitialEpoch ->
+    (match t.handshake.machina with
+    | Client13
+        ( AwaitServerEncryptedExtensions13 (session, _, _, _)
+        (* | AwaitServerFinished13 (session, _, _, _, _) *)
+        | AwaitServerCertificateRequestOrCertificate13 (session, _, _, _) ) ->
+      session.ciphersuite13
+    | _ -> failwith "don't call before handshake bytes")
   | `Epoch { ciphersuite; _ } ->
     (match ciphersuite with
     | #Tls.Ciphersuite.ciphersuite13 as cs13 -> cs13

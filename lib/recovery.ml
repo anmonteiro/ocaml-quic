@@ -78,15 +78,13 @@ let on_ack_received t ~encryption_level ~ranges =
       let q' =
         Q.fold
           (fun pkt_num sent q ->
-            if
-              Int64.compare pkt_num lowest_acked >= 0
-              && Int64.compare pkt_num largest_acked <= 0
+            if Int64.compare pkt_num lowest_acked >= 0
+               && Int64.compare pkt_num largest_acked <= 0
             then (
-              if sent.ack_eliciting then
-                Queue.add_seq info.acked (List.to_seq sent.frames);
+              if sent.ack_eliciting
+              then Queue.add_seq info.acked (List.to_seq sent.frames);
               Q.remove pkt_num q)
-            else
-              q)
+            else q)
           info.sent
           info.sent
       in
@@ -95,8 +93,8 @@ let on_ack_received t ~encryption_level ~ranges =
 
 let drain_acknowledged t ~encryption_level =
   let info = Spaces.of_encryption_level t encryption_level in
-  if Queue.is_empty info.acked then
-    []
+  if Queue.is_empty info.acked
+  then []
   else
     let qseq = Queue.to_seq info.acked in
     Queue.clear info.acked;
