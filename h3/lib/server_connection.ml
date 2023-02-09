@@ -138,7 +138,7 @@ let read _t _stream ~reader bs ~off ~len:_ =
 let read_eof _t _stream ~reader () =
   Reader.read_with_more reader Bigstringaf.empty Complete
 
-(* From RFC<HTTP3-RFC>§8.1:
+(* From RFC9114§8.1:
  *   After the QUIC connection is established, a SETTINGS frame (Section
  *   7.2.4) MUST be sent by each endpoint as the initial frame of their
  *   respective HTTP control stream; see Section 6.2.1. *)
@@ -158,8 +158,11 @@ let frame_handler t (stream : stream) r =
     | GoAway id -> process_goaway_frame t id
     | Ignored _ | Unknown _ -> ())
 
-let start_unidirectional_stream ~start_stream unitype =
-  let stream = start_stream ~direction:Quic.Direction.Unidirectional in
+let start_unidirectional_stream
+    ~(start_stream : Quic.Transport.start_stream)
+    unitype
+  =
+  let stream = start_stream Quic.Direction.Unidirectional in
   Writer.write_unidirectional_stream_type stream unitype;
   stream
 
@@ -188,7 +191,7 @@ let unistream_frame_handler t ~start_stream (stream : stream) unitype =
       }
     in
     t.critical_streams.control <- Some control_stream;
-    (* From RFC<HTTP3-RFC>§6.2.1:
+    (* From RFC9114§6.2.1:
      *   Each side MUST initiate a single control stream at the beginning of
      *   the connection and send its SETTINGS frame as the first frame on this
      *   stream. *)
@@ -198,7 +201,7 @@ let unistream_frame_handler t ~start_stream (stream : stream) unitype =
     (* Client shouldn't send push frames. *)
     assert false
   | Ignored _ ->
-    (* From RFC<HTTP3-RFC>§8.1:
+    (* From RFC9114§8.1:
      *   Stream types of the format 0x1f * N + 0x21 for non-negative integer
      *   values of N are reserved to exercise the requirement that unknown
      *   types be ignored. These streams have no semantics, and can be sent
@@ -251,4 +254,5 @@ let create
         stream.stream
         ~on_eof:(read_eof t stream ~reader)
         ~on_read:(read t stream ~reader);
-      Hashtbl.add t.streams id stream)
+      Hashtbl.add t.streams id stream;
+      { Quic.Transport.on_error = ignore })

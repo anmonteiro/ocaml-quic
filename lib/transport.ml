@@ -80,8 +80,10 @@ module Packet_number = struct
     Frame.Ack { delay = 0; ranges; ecn_counts = None }
 end
 
-type stream_handler = F of (Stream.t -> unit)
-type start_stream = direction:Direction.t -> Stream.t
+type error_handler = int -> unit
+type on_error_handler = { on_error : error_handler }
+type start_stream = ?error_handler:error_handler -> Direction.t -> Stream.t
+type stream_handler = F of (Stream.t -> on_error_handler)
 
 module Connection = struct
   type handler =
@@ -201,7 +203,12 @@ module Connection = struct
             }
         ])
 
-  let process_reset_stream_frame t ~stream_id ~final_size:_ _application_error =
+  let process_reset_stream_frame
+      t
+      ~stream_id
+      ~final_size:_fsiz
+      application_error
+    =
     match Hashtbl.find_opt t.streams stream_id with
     | Some stream ->
       (match stream.typ, t.mode with
@@ -215,8 +222,10 @@ module Connection = struct
           t
           ~frame_type:Frame.Type.Reset_stream
           Error.Stream_state_error
-      | _ ->
+      | _, _ ->
         (* TODO: stream state transitions 3.1 / 3.2 *)
+        stream.error_handler application_error;
+
         Hashtbl.remove t.streams stream_id)
     | None -> ()
 
@@ -242,6 +251,7 @@ module Connection = struct
            RESET_STREAM frame. An endpoint that receives a STOP_SENDING frame
            MUST send a RESET_STREAM frame if the stream is in the "Ready" or
            "Send" state. *)
+        let final_size = Stream.Send.final_size stream.send in
         send_frames
           t
           [ Frame.Reset_stream
@@ -251,7 +261,7 @@ module Connection = struct
                  *   STOP_SENDING frame to the RESET_STREAM frame it sends, but
                  *   it can use any application error code. *)
                 application_protocol_error
-              ; final_size = Stream.Send.final_size stream.send
+              ; final_size
               }
           ])
     | None -> ()
@@ -476,11 +486,14 @@ module Connection = struct
               | Client -> Server direction)
             ~id
         in
-        invoke_handler
-          c
-          ~cid:(CID.to_string c.source_cid)
-          ~start_stream:c.start_stream
-          stream;
+        let error_handler =
+          invoke_handler
+            c
+            ~cid:(CID.to_string c.source_cid)
+            ~start_stream:c.start_stream
+            stream
+        in
+        stream.error_handler <- error_handler.on_error;
         stream
     in
     Stream.Recv.push fragment ~is_fin stream.recv;
@@ -612,10 +625,8 @@ module Connection = struct
            "frame NYI: 0x%x"
            (Frame.Type.serialize (Frame.to_frame_type frame)))
 
-  let next_unidirectional_stream_id t ~direction =
-    let id =
-      Stream.Type.gen_id ~typ:(Server direction) t.next_unidirectional_stream_id
-    in
+  let next_unidirectional_stream_id t ~typ =
+    let id = Stream.Type.gen_id ~typ t.next_unidirectional_stream_id in
     t.next_unidirectional_stream_id <-
       Int64.succ t.next_unidirectional_stream_id;
     id
@@ -671,9 +682,18 @@ module Connection = struct
       ; shutdown
       ; next_unidirectional_stream_id = 0L
       ; start_stream =
-          (fun ~direction ->
-            let id = next_unidirectional_stream_id t ~direction in
-            create_stream t ~typ:(Server direction) ~id)
+          (fun ?error_handler direction ->
+            let typ =
+              match mode with
+              | Server -> Stream.Type.Server direction
+              | Client -> Client direction
+            in
+            let id = next_unidirectional_stream_id t ~typ in
+            let stream = create_stream t ~typ ~id in
+            (match error_handler with
+            | Some f -> stream.error_handler <- f
+            | None -> ());
+            stream)
       ; did_send_connection_close = false
       ; processed_retry_packet = false
       ; token_value = ""
@@ -782,8 +802,7 @@ module Connection = struct
               let frames =
                 match stream_type with
                 | `Data -> [ Frame.Stream { id = stream.id; fragment; is_fin } ]
-                | `Crypto ->
-                  [ Frame.Crypto fragment ]
+                | `Crypto -> [ Frame.Crypto fragment ]
               in
               Writer.write_frames_packet t.writer ~header_info frames;
               on_packet_sent t ~encryption_level ~packet_number frames;

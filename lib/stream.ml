@@ -336,7 +336,7 @@ module Send = struct
      *   More generally, this is one higher than the offset of the byte with
      *   the largest offset sent on the stream, or zero if no bytes were sent.
      *)
-    if t.offset = 0 then 0 else t.offset + 1
+    t.offset
 end
 
 type t =
@@ -344,16 +344,29 @@ type t =
   ; recv : Recv.t
   ; typ : Type.t
   ; id : int64
+  ; mutable error_handler : int -> unit
   }
 
+let default_error_handler _ = ()
+
 let create ~typ ~id when_ready =
-  { send = Send.create when_ready; recv = Recv.create (); typ; id }
+  { send = Send.create when_ready
+  ; recv = Recv.create ()
+  ; typ
+  ; id
+  ; error_handler = default_error_handler
+  }
 
 (* These are not consumed by the application, so the `recv` consumer starts out
  * closed. *)
 let create_crypto () =
   let recv = { (Recv.create ()) with consumer = Buffer.empty } in
-  { send = Send.create ignore; recv; typ = Server Bidirectional; id = -1L }
+  { send = Send.create ignore
+  ; recv
+  ; typ = Server Bidirectional
+  ; id = -1L
+  ; error_handler = default_error_handler
+  }
 
 let id { id; _ } = id
 

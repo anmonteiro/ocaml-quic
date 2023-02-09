@@ -94,8 +94,10 @@ end
 
 module Transport : sig
   type t
-  type start_stream = direction:Direction.t -> Stream.t
-  type stream_handler = F of (Stream.t -> unit)
+  type error_handler = int -> unit
+  type on_error_handler = { on_error : error_handler }
+  type start_stream = ?error_handler:error_handler -> Direction.t -> Stream.t
+  type stream_handler = F of (Stream.t -> on_error_handler)
 
   val next_read_operation : t -> [ `Read | `Yield | `Close ]
 
