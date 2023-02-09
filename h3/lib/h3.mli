@@ -458,3 +458,32 @@ module Server_connection : sig
   (** [error_code t] returns the [error_code] that caused the connection to
       close, if one exists. *)
 end
+
+module Client_connection : sig
+  type t
+  type response_handler = Response.t -> Body.Reader.t -> unit
+
+  type error =
+    [ `Malformed_response of string
+    | `Invalid_response_body_length of Response.t
+    | `Protocol_error of Error.t * string
+    | `Exn of exn
+    ]
+
+  type error_handler = error -> unit
+
+  val create
+    :  error_handler:error_handler
+    -> cid:string
+    -> start_stream:Quic.Transport.start_stream
+    -> t * Quic.Transport.stream_handler
+
+  val request
+    :  t (* -> ?trailers_handler:trailers_handler *)
+    -> Request.t
+    -> error_handler:error_handler
+    -> response_handler:response_handler
+    -> Body.Writer.t
+
+  (* val shutdown : t -> unit *)
+end

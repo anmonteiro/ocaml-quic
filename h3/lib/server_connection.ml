@@ -94,7 +94,7 @@ let handle_headers t { stream; writer; _ } headers =
       let request =
         Request.create ~scheme ~headers (Httpaf.Method.of_string meth) path
       in
-      let request_body = Body.Reader.create stream in
+      let request_body = Body.Reader.create (Bigstringaf.create 0x1000) in
       let reqd =
         Reqd.create
           t.error_handler

@@ -31,31 +31,26 @@
  *---------------------------------------------------------------------------*)
 
 let varint_encoding_length n =
-  if n < 1 lsl 6 then
-    1
-  else if n < 1 lsl 14 then
-    2
-  else if n < 1 lsl 30 then
-    4
-  else
-    8
+  if n < 1 lsl 6
+  then 1
+  else if n < 1 lsl 14
+  then 2
+  else if n < 1 lsl 30
+  then 4
+  else 8
 
 let rec decomp n acc x =
-  if n = 0 then
-    acc
-  else
-    decomp (n - 1) ((x land 0xff) :: acc) (x lsr 8)
+  if n = 0 then acc else decomp (n - 1) ((x land 0xff) :: acc) (x lsr 8)
 
 let write_variable_length_integer t n =
   let encoding_bytes, encoding =
-    if n < 1 lsl 6 then
-      1, 0
-    else if n < 1 lsl 14 then
-      2, 1
-    else if n < 1 lsl 30 then
-      4, 2
-    else
-      8, 3
+    if n < 1 lsl 6
+    then 1, 0
+    else if n < 1 lsl 14
+    then 2, 1
+    else if n < 1 lsl 30
+    then 4, 2
+    else 8, 3
   in
   let ns = decomp encoding_bytes [] n in
   let hd = List.hd ns in
@@ -178,14 +173,13 @@ module Writer = struct
     in
     let headers =
       match meth with
-      | `CONNECT ->
+      | `CONNECT -> headers
+      | _ ->
         (* From RFC<HTTP3-RFC>§4.2:
          *   The ":scheme" and ":path" pseudo-header fields are omitted *)
         { Headers.name = ":path"; value = target; sensitive = false }
         :: { Headers.name = ":scheme"; value = scheme; sensitive = false }
         :: headers
-      | _ ->
-        headers
     in
     encode_headers t qencoder ~encoder_stream ~stream_id headers
 
@@ -201,14 +195,12 @@ module Writer = struct
     encode_headers t qencoder ~encoder_stream ~stream_id headers
 
   let write_data_char t c = write_data_frame_char t.stream c
-
   let write_data t s = write_data_frame t.stream s
 
   let write_data_bigstring t ?off ?len b =
     write_data_frame_bigstring ?off ?len t.stream b
 
   let schedule_data t ?off ?len s = schedule_data_frame ?off ?len t.stream s
-
   let write_settings t settings = write_settings_frame t.stream settings
 
   let write_unidirectional_stream_type t typ =

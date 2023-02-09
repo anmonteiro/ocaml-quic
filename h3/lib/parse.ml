@@ -33,14 +33,13 @@
 open Angstrom
 
 let varint_encoding_length n =
-  if n < 1 lsl 6 then
-    1
-  else if n < 1 lsl 14 then
-    2
-  else if n < 1 lsl 30 then
-    4
-  else
-    8
+  if n < 1 lsl 6
+  then 1
+  else if n < 1 lsl 14
+  then 2
+  else if n < 1 lsl 30
+  then 4
+  else 8
 
 (* XXX: technically could be a 62-bit int. *)
 let variable_length_integer =
@@ -50,21 +49,20 @@ let variable_length_integer =
   let encoding = first_byte lsr 6 in
   let b1 = first_byte land 0b00111111 in
   match encoding with
-  | 0 ->
-    return b1
-  | 1 ->
-    parse_remaining b1 1
-  | 2 ->
-    parse_remaining b1 3
+  | 0 -> return b1
+  | 1 -> parse_remaining b1 1
+  | 2 -> parse_remaining b1 3
   | _ ->
     assert (encoding = 3);
     parse_remaining b1 7
 
 let parse_data_frame length =
-  lift (fun bs -> Frame.Data bs) (take_bigstring length)
+  lift (fun bs -> Frame.Data bs) (Angstrom.Unsafe.take length Bigstringaf.sub)
 
 let parse_headers_frame length =
-  lift (fun bs -> Frame.Headers bs) (take_bigstring length)
+  lift
+    (fun bs -> Frame.Headers bs)
+    (Angstrom.Unsafe.take length Bigstringaf.sub)
 
 let parse_cancel_push_frame length =
   lift
@@ -95,8 +93,7 @@ let parse_settings_frame length =
              *   SETTINGS_MAX_FIELD_SECTION_SIZE (0x6): The default value is
              *   unlimited. See Section 4.1.1 for usage. *)
             { Settings.max_field_section_size = v }, acc'
-          | _ ->
-            assert false)
+          | _ -> assert false)
         variable_length_integer
         variable_length_integer
         m
@@ -110,7 +107,7 @@ let parse_push_promise_frame length =
   let id_len = varint_encoding_length push_id in
   lift
     (fun headers -> Frame.Push_promise { push_id; headers })
-    (take_bigstring (length - id_len))
+    (Unsafe.take (length - id_len) Bigstringaf.sub)
 
 let parse_goaway_frame length =
   lift
@@ -130,24 +127,15 @@ let parse_frame =
   variable_length_integer >>= fun frame_type ->
   variable_length_integer >>= fun length ->
   match Frame.Type.parse frame_type with
-  | Data ->
-    parse_data_frame length
-  | Headers ->
-    parse_headers_frame length
-  | Cancel_push ->
-    parse_cancel_push_frame length
-  | Settings ->
-    parse_settings_frame length
-  | Push_promise ->
-    parse_push_promise_frame length
-  | GoAway ->
-    parse_goaway_frame length
-  | Max_push_id ->
-    parse_max_push_id_frame length
-  | Ignored x ->
-    advance length *> return (Frame.Ignored x)
-  | Unknown x ->
-    advance length *> return (Frame.Unknown x)
+  | Data -> parse_data_frame length
+  | Headers -> parse_headers_frame length
+  | Cancel_push -> parse_cancel_push_frame length
+  | Settings -> parse_settings_frame length
+  | Push_promise -> parse_push_promise_frame length
+  | GoAway -> parse_goaway_frame length
+  | Max_push_id -> parse_max_push_id_frame length
+  | Ignored x -> advance length *> return (Frame.Ignored x)
+  | Unknown x -> advance length *> return (Frame.Unknown x)
 
 let unidirectional_stream_header =
   (* From RFC<HTTP3-RFC>§6.2:
@@ -183,8 +171,7 @@ let unidirectional_stream_header =
      *   types be ignored. These streams have no semantics, and can be sent
      *   when application-layer padding is desired. *)
     return (Unidirectional_stream.Ignored (Settings.Type.unknown_n x))
-  | _ ->
-    failwith "unknown"
+  | _ -> failwith "unknown"
 
 module Reader = struct
   module AB = Angstrom.Buffered
@@ -207,7 +194,6 @@ module Reader = struct
   type frame = parse_error t
 
   let create parser = { parser; parse_state = AB.parse parser; closed = false }
-
   let ignored_stream = skip_many (any_char <* commit) >>| fun () -> Ok ()
 
   let http3_frames handler =
@@ -228,15 +214,12 @@ module Reader = struct
 
   let transition t bs =
     match t.parse_state with
-    | AB.Done (_unconsumed, Ok ()) ->
-      assert false
+    | AB.Done (_unconsumed, Ok ()) -> assert false
     | Done (_unconsumed, Error _error) ->
       (* t.parse_state <- Fail error; *)
       assert false
-    | Fail (_unconsumed, _marks, _msg) ->
-      t.parse_state
-    | Partial continue ->
-      continue (`Bigstring bs)
+    | Fail (_unconsumed, _marks, _msg) -> t.parse_state
+    | Partial continue -> continue (`Bigstring bs)
 
   let read_with_more t bs more =
     t.parse_state <- transition t bs;
@@ -244,11 +227,9 @@ module Reader = struct
     | Angstrom.Unbuffered.Complete ->
       t.closed <- true;
       t.parse_state <- AB.feed t.parse_state `Eof
-    | Incomplete ->
-      ()
+    | Incomplete -> ()
 
   let force_close t = t.closed <- true
-
   let fail_to_string marks err = String.concat " > " marks ^ ": " ^ err
 
   (* let next_from_error t ?(msg = "") error_code = *)
@@ -284,10 +265,8 @@ module Reader = struct
     match t.parse_state with
     | Done (_, Error error) ->
       (match error with
-      | `Error e ->
-        `Error e
-      | `Error_code _error_code ->
-        failwith "fix me")
+      | `Error e -> `Error e
+      | `Error_code _error_code -> failwith "fix me")
     | Fail (_, marks, msg) ->
       let _error_code =
         match marks, msg with
@@ -298,17 +277,10 @@ module Reader = struct
            *   exceeds any limit defined for the frame type, or is too small
            *   to contain mandatory frame data. *)
           Error.Code.Frame_error
-        | _ ->
-          Error.Code.General_protocol_error
+        | _ -> Error.Code.General_protocol_error
       in
       failwith "fix me"
-    | _ when t.closed ->
-      `Close
-    | Partial _ ->
-      `Read
-    | Done _ ->
-      if t.closed then
-        `Close
-      else
-        `Read
+    | _ when t.closed -> `Close
+    | Partial _ -> `Read
+    | Done _ -> if t.closed then `Close else `Read
 end

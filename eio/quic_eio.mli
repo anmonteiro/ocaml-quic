@@ -70,3 +70,5 @@ val connect
       -> start_stream:Transport.start_stream
       -> Transport.stream_handler)
   -> unit
+
+val shutdown : t -> unit

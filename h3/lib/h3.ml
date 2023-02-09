@@ -37,4 +37,5 @@ module Request = Request
 module Response = Response
 module Body = Body
 module Reqd = Reqd
+module Client_connection = Client_connection
 module Server_connection = Server_connection

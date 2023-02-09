@@ -1303,8 +1303,14 @@ let read_with_more t bs ~off ~len more =
 let read t ~client_address bs ~off ~len =
   (* let hex = Hex.of_string (Bigstringaf.substring bs ~off ~len) in *)
   (* Format.eprintf "wtf(%d): %a@." len Hex.pp hex; *)
-  t.current_client_address <- Some client_address;
+  t.current_peer_address <- Some client_address;
   read_with_more t bs ~off ~len Incomplete
 
 let read_eof t bs ~off ~len = read_with_more t bs ~off ~len Complete
-let next_read_operation _t = `Read
+
+let next_read_operation t =
+  match Reader.next t.reader with
+  | (`Read | `Close) as operation -> operation
+  | `Start -> `Read
+  | `Error (`Parse (_marks, _msg)) -> failwith "NYI: next_read error"
+(* `Close *)

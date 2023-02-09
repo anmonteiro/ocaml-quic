@@ -227,3 +227,5 @@ end
 let connect t ~address f =
   let address = Addr.serialize address in
   Quic.Transport.connect t ~address f
+
+let shutdown t = Quic.Transport.shutdown t

@@ -1,3 +1,3 @@
 (executables
- (names eio_http1_echo_server eio_h3_echo_server)
+ (names eio_http1_echo_server eio_h3_echo_server eio_h3_client)
  (libraries h3 quic-eio eio_main mirage-crypto-rng.unix))
