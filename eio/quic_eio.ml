@@ -39,8 +39,10 @@ module Addr = struct
   (* type t = Eio.Net.Sockaddr.datagram *)
 
   let parse s =
-    Scanf.sscanf s "%d:%s" (fun port addr ->
-        `Udp (Eio.Net.Ipaddr.of_raw addr, port))
+    match String.split_on_char ':' s with
+    | [] -> assert false
+    | port :: xs ->
+      `Udp (Eio.Net.Ipaddr.of_raw (String.concat "" xs), int_of_string port)
 
   let serialize (`Udp (addr, port)) =
     Format.asprintf "%d:%s" port (Obj.magic addr : string)
