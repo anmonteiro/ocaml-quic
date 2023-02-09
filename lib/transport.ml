@@ -148,16 +148,53 @@ module Connection = struct
 
   let wakeup_writer t = t.wakeup_writer ()
 
+  let on_packet_sent t ~encryption_level ~packet_number frames =
+    Recovery.on_packet_sent t.recovery ~encryption_level ~packet_number frames
+
+  type flush_ret =
+    | Didnt_write
+    | Wrote
+    | Wrote_app_data
+
+  (* Flushes packets into one datagram *)
+  let _flush_pending_packets t =
+    let rec inner t acc =
+      match Queue.take_opt t.queued_packets with
+      | Some
+          ( ({ Writer.encryption_level; packet_number; _ } as header_info)
+          , frames ) ->
+        Format.eprintf
+          "Sending %d frames at encryption level: %a %Ld@."
+          (List.length frames)
+          Encryption_level.pp_hum
+          encryption_level
+          packet_number;
+        Writer.write_frames_packet t.writer ~header_info frames;
+        on_packet_sent t ~encryption_level ~packet_number frames;
+        let can_be_followed_by_other_packets =
+          encryption_level <> Application_data
+        in
+        if can_be_followed_by_other_packets
+        then inner t Wrote
+        else Wrote_app_data
+      | None -> acc
+    in
+    inner t Didnt_write
+
   let shutdown_writer t =
     Writer.close t.writer;
     wakeup_writer t
 
   let shutdown t =
-    shutdown_writer t;
-    t.shutdown t
-
-  let on_packet_sent t ~encryption_level ~packet_number frames =
-    Recovery.on_packet_sent t.recovery ~encryption_level ~packet_number frames
+    let shutdown () =
+      shutdown_writer t;
+      t.shutdown t
+    in
+    match _flush_pending_packets t with
+    | Wrote | Wrote_app_data -> Writer.flush t.writer shutdown
+    | Didnt_write ->
+      (* TODO: might wanna call Stream.close_reader on all readable streams? *)
+      shutdown ()
 
   let send_frames t ?(encryption_level = t.encdec.current) frames =
     let packet_number =
@@ -193,7 +230,6 @@ module Connection = struct
   let report_error ?frame_type t error =
     if not t.did_send_connection_close
     then (
-      t.did_send_connection_close <- true;
       send_frames
         t
         [ Frame.Connection_close_quic
@@ -201,7 +237,9 @@ module Connection = struct
             ; reason_phrase = ""
             ; error_code = error
             }
-        ])
+        ];
+      t.did_send_connection_close <- true;
+      shutdown t)
 
   let process_reset_stream_frame
       t
@@ -218,10 +256,7 @@ module Connection = struct
          *   stream MUST terminate the connection with error
          *   STREAM_STATE_ERROR.
          *)
-        report_error
-          t
-          ~frame_type:Frame.Type.Reset_stream
-          Error.Stream_state_error
+        report_error t ~frame_type:Reset_stream Stream_state_error
       | _, _ ->
         (* TODO: stream state transitions 3.1 / 3.2 *)
         stream.error_handler application_error;
@@ -400,9 +435,7 @@ module Connection = struct
             | Ok transport_params ->
               t.peer_transport_params <- transport_params;
               process_tls_result t ~new_tls_state:tls_state' ~tls_packets
-            | Error _ ->
-              failwith
-                "TODO: send connection error of TRANSPORT_PARAMETER_ERROR")
+            | Error e -> report_error t ~frame_type:Crypto e)
           | None -> ()))
       | Server13
           ( AwaitClientCertificate13 _ | AwaitClientCertificateVerify13 _
@@ -730,36 +763,6 @@ module Connection = struct
     send_handshake_bytes t;
     wakeup_writer t
 
-  type flush_ret =
-    | Didnt_write
-    | Wrote
-    | Wrote_app_data
-
-  (* Flushes packets into one datagram *)
-  let _flush_pending_packets t =
-    let rec inner t acc =
-      match Queue.take_opt t.queued_packets with
-      | Some
-          ( ({ Writer.encryption_level; packet_number; _ } as header_info)
-          , frames ) ->
-        Format.eprintf
-          "Sending %d frames at encryption level: %a %Ld@."
-          (List.length frames)
-          Encryption_level.pp_hum
-          encryption_level
-          packet_number;
-        Writer.write_frames_packet t.writer ~header_info frames;
-        on_packet_sent t ~encryption_level ~packet_number frames;
-        let can_be_followed_by_other_packets =
-          encryption_level <> Application_data
-        in
-        if can_be_followed_by_other_packets
-        then inner t Wrote
-        else Wrote_app_data
-      | None -> acc
-    in
-    inner t Didnt_write
-
   module Streams = struct
     type t =
       [ `Crypto
@@ -907,6 +910,13 @@ let create_outgoing_frames ~current =
   List.iter (fun lvl -> Encryption_level.add lvl [] r) Encryption_level.all;
   r
 
+let on_close t (connection : Connection.t) =
+  match Connection.Table.find_opt t.connections connection.source_cid with
+  | None -> ()
+  | Some _ ->
+    Connection.Table.remove t.connections connection.source_cid;
+    ()
+
 let create_new_connection
     ?(src_cid = CID.generate ())
     ~peer_address
@@ -915,16 +925,13 @@ let create_new_connection
     ~encdec
     t
   =
-  let shutdown_connection (c : Connection.t) =
-    Connection.Table.remove t.connections c.source_cid
-  in
   let connection =
     Connection.create
       ~mode:t.mode
       ~peer_address
       ~tls_state
       ~wakeup_writer:(ready_to_write t)
-      ~shutdown:shutdown_connection
+      ~shutdown:(on_close t)
       ~connection_handler
       src_cid
   in
