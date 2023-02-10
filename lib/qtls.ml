@@ -222,3 +222,8 @@ let transport_params t =
   match Tls.Engine.epoch t with
   | `InitialEpoch -> failwith "don't call before handshake bytes"
   | `Epoch { quic_transport_parameters; _ } -> quic_transport_parameters
+
+let alpn_protocol t =
+  match Tls.Engine.epoch t with
+  | `InitialEpoch -> failwith "don't call before handshake bytes"
+  | `Epoch { alpn_protocol; _ } -> alpn_protocol

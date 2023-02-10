@@ -31,7 +31,7 @@
  *---------------------------------------------------------------------------*)
 
 let packet_number_length pn =
-  (* From RFC<QUIC-RFC>§17.1:
+  (* From RFC9000§17.1:
    *   Packet numbers are integers in the range 0 to 2^62-1 (Section 12.3).
    *   When present in long or short packet headers, they are encoded in 1 to 4
    *   bytes. *)
@@ -68,7 +68,7 @@ let write_variable_length_integer t n =
   let ns = decomp encoding_bytes [] n in
   let hd = List.hd ns in
   let tl = List.tl ns in
-  (* From RFC<QUIC-RFC>§16:
+  (* From RFC9000§16:
    *   The QUIC variable-length integer encoding reserves the two most
    *   significant bits of the first byte to encode the base 2 logarithm of the
    *   integer encoding length in bytes. The integer value is encoded on the
@@ -184,7 +184,7 @@ module Frame = struct
     Faraday.write_string t reason_phrase
 
   let write_frame t frame =
-    (* From RFC<QUIC-RFC>§12.4:
+    (* From RFC9000§12.4:
      *   The Frame Type field uses a variable length integer encoding (see
      *   Section 16) with one exception. To ensure simple and efficient
      *   implementations of frame parsing, a frame type MUST use the shortest
@@ -249,7 +249,7 @@ module Pkt = struct
       match header with
       | Packet.Header.Initial _
       | Long { packet_type = Initial | Zero_RTT | Handshake; _ } ->
-        (* From RFC<QUIC-RFC>§17.2:
+        (* From RFC9000§17.2:
          * Length: The length of the remainder of the packet (that is, the
          *         Packet Number and Payload fields) in bytes, encoded as a
          *         variable-length integer (Section 16). *)
@@ -259,7 +259,7 @@ module Pkt = struct
     let write_long_header t ~pn_length ~header =
       let packet_type = Packet.Header.long_packet_type header in
       assert (1 <= pn_length && pn_length <= 4);
-      (* From RFC<QUIC-RFC>§17.2:
+      (* From RFC9000§17.2:
        *   Header Form: The most significant bit (0x80) of byte 0 (the first
        *                byte) is set to 1 for long headers.
        *
@@ -267,13 +267,13 @@ module Pkt = struct
        *              containing a zero value for this bit are not valid
        *              packets in this version and MUST be discarded. *)
       let form_and_fixed_bits = 0b11000000 in
-      (* From RFC<QUIC-RFC>§17.2.1:
+      (* From RFC9000§17.2.1:
        *   Long Packet Type: The next two bits (those with a mask of 0x30) of
        *                     byte 0 contain a packet type. Packet types are
        *                     listed in Table 5. *)
       let first_byte = Packet.Type.serialize packet_type lsl 4 in
       let first_byte = form_and_fixed_bits lor first_byte in
-      (* From RFC<QUIC-RFC>§17.2:
+      (* From RFC9000§17.2:
        *   Reserved Bits: Two bits (those with a mask of 0x0c) of byte 0 are
        *                  reserved across multiple packet types. [...] The
        *                  value included prior to protection MUST be set to
@@ -282,7 +282,7 @@ module Pkt = struct
       let first_byte =
         match packet_type with
         | Initial | Zero_RTT | Handshake ->
-          (* From RFC<QUIC-RFC>§17.2:
+          (* From RFC9000§17.2:
            *   In packet types which contain a Packet Number field, the least
            *   significant two bits (those with a mask of 0x03) of byte 0
            *   contain the length of the packet number, encoded as an unsigned,
@@ -306,7 +306,7 @@ module Pkt = struct
       | Short _ -> assert false
 
     let write_short_header t ~pn_length ~dest_cid =
-      (* From RFC<QUIC-RFC>§17.3:
+      (* From RFC9000§17.3:
        *   Header Form: The most significant bit (0x80) of byte 0 is set to 0
        *   for the short header.
        *   Fixed Bit: The next bit (0x40) of byte 0 is set to 1. Packets
@@ -315,7 +315,7 @@ module Pkt = struct
       let form_and_fixed_bits = 0b01000000 in
       (* TODO: spin bit, key phase *)
       let first_byte = form_and_fixed_bits lor ((pn_length - 1) land 0b11) in
-      (* From RFC<QUIC-RFC>§17.2:
+      (* From RFC9000§17.2:
        *   Reserved Bits: The next two bits (those with a mask of 0x18) of byte
        *                  0 are reserved. These bits are protected using header
        *                  protection; see Section 5.4 of [QUIC-TLS]. The value
@@ -333,7 +333,7 @@ module Pkt = struct
   end
 
   let write_version_negotiation_packet t ~versions ~source_cid ~dest_cid =
-    (* From RFC<QUIC-RFC>§17.2:
+    (* From RFC9000§17.2:
      *   Header Form: The most significant bit (0x80) of byte 0 (the first
      *                byte) is set to 1 for long headers.
      *
@@ -342,7 +342,7 @@ module Pkt = struct
      *              packets in this version and MUST be discarded. *)
     let form_and_fixed_bits = 0b11000000 in
     Faraday.write_uint8 t form_and_fixed_bits;
-    (* From RFC<QUIC-RFC>§17.2.1:
+    (* From RFC9000§17.2.1:
      *   The Version field of a Version Negotiation packet MUST be set to
      *   0x00000000. *)
     Faraday.write_string t "\x00\x00\x00\x00";
@@ -350,7 +350,7 @@ module Pkt = struct
     List.iter (fun version -> Faraday.BE.write_uint32 t version) versions
 
   let write_packet_payload t payload =
-    (* From RFC<QUIC-RFC>§17.1:
+    (* From RFC9000§17.1:
      *   When present in long or short packet headers, they are encoded in 1
      *   to 4 bytes. The number of bits required to represent the packet
      *   number is reduced by including the least significant bits of the
@@ -410,7 +410,7 @@ module Writer = struct
     let encoder = Faraday.of_bigstring buffer in
     { buffer; encoder; drained_bytes = 0 }
 
-  (* From RFC<QUIC-RFC>§15:
+  (* From RFC9000§15:
    *   Version numbers used to identify IETF drafts are created by adding the
    *   draft number to 0xff000000. For example, draft-ietf-quic-transport-13
    *   would be identified as 0xff00000D.

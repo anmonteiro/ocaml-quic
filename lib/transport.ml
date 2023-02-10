@@ -1024,7 +1024,7 @@ let process_retry_packet
             wakeup_writer t))
     | Initial _ | Short _ -> assert false)
 
-let packet_handler t packet =
+let packet_handler t ?error packet =
   (* TODO: track received packet number. *)
   let connection_id = Packet.destination_cid packet in
   let c =
@@ -1052,102 +1052,107 @@ let packet_handler t packet =
         ~connection_handler:t.connection_handler
         ~encdec
   in
-  if CID.is_empty c.original_dest_cid
-  then
-    (* From RFC9000§7.3:
-     *   Each endpoint includes the value of the Source Connection ID field
-     *   from the first Initial packet it sent in the
-     *   initial_source_connection_id transport parameter; see Section 18.2. A
-     *   server includes the Destination Connection ID field from the first
-     *   Initial packet it received from the client in the
-     *   original_destination_connection_id transport parameter [...]. *)
-    c.original_dest_cid <- Packet.destination_cid packet;
 
-  match packet with
-  | Packet.VersionNegotiation _ -> failwith "NYI: version negotiation"
-  | Frames { header; payload; packet_number; _ } ->
-    let encryption_level = Encryption_level.of_header header in
+  match error with
+  | Some error -> Connection.report_error c error
+  | None ->
+    if CID.is_empty c.original_dest_cid
+    then
+      (* From RFC9000§7.3:
+       *   Each endpoint includes the value of the Source Connection ID field
+       *   from the first Initial packet it sent in the
+       *   initial_source_connection_id transport parameter; see Section 18.2. A
+       *   server includes the Destination Connection ID field from the first
+       *   Initial packet it received from the client in the
+       *   original_destination_connection_id transport parameter [...]. *)
+      c.original_dest_cid <- Packet.destination_cid packet;
 
-    (* (match encryption_level with *)
-    (* | Initial -> *)
-    (* c.packet_number_spaces.initial.received <- *)
-    (* Int64.max c.packet_number_spaces.initial.received packet_number *)
-    (* | Handshake -> *)
-    (* c.packet_number_spaces.handshake.received <- *)
-    (* Int64.max c.packet_number_spaces.handshake.received packet_number *)
-    (* | Application_data | Zero_RTT -> *)
-    (* c.packet_number_spaces.application_data.received <- *)
-    (* Int64.max c.packet_number_spaces.application_data.received
-       packet_number); *)
-    (match Packet.source_cid packet with
-    | Some src_cid ->
-      (* From RFC9000§19.6:
-       *   Upon receiving a packet, each endpoint sets the Destination Connection
-       *   ID it sends to match the value of the Source Connection ID that it
-       *   receives. *)
-      c.dest_cid <- src_cid
-    | None ->
-      (* TODO: short packets will fail here? *)
-      assert (
-        match packet with
-        | Frames { header = Packet.Header.Short _; _ } -> true
-        | _ -> false));
+    (match packet with
+    | Packet.VersionNegotiation _ -> failwith "NYI: version negotiation"
+    | Frames { header; payload; packet_number; _ } ->
+      let encryption_level = Encryption_level.of_header header in
 
-    let packet_info =
-      { header
-      ; encryption_level
-      ; packet_number
-      ; outgoing_frames = create_outgoing_frames ~current:c.encdec.current
-      ; connection = c
-      }
-    in
+      (* (match encryption_level with *)
+      (* | Initial -> *)
+      (* c.packet_number_spaces.initial.received <- *)
+      (* Int64.max c.packet_number_spaces.initial.received packet_number *)
+      (* | Handshake -> *)
+      (* c.packet_number_spaces.handshake.received <- *)
+      (* Int64.max c.packet_number_spaces.handshake.received packet_number *)
+      (* | Application_data | Zero_RTT -> *)
+      (* c.packet_number_spaces.application_data.received <- *)
+      (* Int64.max c.packet_number_spaces.application_data.received
+         packet_number); *)
+      (match Packet.source_cid packet with
+      | Some src_cid ->
+        (* From RFC9000§19.6:
+         *   Upon receiving a packet, each endpoint sets the Destination Connection
+         *   ID it sends to match the value of the Source Connection ID that it
+         *   receives. *)
+        c.dest_cid <- src_cid
+      | None ->
+        (* TODO: short packets will fail here? *)
+        assert (
+          match packet with
+          | Frames { header = Packet.Header.Short _; _ } -> true
+          | _ -> false));
 
-    (match
-       Angstrom.parse_bigstring
-         ~consume:All
-         (Parse.Frame.parser (Connection.frame_handler c ~packet_info))
-         payload
-     with
-    | Ok () ->
-      (* process streams for packets that have been acknowledged. *)
-      let acked_frames =
-        Recovery.drain_acknowledged
-          c.recovery
-          ~encryption_level:packet_info.encryption_level
+      let packet_info =
+        { header
+        ; encryption_level
+        ; packet_number
+        ; outgoing_frames = create_outgoing_frames ~current:c.encdec.current
+        ; connection = c
+        }
       in
-      List.iter
-        (function
-          | Frame.Crypto { IOVec.off; _ } ->
-            let crypto_stream =
-              Spaces.of_encryption_level
-                c.crypto_streams
-                packet_info.encryption_level
-            in
-            Stream.Send.remove off crypto_stream.send
-          | Stream { id = _; fragment = _; _ } -> ()
-          | Ack { ranges = _; _ } ->
-            (* TODO: when we track packets that need acknowledgement, update the
-               largest acknowledged here. *)
-            ()
-          | _other -> ())
-        acked_frames;
-      (* This packet has been processed, mark it for acknowledgement. *)
-      let pn_space =
-        Spaces.of_encryption_level
-          c.packet_number_spaces
-          packet_info.encryption_level
-      in
-      Packet_number.insert_for_acking pn_space packet_number;
-      (* packet_info should now contain frames we need to send in response. *)
-      send_packets t ~packet_info;
-      (* Reset for the next packet. *)
-      pn_space.ack_elicited <- false
-    | Error e -> failwith ("Err: " ^ e))
-  | Retry { header; token; pseudo; tag } ->
-    process_retry_packet t c ~header ~token ~pseudo ~tag
+
+      (match
+         Angstrom.parse_bigstring
+           ~consume:All
+           (Parse.Frame.parser (Connection.frame_handler c ~packet_info))
+           payload
+       with
+      | Ok _frames ->
+        (* process streams for packets that have been acknowledged. *)
+        let acked_frames =
+          Recovery.drain_acknowledged
+            c.recovery
+            ~encryption_level:packet_info.encryption_level
+        in
+        List.iter
+          (function
+            | Frame.Crypto { IOVec.off; _ } ->
+              let crypto_stream =
+                Spaces.of_encryption_level
+                  c.crypto_streams
+                  packet_info.encryption_level
+              in
+              Stream.Send.remove off crypto_stream.send
+            | Stream { id = _; fragment = _; _ } -> ()
+            | Ack { ranges = _; _ } ->
+              (* TODO: when we track packets that need acknowledgement, update
+                 the largest acknowledged here. *)
+              ()
+            | _other -> ())
+          acked_frames;
+        (* This packet has been processed, mark it for acknowledgement. *)
+        let pn_space =
+          Spaces.of_encryption_level
+            c.packet_number_spaces
+            packet_info.encryption_level
+        in
+        Packet_number.insert_for_acking pn_space packet_number;
+        (* packet_info should now contain frames we need to send in response. *)
+        send_packets t ~packet_info;
+        (* Reset for the next packet. *)
+        pn_space.ack_elicited <- false
+      | Error e -> failwith ("Err: " ^ e))
+    | Retry { header; token; pseudo; tag } ->
+      process_retry_packet t c ~header ~token ~pseudo ~tag)
 
 let create ~mode ~config connection_handler =
-  let rec reader_packet_handler t packet = packet_handler (Lazy.force t) packet
+  let rec reader_packet_handler t ?error packet =
+    packet_handler (Lazy.force t) ?error packet
   and decrypt t ~payload_length ~header bs ~off ~len =
     let t : t = Lazy.force t in
     let cs = Cstruct.of_bigarray ~off ~len bs in

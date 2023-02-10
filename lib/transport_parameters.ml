@@ -117,8 +117,9 @@ module Encoding = struct
     | 0x02 ->
       (* From RFC<QUIC-RFC>§18.2:
        *   This parameter is a sequence of 16 bytes. *)
-      assert (length = 16);
-      lift (fun token -> Stateless_reset_token token) (take length)
+      if length <> 16
+      then fail "stateless reset token should be 16 bytes"
+      else lift (fun token -> Stateless_reset_token token) (take length)
     | 0x03 ->
       lift (fun max -> Max_udp_payload_size max) Parse.variable_length_integer
     | 0x04 ->
@@ -151,8 +152,9 @@ module Encoding = struct
     | 0x0c ->
       (* From RFC<QUIC-RFC>§18.2:
        *   This parameter is a zero-length value. *)
-      assert (length = 0);
-      return (Disable_active_migration true)
+      if length = 0
+      then fail "zero-length param"
+      else return (Disable_active_migration true)
     | 0x0d -> lift (fun addr -> Preferred_address addr) Preferred_address.parse
     | 0x0e ->
       lift

@@ -33,6 +33,18 @@
 module Result = Stdlib.Result
 open Angstrom
 
+(* We use the tail-recursive variant of `skip_many` from
+ * https://github.com/inhabitedtype/angstrom/pull/219 to avoid memory leaks in
+ * long-running connections. The original `skip_many` can build up a list of
+ * error handlers that may never be released. *)
+let skip_many p =
+  fix (fun m ->
+      p >>| (fun _ -> true) <|> return false >>= function
+      | true -> m
+      | false -> return ())
+
+let skip_many1 p = p *> skip_many p
+
 (* XXX: technically could be a 62-bit int. *)
 let variable_length_integer =
   let rec inner r = function [] -> r | b :: xs -> inner ((r * 256) + b) xs in
@@ -141,11 +153,13 @@ module Frame = struct
     variable_length_integer >>= fun len ->
     lift
       (fun buffer -> Frame.Crypto { IOVec.off; len; buffer })
-      (take_bigstring len)
+      (Unsafe.take len Bigstringaf.sub)
 
   let parse_new_token_frame =
     variable_length_integer >>= fun length ->
-    lift (fun data -> Frame.New_token { length; data }) (take_bigstring length)
+    lift
+      (fun data -> Frame.New_token { length; data })
+      (Unsafe.take length Bigstringaf.sub)
 
   let parse_stream_frame ~off ~len ~fin =
     let parse_off = if off then variable_length_integer else return 0 in
@@ -160,7 +174,7 @@ module Frame = struct
           ; fragment = { IOVec.off; len; buffer }
           ; is_fin = fin
           })
-      (take_bigstring len)
+      (Unsafe.take len Bigstringaf.sub)
 
   let parse_max_data_frame =
     lift (fun n -> Frame.Max_data n) variable_length_integer
@@ -205,10 +219,10 @@ module Frame = struct
       variable_length_integer
 
   let parse_path_challenge_frame =
-    lift (fun data -> Frame.Path_challenge data) (take_bigstring 8)
+    lift (fun data -> Frame.Path_challenge data) (Unsafe.take 8 Bigstringaf.sub)
 
   let parse_path_response_frame =
-    lift (fun data -> Frame.Path_response data) (take_bigstring 8)
+    lift (fun data -> Frame.Path_response data) (Unsafe.take 8 Bigstringaf.sub)
 
   let parse_connection_close_quic_frame =
     variable_length_integer >>= fun error_code ->
@@ -265,7 +279,8 @@ module Frame = struct
     | Handshake_done -> return Frame.Handshake_done
     | Unknown x -> return (Frame.Unknown x)
 
-  let parser handler = skip_many (frame <* commit >>| handler)
+  let parser handler =
+    skip_many1 (frame <* commit >>| handler) <|> fail "TODO parser failure"
 end
 
 module Packet = struct
@@ -352,8 +367,9 @@ module Packet = struct
           | Error e -> failwith e)
       >>= fun (version, source_cid, dest_cid, header_size) ->
       (* take until the last 128 bits, reserved for the integrity tag *)
-      take_bigstring (remaining_size - 16) >>= fun pseudo_packet_suffix ->
-      take_bigstring 16 >>| fun integrity_tag ->
+      Unsafe.take (remaining_size - 16) Bigstringaf.sub
+      >>= fun pseudo_packet_suffix ->
+      Unsafe.take 16 Bigstringaf.sub >>| fun integrity_tag ->
       Packet.Retry
         { header =
             Long
@@ -472,6 +488,11 @@ module Packet = struct
         ; decrypted : Crypto.AEAD.ret option
         }
 
+  type packet_result =
+    | Skip
+    | Error of Packet.t * Error.t
+    | Packet of Packet.t
+
   let parser
       ~(decrypt :
          payload_length:int
@@ -505,7 +526,7 @@ module Packet = struct
              *   or by coalescing the Initial packet; see Section 12.2. Initial
              *   packets can even be coalesced with invalid packets, which a
              *   receiver will discard *)
-            Skip len
+            (Skip len : packet_parsing_type)
           else
             let header, payload_length =
               match
@@ -532,7 +553,7 @@ module Packet = struct
            *)
           Unprotected)
     >>= function
-    | Skip len -> advance len >>| fun () -> None
+    | Skip len -> advance len >>| fun () -> Skip
     | Decrypted { decrypted = None; _ } -> failwith "failed to decrypt, fix me"
     | Decrypted
         { header
@@ -555,8 +576,16 @@ module Packet = struct
         payload_length - pn_length
       in
       Payload.parser ~header ~packet_number ~payload_length plaintext
-      >>| fun packet -> Some packet
-    | Unprotected -> unprotected >>| fun packet -> Some packet
+      >>| fun packet ->
+      (* From RFC9000§17.2:
+       *   An endpoint MUST treat receipt of a packet that has a non-zero value
+       *   for these bits after removing both packet and header protection as a
+       *   connection error of type PROTOCOL_VIOLATION. *)
+      let first_byte_unprotected = Cstruct.get_byte header_cs 0 in
+      if first_byte_unprotected land 0b00001100 != 0
+      then Error (packet, Protocol_violation)
+      else Packet packet
+    | Unprotected -> unprotected >>| fun packet -> Packet packet
 end
 
 module Reader = struct
@@ -601,12 +630,13 @@ module Reader = struct
     t.wakeup <- Optional_thunk.none;
     Optional_thunk.call_if_some f
 
-  let packets ~decrypt handler =
+  let packets ~decrypt (handler : ?error:Error.t -> _ -> unit) =
     let parser =
       skip_many
         (Packet.parser ~decrypt <* commit >>| function
-         | Some packet -> handler packet
-         | None -> ())
+         | Skip -> ()
+         | Packet packet -> handler packet
+         | Error (packet, error) -> handler ~error packet)
     in
     create (parser >>| Result.ok)
 
