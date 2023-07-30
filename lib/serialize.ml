@@ -489,14 +489,45 @@ module Writer = struct
     let header = header_of_encryption_level header_info in
     let hf = Faraday.create 0x100 in
     Pkt.Header.write_packet_header hf ~pn_length ~header;
+
+    let payload_length, plaintext =
+      let packet_len =
+        Faraday.pending_bytes hf
+        + payload_length
+        + pn_length
+        + varint_encoding_length 1200
+      in
+      match header_info.encryption_level, packet_len with
+      | Initial, packet_len when packet_len < 1200 ->
+        (* From RFC9000§14.1:
+         *   A client MUST expand the payload of all UDP datagrams carrying
+         *   Initial packets to at least the smallest allowed maximum datagram
+         *   size of 1200 bytes by adding PADDING frames to the Initial packet or
+         *   by coalescing the Initial packet; see Section 12.2. Initial packets
+         *   can even be coalesced with invalid packets, which a receiver will
+         *   discard. Similarly, a server MUST expand the payload of all UDP
+         *   datagrams carrying ack-eliciting Initial packets to at least the
+         *   smallest allowed maximum datagram size of 1200 bytes. *)
+        let padding_n = 1200 - packet_len in
+        let padding_f = Faraday.create padding_n in
+        Frame.write_padding padding_f padding_n;
+        ( payload_length + padding_n
+        , Cstruct.append
+            plaintext
+            (Cstruct.of_bigarray (Faraday.serialize_to_bigstring padding_f)) )
+      | _ -> payload_length, plaintext
+    in
+
     Pkt.Header.write_payload_length hf ~pn_length ~header payload_length;
     Pkt.Header.write_packet_number
       hf
       ~pn_length
       ~packet_number:header_info.packet_number;
+
     let unprotected_header =
       Cstruct.of_bigarray (Faraday.serialize_to_bigstring hf)
     in
+
     let protected =
       Crypto.AEAD.encrypt_packet
         header_info.encrypter

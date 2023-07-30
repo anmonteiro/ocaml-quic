@@ -81,7 +81,7 @@ let () =
                 ();
                 F (fun _stream -> assert false))
           in
-          Quic_eio.connect t ~address (fun ~cid ~start_stream ->
+          Quic_eio.connect t ~address ~host (fun ~cid ~start_stream ->
               let conn, stream_handler =
                 H3.Client_connection.create ~error_handler ~cid ~start_stream
               in

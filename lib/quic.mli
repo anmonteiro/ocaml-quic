@@ -142,6 +142,7 @@ module Transport : sig
   val connect
     :  t
     -> address:string
+    -> host:string
     -> (cid:string -> start_stream:start_stream -> stream_handler)
     -> unit
 end

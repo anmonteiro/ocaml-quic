@@ -1201,7 +1201,7 @@ module Client = struct
     create ~mode:Client ~config connection_handler
 end
 
-let connect t ~address connection_handler =
+let connect t ~address ~host connection_handler =
   let { Config.alpn_protocols; _ } = t.config in
   let dest_cid = CID.generate () in
   let src_cid = CID.generate () in
@@ -1239,7 +1239,11 @@ let connect t ~address connection_handler =
   in
 
   let tls_state =
-    Qtls.client ~authenticator:Config.null_auth ~alpn_protocols transport_params
+    Qtls.client
+      ~authenticator:Config.null_auth
+      ~alpn_protocols
+      ~host
+      transport_params
   in
   let new_connection =
     create_new_connection

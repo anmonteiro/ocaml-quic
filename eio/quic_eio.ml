@@ -226,8 +226,8 @@ module Client = struct
     connection
 end
 
-let connect t ~address f =
+let connect t ~address ~host f =
   let address = Addr.serialize address in
-  Quic.Transport.connect t ~address f
+  Quic.Transport.connect t ~address ~host f
 
 let shutdown t = Quic.Transport.shutdown t

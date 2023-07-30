@@ -186,7 +186,7 @@ let server ~certificates ~alpn_protocols =
   in
   (server : t)
 
-let client ~authenticator ~alpn_protocols quic_transport_parameters =
+let client ~authenticator ~alpn_protocols ~host quic_transport_parameters =
   let client, _nonce =
     Tls.Engine.client
       ~quic_transport_parameters
@@ -196,9 +196,7 @@ let client ~authenticator ~alpn_protocols quic_transport_parameters =
          ~version:(`TLS_1_3, `TLS_1_3)
          ~alpn_protocols
          ~peer_name:
-           (Domain_name.of_string "localhost"
-           |> Result.get_ok
-           |> Domain_name.host_exn)
+           (Domain_name.of_string host |> Result.get_ok |> Domain_name.host_exn)
          ())
   in
   (client : t)

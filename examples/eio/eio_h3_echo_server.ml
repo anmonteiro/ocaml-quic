@@ -24,12 +24,12 @@ let connection_handler clock =
 let () =
   Mirage_crypto_rng_unix.initialize ();
   Sys.(set_signal sigpipe Signal_ignore);
-  let port = ref 8080 in
+  let port = ref 4433 in
   Arg.parse
-    [ "-p", Arg.Set_int port, " Listening port number (8080 by default)" ]
+    [ "-p", Arg.Set_int port, " Listening port number (4433 by default)" ]
     ignore
     "Echoes POST requests. Runs forever.";
-  let listen_address = `Udp (Eio.Net.Ipaddr.V4.loopback, !port) in
+  let listen_address = `Udp (Eio.Net.Ipaddr.V4.any, !port) in
   let certificates =
     let cert = "./certificates/server.pem" in
     let priv_key = "./certificates/server.key" in

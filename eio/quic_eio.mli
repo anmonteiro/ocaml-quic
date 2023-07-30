@@ -66,6 +66,7 @@ end
 val connect
   :  t
   -> address:Eio.Net.Sockaddr.datagram
+  -> host:string
   -> (cid:string
       -> start_stream:Transport.start_stream
       -> Transport.stream_handler)
