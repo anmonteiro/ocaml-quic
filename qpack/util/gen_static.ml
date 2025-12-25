@@ -54,15 +54,18 @@ let mk_tokens static_table =
   let _, tokens =
     Array.fold_left
       (fun (prev_token, acc) (i, name, _) ->
-        if name <> prev_token then
-          let token =
-            let_
-              (Printf.sprintf "token_%s" (token_of_name name))
-              (Exp.constant (Pconst_integer (string_of_int i, None)))
-          in
-          name, token :: acc
-        else
-          name, acc)
+         if name <> prev_token
+         then
+           let token =
+             let_
+               (Printf.sprintf "token_%s" (token_of_name name))
+               (Exp.constant
+                  { pconst_loc = !default_loc
+                  ; pconst_desc = Pconst_integer (string_of_int i, None)
+                  })
+           in
+           name, token :: acc
+         else name, acc)
       ("", [])
       static_table
   in
@@ -75,18 +78,16 @@ let find_pos names =
     if
       List.map
         (fun name ->
-          Format.eprintf "n: %d %s@." pos name;
-          let ret = name.[pos] in
-          Format.eprintf "boom %c@." ret;
-          ret)
+           Format.eprintf "n: %d %s@." pos name;
+           let ret = name.[pos] in
+           Format.eprintf "boom %c@." ret;
+           ret)
         names
       |> CharSet.of_list
       |> CharSet.cardinal
       |> ( = ) n
-    then
-      pos
-    else
-      loop (pos + 1)
+    then pos
+    else loop (pos + 1)
   in
   loop 0
 
@@ -100,21 +101,19 @@ let make_token_map static_table =
   let tbl = Hashtbl.create 100 in
   Array.iter
     (fun (i, name, _) ->
-      let length = String.length name in
-      let string_tbl =
-        match Hashtbl.find_opt tbl length with
-        | Some string_tbl ->
-          string_tbl
-        | None ->
-          Hashtbl.create 10
-      in
-      add_name name i string_tbl;
-      Hashtbl.replace tbl length string_tbl)
+       let length = String.length name in
+       let string_tbl =
+         match Hashtbl.find_opt tbl length with
+         | Some string_tbl -> string_tbl
+         | None -> Hashtbl.create 10
+       in
+       add_name name i string_tbl;
+       Hashtbl.replace tbl length string_tbl)
     static_table;
   Hashtbl.fold
     (fun length names ret ->
-      let bindings = Hashtbl.fold (fun k v lst -> (k, v) :: lst) names [] in
-      (length, find_pos names, bindings) :: ret)
+       let bindings = Hashtbl.fold (fun k v lst -> (k, v) :: lst) names [] in
+       (length, find_pos names, bindings) :: ret)
     tbl
     []
 
@@ -122,13 +121,21 @@ let mk_static_table static_table =
   let items =
     Array.fold_left
       (fun acc (_, name, value) ->
-        let tup =
-          Exp.tuple
-            [ Exp.constant (Pconst_string (name, !default_loc, None))
-            ; Exp.constant (Pconst_string (value, !default_loc, None))
-            ]
-        in
-        tup :: acc)
+         let tup =
+           Exp.tuple
+             [ ( None
+               , Exp.constant
+                   { pconst_loc = !default_loc
+                   ; pconst_desc = Pconst_string (name, !default_loc, None)
+                   } )
+             ; ( None
+               , Exp.constant
+                   { pconst_loc = !default_loc
+                   ; pconst_desc = Pconst_string (value, !default_loc, None)
+                   } )
+             ]
+         in
+         tup :: acc)
       []
       static_table
   in
@@ -137,74 +144,115 @@ let mk_static_table static_table =
 let mk_lookup_token token_map =
   let_
     "lookup_token"
-    (Exp.fun_
-       Nolabel
+    (Exp.function_
+       [ { pparam_loc = !default_loc
+         ; pparam_desc =
+             Pparam_val
+               (Nolabel, None, Pat.var { txt = "name"; loc = !default_loc })
+         }
+       ]
        None
-       (Pat.var { txt = "name"; loc = !default_loc })
-       (Exp.match_
-          (Exp.apply
-             (Exp.ident
-                { txt = Longident.(Ldot (Lident "String", "length"))
-                ; loc = !default_loc
-                })
-             [ ( Nolabel
-               , Exp.ident { txt = Longident.Lident "name"; loc = !default_loc }
-               )
-             ])
-          (List.concat
-             [ List.map
-                 (fun (length, pos, names) ->
-                   Exp.case
-                     (Pat.constant
-                        (Pconst_integer (string_of_int length, None)))
-                     (Exp.match_
-                        (Exp.apply
-                           (Exp.ident
-                              { txt = Ldot (Lident "String", "get")
-                              ; loc = !default_loc
-                              })
-                           [ ( Nolabel
-                             , Exp.ident
-                                 { txt = Lident "name"; loc = !default_loc } )
-                           ; ( Nolabel
-                             , Exp.constant
-                                 (Pconst_integer (string_of_int pos, None)) )
-                           ])
-                        (List.concat
-                           [ List.map
-                               (fun (name, i) ->
-                                 Exp.case
-                                   (Pat.constant (Pconst_char name.[pos]))
-                                   ~guard:
-                                     (Exp.apply
-                                        (Exp.ident
-                                           { txt = Lident "="
-                                           ; loc = !default_loc
+       (Pfunction_body
+          (Exp.match_
+             (Exp.apply
+                (Exp.ident
+                   { txt =
+                       Longident.(
+                         Ldot
+                           ( { loc = !default_loc; txt = Lident "String" }
+                           , { loc = !default_loc; txt = "length" } ))
+                   ; loc = !default_loc
+                   })
+                [ ( Nolabel
+                  , Exp.ident
+                      { txt = Longident.Lident "name"; loc = !default_loc } )
+                ])
+             (List.concat
+                [ List.map
+                    (fun (length, pos, names) ->
+                       Exp.case
+                         (Pat.constant
+                            { pconst_loc = !default_loc
+                            ; pconst_desc =
+                                Pconst_integer (string_of_int length, None)
+                            })
+                         (Exp.match_
+                            (Exp.apply
+                               (Exp.ident
+                                  { txt =
+                                      Ldot
+                                        ( { loc = !default_loc
+                                          ; txt = Lident "String"
+                                          }
+                                        , { loc = !default_loc; txt = "get" } )
+                                  ; loc = !default_loc
+                                  })
+                               [ ( Nolabel
+                                 , Exp.ident
+                                     { txt = Lident "name"; loc = !default_loc }
+                                 )
+                               ; ( Nolabel
+                                 , Exp.constant
+                                     { pconst_loc = !default_loc
+                                     ; pconst_desc =
+                                         Pconst_integer (string_of_int pos, None)
+                                     } )
+                               ])
+                            (List.concat
+                               [ List.map
+                                   (fun (name, i) ->
+                                      Exp.case
+                                        (Pat.constant
+                                           { pconst_loc = !default_loc
+                                           ; pconst_desc =
+                                               Pconst_char name.[pos]
                                            })
-                                        [ ( Nolabel
-                                          , Exp.ident
-                                              { txt = Lident "name"
-                                              ; loc = !default_loc
-                                              } )
-                                        ; ( Nolabel
-                                          , Exp.constant
-                                              (Pconst_string
-                                                 (name, !default_loc, None)) )
-                                        ])
-                                   (Exp.constant
-                                      (Pconst_integer (string_of_int i, None))))
-                               names
-                           ; [ Exp.case
-                                 (Pat.any ())
-                                 (Exp.constant (Pconst_integer ("-1", None)))
-                             ]
-                           ])))
-                 token_map
-             ; [ Exp.case
-                   (Pat.any ())
-                   (Exp.constant (Pconst_integer ("-1", None)))
-               ]
-             ])))
+                                        ~guard:
+                                          (Exp.apply
+                                             (Exp.ident
+                                                { txt = Lident "="
+                                                ; loc = !default_loc
+                                                })
+                                             [ ( Nolabel
+                                               , Exp.ident
+                                                   { txt = Lident "name"
+                                                   ; loc = !default_loc
+                                                   } )
+                                             ; ( Nolabel
+                                               , Exp.constant
+                                                   { pconst_loc = !default_loc
+                                                   ; pconst_desc =
+                                                       Pconst_string
+                                                         ( name
+                                                         , !default_loc
+                                                         , None )
+                                                   } )
+                                             ])
+                                        (Exp.constant
+                                           { pconst_loc = !default_loc
+                                           ; pconst_desc =
+                                               Pconst_integer
+                                                 (string_of_int i, None)
+                                           }))
+                                   names
+                               ; [ Exp.case
+                                     (Pat.any ())
+                                     (Exp.constant
+                                        { pconst_loc = !default_loc
+                                        ; pconst_desc =
+                                            Pconst_integer ("-1", None)
+                                        })
+                                 ]
+                               ])))
+                    token_map
+                ; [ Exp.case
+                      (Pat.any ())
+                      (Exp.constant
+                         { pconst_loc = !default_loc
+                         ; pconst_desc = Pconst_integer ("-1", None)
+                         })
+                  ]
+                ]))))
 
 let () =
   let ic = open_in Sys.argv.(1) in
@@ -212,17 +260,21 @@ let () =
     Array.init 99 @@ fun i ->
     let line = input_line ic in
     match String.split_on_char '\t' line with
-    | [ s; name ] when int_of_string s == i ->
-      i, name, ""
-    | [ s; name; value ] when int_of_string s == i ->
-      i, name, value
-    | _ ->
-      assert false
+    | [ s; name ] when int_of_string s == i -> i, name, ""
+    | [ s; name; value ] when int_of_string s == i -> i, name, value
+    | _ -> assert false
   in
   let token_map = make_token_map static_table in
   let ppf = Format.std_formatter in
   Format.fprintf ppf "(* generated by util/gen_static.ml *)\n\n";
-  let size = let_ "size" (Exp.constant (Pconst_integer ("99", None))) in
+  let size =
+    let_
+      "size"
+      (Exp.constant
+         { pconst_loc = !default_loc
+         ; pconst_desc = Pconst_integer ("99", None)
+         })
+  in
   Pprintast.structure
     ppf
     (List.concat
