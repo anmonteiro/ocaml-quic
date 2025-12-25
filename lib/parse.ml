@@ -39,9 +39,9 @@ open Angstrom
  * error handlers that may never be released. *)
 let skip_many p =
   fix (fun m ->
-      p >>| (fun _ -> true) <|> return false >>= function
-      | true -> m
-      | false -> return ())
+    p >>| (fun _ -> true) <|> return false >>= function
+    | true -> m
+    | false -> return ())
 
 let skip_many1 p = p *> skip_many p
 
@@ -64,9 +64,9 @@ module Frame = struct
   let parse_padding_frames () =
     let count = ref 0 in
     skip_while (fun c ->
-        let r = Char.code c = 0x0 in
-        if r then incr count;
-        r)
+      let r = Char.code c = 0x0 in
+      if r then incr count;
+      r)
     >>| fun () -> !count
 
   let parse_ack_frame ecn_counts =
@@ -82,13 +82,13 @@ module Frame = struct
          variable_length_integer)
     >>= fun ranges ->
     (if not ecn_counts
-    then return None
-    else
-      lift3
-        (fun ect0 ect1 cn -> Some (ect0, ect1, cn))
-        variable_length_integer
-        variable_length_integer
-        variable_length_integer)
+     then return None
+     else
+       lift3
+         (fun ect0 ect1 cn -> Some (ect0, ect1, cn))
+         variable_length_integer
+         variable_length_integer
+         variable_length_integer)
     >>| fun ecn_counts ->
     (* From RFC9000§19.3.1:
      *   Thus, given a largest packet number for the range, the smallest value
@@ -105,22 +105,22 @@ module Frame = struct
     let ranges =
       List.fold_left
         (fun acc (gap, len) ->
-          (* TODO: validate smallest < gap + 2 *)
-          (* From RFC9000§19.3.1:
+           (* TODO: validate smallest < gap + 2 *)
+           (* From RFC9000§19.3.1:
            *   Gap and ACK Range value use a relative integer encoding for
            *   efficiency. Though each encoded value is positive, the values are
            *   subtracted, so that each ACK Range describes progressively
            *   lower-numbered packets. *)
-          let smallest_ack = (List.hd acc).Frame.Range.first in
-          (* From RFC9000§19.3.1:
-           *   The value of the Gap field establishes the largest packet number
-           *   value for the subsequent ACK Range using the following formula:
-           *
-           *     largest = previous_smallest - gap - 2
-           *)
-          let largest_ack = Int64.(sub (sub smallest_ack gap) 2L) in
-          let smallest_ack = Int64.sub largest_ack len in
-          { Frame.Range.first = smallest_ack; last = largest_ack } :: acc)
+           let smallest_ack = (List.hd acc).Frame.Range.first in
+           (* From RFC9000§19.3.1:
+            *   The value of the Gap field establishes the largest packet number
+            *   value for the subsequent ACK Range using the following formula:
+            *
+            *     largest = previous_smallest - gap - 2
+            *)
+           let largest_ack = Int64.(sub (sub smallest_ack gap) 2L) in
+           let smallest_ack = Int64.sub largest_ack len in
+           { Frame.Range.first = smallest_ack; last = largest_ack } :: acc)
         [ first_range ]
         ranges
     in
@@ -129,11 +129,11 @@ module Frame = struct
   let parse_reset_stream_frame =
     lift3
       (fun stream_id error final_size ->
-        Frame.Reset_stream
-          { stream_id = Int64.of_int stream_id
-          ; application_protocol_error = error
-          ; final_size
-          })
+         Frame.Reset_stream
+           { stream_id = Int64.of_int stream_id
+           ; application_protocol_error = error
+           ; final_size
+           })
       variable_length_integer
       variable_length_integer
       variable_length_integer
@@ -141,10 +141,10 @@ module Frame = struct
   let parse_stop_sending_frame =
     lift2
       (fun stream_id error ->
-        Frame.Stop_sending
-          { stream_id = Int64.of_int stream_id
-          ; application_protocol_error = error
-          })
+         Frame.Stop_sending
+           { stream_id = Int64.of_int stream_id
+           ; application_protocol_error = error
+           })
       variable_length_integer
       variable_length_integer
 
@@ -169,11 +169,11 @@ module Frame = struct
     parse_len >>= fun len ->
     lift
       (fun buffer ->
-        Frame.Stream
-          { id = Int64.of_int stream_id
-          ; fragment = { IOVec.off; len; buffer }
-          ; is_fin = fin
-          })
+         Frame.Stream
+           { id = Int64.of_int stream_id
+           ; fragment = { IOVec.off; len; buffer }
+           ; is_fin = fin
+           })
       (Unsafe.take len Bigstringaf.sub)
 
   let parse_max_data_frame =
@@ -182,8 +182,8 @@ module Frame = struct
   let parse_max_stream_data_frame =
     lift2
       (fun stream_id n ->
-        Frame.Max_stream_data
-          { stream_id = Int64.of_int stream_id; max_data = n })
+         Frame.Max_stream_data
+           { stream_id = Int64.of_int stream_id; max_data = n })
       variable_length_integer
       variable_length_integer
 
@@ -196,7 +196,7 @@ module Frame = struct
   let parse_stream_data_blocked_frame =
     lift2
       (fun stream_id n ->
-        Frame.Stream_data_blocked { id = Int64.of_int stream_id; max_data = n })
+         Frame.Stream_data_blocked { id = Int64.of_int stream_id; max_data = n })
       variable_length_integer
       variable_length_integer
 
@@ -208,8 +208,8 @@ module Frame = struct
     variable_length_integer >>= fun retire_prior_to ->
     lift2
       (fun cid stateless_reset_token ->
-        Frame.New_connection_id
-          { cid; sequence_no; stateless_reset_token; retire_prior_to })
+         Frame.New_connection_id
+           { cid; sequence_no; stateless_reset_token; retire_prior_to })
       CID.parse
       (take 16)
 
@@ -230,11 +230,11 @@ module Frame = struct
     variable_length_integer >>= fun reason_phrase_length ->
     lift
       (fun reason_phrase ->
-        Frame.Connection_close_quic
-          { error_code = Error.parse error_code
-          ; frame_type = Frame.Type.parse frame_type
-          ; reason_phrase
-          })
+         Frame.Connection_close_quic
+           { error_code = Error.parse error_code
+           ; frame_type = Frame.Type.parse frame_type
+           ; reason_phrase
+           })
       (take reason_phrase_length)
 
   let parse_connection_close_app_frame =
@@ -242,7 +242,7 @@ module Frame = struct
     variable_length_integer >>= fun reason_phrase_length ->
     lift
       (fun reason_phrase ->
-        Frame.Connection_close_app { error_code; reason_phrase })
+         Frame.Connection_close_app { error_code; reason_phrase })
       (take reason_phrase_length)
 
   let frame =
@@ -289,14 +289,14 @@ module Packet = struct
       let parse =
         lift3
           (fun version dst_cid src_cid ->
-            (* From RFC9000§17.2:
+             (* From RFC9000§17.2:
              *   In QUIC version 1, this value MUST NOT exceed 20. Endpoints that
              *   receive a version 1 long header with a value larger than 20 MUST
              *   drop the packet.  Servers SHOULD be able to read longer connection
              *   IDs from other QUIC versions in order to properly form a version
              *   negotiation packet. *)
-            (* TODO: "drop" the packet. *)
-            Packet.Version.parse version, src_cid, dst_cid)
+             (* TODO: "drop" the packet. *)
+             Packet.Version.parse version, src_cid, dst_cid)
           BE.any_int32
           CID.parse
           CID.parse
@@ -320,8 +320,8 @@ module Packet = struct
       available >>= fun remaining_size ->
       lift
         (fun versions ->
-          (* TODO: do we need to validate that version is not 0? *)
-          Packet.VersionNegotiation { source_cid; dest_cid; versions })
+           (* TODO: do we need to validate that version is not 0? *)
+           Packet.VersionNegotiation { source_cid; dest_cid; versions })
         (count remaining_size BE.any_int32)
 
     (*
@@ -347,24 +347,23 @@ module Packet = struct
        *   datagram. *)
       available >>= fun remaining_size ->
       Unsafe.peek remaining_size (fun bs ~off ~len ->
-          match
-            Angstrom.parse_bigstring
-              ~consume:Prefix
-              ( advance 1 *> Header.Long.parse
-              >>= fun (version, source_cid, dest_cid) ->
-                return
-                  ( version
-                  , source_cid
-                  , dest_cid
-                  , 1 + 4 + 1 + 1 + CID.length source_cid + CID.length dest_cid
-                  )
-                >>| fun (v, s, d, l) ->
-                Format.eprintf "n: %d %d@." l remaining_size;
-                v, s, d, l )
-              (Bigstringaf.sub bs ~off ~len)
-          with
-          | Ok x -> x
-          | Error e -> failwith e)
+        match
+          Angstrom.parse_bigstring
+            ~consume:Prefix
+            ( advance 1 *> Header.Long.parse
+            >>= fun (version, source_cid, dest_cid) ->
+              return
+                ( version
+                , source_cid
+                , dest_cid
+                , 1 + 4 + 1 + 1 + CID.length source_cid + CID.length dest_cid )
+              >>| fun (v, s, d, l) ->
+              Format.eprintf "n: %d %d@." l remaining_size;
+              v, s, d, l )
+            (Bigstringaf.sub bs ~off ~len)
+        with
+        | Ok x -> x
+        | Error e -> failwith e)
       >>= fun (version, source_cid, dest_cid, header_size) ->
       (* take until the last 128 bits, reserved for the integrity tag *)
       Unsafe.take (remaining_size - 16) Bigstringaf.sub
@@ -388,11 +387,18 @@ module Packet = struct
         }
 
     let parser ~payload_length ~header ~packet_number plaintext =
-      let plaintext = Cstruct.to_bigarray plaintext in
-      assert (payload_length >= Bigstringaf.length plaintext);
+      assert (payload_length >= String.length plaintext);
       advance payload_length >>| fun () ->
       Packet.Frames
-        { header; payload_length; payload = plaintext; packet_number }
+        { header
+        ; payload_length
+        ; payload =
+            Bigstringaf.of_string
+              ~off:0
+              ~len:(String.length plaintext)
+              plaintext
+        ; packet_number
+        }
   end
 
   let unprotected =
@@ -428,15 +434,15 @@ module Packet = struct
         variable_length_integer >>= fun token_length ->
         lift2
           (fun token payload_length ->
-            ( Packet.Header.Initial { version; source_cid; dest_cid; token }
-            , payload_length ))
+             ( Packet.Header.Initial { version; source_cid; dest_cid; token }
+             , payload_length ))
           (take token_length)
           variable_length_integer
       | Zero_RTT | Handshake ->
         lift
           (fun payload_length ->
-            ( Packet.Header.Long { version; source_cid; dest_cid; packet_type }
-            , payload_length ))
+             ( Packet.Header.Long { version; source_cid; dest_cid; packet_type }
+             , payload_length ))
           variable_length_integer
       | Retry -> failwith "retry is unprotected")
 
@@ -494,13 +500,13 @@ module Packet = struct
     | Packet of Packet.t
 
   let parser
-      ~(decrypt :
-         payload_length:int
-         -> header:Packet.Header.t
-         -> Cstruct.buffer
-         -> off:int
-         -> len:int
-         -> Crypto.AEAD.ret option)
+        ~(decrypt :
+           payload_length:int
+           -> header:Packet.Header.t
+           -> Cstruct.buffer
+           -> off:int
+           -> len:int
+           -> Crypto.AEAD.ret option)
     =
     (* XXX(anmonteiro): it's important to call `peek_char_fail` before calling
      * `available` because Angstrom.Unbuffered starts the parser with
@@ -510,48 +516,48 @@ module Packet = struct
     let first_byte = Char.code first_byte in
     available >>= fun avail ->
     Unsafe.peek avail (fun bs ~off ~len ->
-        if is_protected bs ~off
+      if is_protected bs ~off
+      then (
+        if not (Bits.test first_byte 6)
         then
-          if not (Bits.test first_byte 6)
-          then
-            (* From RFC9000§17.2:
-             *   Fixed Bit: The next bit (0x40) of byte 0 is set to 1. Packets
-             *   containing a zero value for this bit are not valid packets in
-             *   this version and MUST be discarded. *)
-
-            (* From RFC9001§14.1:
-             *   A client MUST expand the payload of all UDP datagrams carrying
-             *   Initial packets to at least the smallest allowed maximum datagram
-             *   size of 1200 bytes by adding PADDING frames to the Initial packet
-             *   or by coalescing the Initial packet; see Section 12.2. Initial
-             *   packets can even be coalesced with invalid packets, which a
-             *   receiver will discard *)
-            (Skip len : packet_parsing_type)
-          else
-            let header, payload_length =
-              match
-                Angstrom.parse_bigstring
-                  ~consume:Prefix
-                  protected_header
-                  (Bigstringaf.sub bs ~off ~len)
-              with
-              | Ok x -> x
-              | Error e -> failwith e
-            in
-            Decrypted
-              { header
-              ; payload_length
-              ; decrypted = decrypt ~payload_length ~header bs ~off ~len
-              }
+          (* From RFC9000§17.2:
+           *   Fixed Bit: The next bit (0x40) of byte 0 is set to 1. Packets
+           *   containing a zero value for this bit are not valid packets in
+           *   this version and MUST be discarded. *)
+          (* From RFC9001§14.1:
+           *   A client MUST expand the payload of all UDP datagrams carrying
+           *   Initial packets to at least the smallest allowed maximum datagram
+           *   size of 1200 bytes by adding PADDING frames to the Initial packet
+           *   or by coalescing the Initial packet; see Section 12.2. Initial
+           *   packets can even be coalesced with invalid packets, which a
+           *   receiver will discard *)
+          (Skip len : packet_parsing_type)
         else
-          (* From RFC9001§5.3:
-           *   All QUIC packets other than Version Negotiation and Retry
-           *   packets are protected with an AEAD algorithm [AEAD].
-           *
-           * NOTE(anmonteiro): Can only be one of the above: Negotiation or
-           * Retry.
-           *)
-          Unprotected)
+          let header, payload_length =
+            match
+              Angstrom.parse_bigstring
+                ~consume:Prefix
+                protected_header
+                (Bigstringaf.sub bs ~off ~len)
+            with
+            | Ok x -> x
+            | Error e -> failwith e
+          in
+          Format.eprintf "mutha %d@." payload_length;
+          Decrypted
+            { header
+            ; payload_length
+            ; decrypted = decrypt ~payload_length ~header bs ~off ~len
+            })
+      else
+        (* From RFC9001§5.3:
+         *   All QUIC packets other than Version Negotiation and Retry
+         *   packets are protected with an AEAD algorithm [AEAD].
+         *
+         * NOTE(anmonteiro): Can only be one of the above: Negotiation or
+         * Retry.
+         *)
+        Unprotected)
     >>= function
     | Skip len -> advance len >>| fun () -> Skip
     | Decrypted { decrypted = None; _ } -> failwith "failed to decrypt, fix me"
@@ -566,7 +572,7 @@ module Packet = struct
               ; header = header_cs
               }
         } ->
-      let header_length = Cstruct.length header_cs in
+      let header_length = String.length header_cs in
       advance header_length >>= fun () ->
       let payload_length =
         (* From RFC9000§17.2:
@@ -581,7 +587,7 @@ module Packet = struct
        *   An endpoint MUST treat receipt of a packet that has a non-zero value
        *   for these bits after removing both packet and header protection as a
        *   connection error of type PROTOCOL_VIOLATION. *)
-      let first_byte_unprotected = Cstruct.get_byte header_cs 0 in
+      let first_byte_unprotected = String.get_uint8 header_cs 0 in
       if first_byte_unprotected land 0b00001100 != 0
       then Error (packet, Protocol_violation)
       else Packet packet
@@ -606,10 +612,10 @@ module Reader = struct
   type t =
     { parser : (unit, error) result Angstrom.t
     ; mutable parse_state : error parse_state
-          (* The state of the parse for the current request *)
+      (* The state of the parse for the current request *)
     ; mutable closed : bool
-          (* Whether the input source has left the building, indicating that no
-           * further input will be received. *)
+      (* Whether the input source has left the building, indicating that no
+       * further input will be received. *)
     ; mutable wakeup : Optional_thunk.t
     }
 
@@ -633,10 +639,10 @@ module Reader = struct
   let packets ~decrypt (handler : ?error:Error.t -> _ -> unit) =
     let parser =
       skip_many
-        (Packet.parser ~decrypt <* commit >>| function
-         | Skip -> ()
-         | Packet packet -> handler packet
-         | Error (packet, error) -> handler ~error packet)
+        ( Packet.parser ~decrypt <* commit >>| function
+          | Skip -> ()
+          | Packet packet -> handler packet
+          | Error (packet, error) -> handler ~error packet )
     in
     create (parser >>| Result.ok)
 

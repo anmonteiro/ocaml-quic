@@ -98,11 +98,11 @@ module Frame = struct
     let (_ : int64) =
       List.fold_left
         (fun smallest_ack { Frame.Range.first; last } ->
-          let gap = Int64.sub smallest_ack last in
-          let len = Int64.sub last first in
-          write_variable_length_integer t (Int64.to_int gap);
-          write_variable_length_integer t (Int64.to_int len);
-          first)
+           let gap = Int64.sub smallest_ack last in
+           let len = Int64.sub last first in
+           write_variable_length_integer t (Int64.to_int gap);
+           write_variable_length_integer t (Int64.to_int len);
+           first)
         first.first
         rest
     in
@@ -155,11 +155,11 @@ module Frame = struct
   let write_streams_blocked t ~max = write_variable_length_integer t max
 
   let write_new_connection_id
-      t
-      ~cid
-      ~stateless_reset_token
-      ~retire_prior_to
-      ~sequence_no
+        t
+        ~cid
+        ~stateless_reset_token
+        ~retire_prior_to
+        ~sequence_no
     =
     write_variable_length_integer t sequence_no;
     write_variable_length_integer t retire_prior_to;
@@ -394,15 +394,15 @@ module Writer = struct
 
   type t =
     { buffer : Bigstringaf.t
-          (* The buffer that the encoder uses for buffered writes. Managed by
-           * the control module for the encoder. *)
+      (* The buffer that the encoder uses for buffered writes. Managed by
+       * the control module for the encoder. *)
     ; encoder : Faraday.t
-          (* The encoder that handles encoding for writes. Uses the [buffer]
-           * referenced above internally. *)
+      (* The encoder that handles encoding for writes. Uses the [buffer]
+       * referenced above internally. *)
     ; mutable drained_bytes : int
-          (* The number of bytes that were not written due to the output stream
-           * being closed before all buffered output could be written. Useful
-           * for detecting error cases. *)
+      (* The number of bytes that were not written due to the output stream
+       * being closed before all buffered output could be written. Useful
+       * for detecting error cases. *)
     }
 
   let create buffer_size =
@@ -419,13 +419,13 @@ module Writer = struct
    *
    * 0xff000000 + 0x1d = 0xff00001d *)
   let make_header_info
-      ~encrypter
-      ~packet_number
-      ~encryption_level
-      ?(source_cid = CID.empty)
-      ?(version = 0x1l)
-      ~token
-      dest_cid
+        ~encrypter
+        ~packet_number
+        ~encryption_level
+        ?(source_cid = CID.empty)
+        ?(version = 0x1l)
+        ~token
+        dest_cid
     =
     { encrypter
     ; version
@@ -457,7 +457,7 @@ module Writer = struct
    *               Table 1: Encryption Keys by Packet Type
    *)
   let header_of_encryption_level
-      { version; source_cid; dest_cid; token; encryption_level; _ }
+        { version; source_cid; dest_cid; token; encryption_level; _ }
     =
     match encryption_level with
     | Encryption_level.Initial ->
@@ -478,14 +478,19 @@ module Writer = struct
     Pkt.write_packet_payload tmpf frames;
     let pn_offset = 4 - pn_length in
     let cur_size = Bigstringaf.length frames + tag_len in
-    (if pn_offset + (* sample size *) 16 > cur_size
-    then
-      (* needs padding *)
-      let n_padding = pn_offset + 16 - cur_size in
-      Frame.write_padding tmpf n_padding);
-    let plaintext = Cstruct.of_bigarray (Faraday.serialize_to_bigstring tmpf) in
+    (if
+       pn_offset
+       +
+       (* sample size *)
+       16
+       > cur_size
+     then
+       (* needs padding *)
+       let n_padding = pn_offset + 16 - cur_size in
+       Frame.write_padding tmpf n_padding);
+    let plaintext = Faraday.serialize_to_string tmpf in
     (* AEAD ciphertext length is the same as the plaintext length (+ tag). *)
-    let payload_length = Cstruct.length plaintext + tag_len in
+    let payload_length = String.length plaintext + tag_len in
     let header = header_of_encryption_level header_info in
     let hf = Faraday.create 0x100 in
     Pkt.Header.write_packet_header hf ~pn_length ~header;
@@ -512,9 +517,7 @@ module Writer = struct
         let padding_f = Faraday.create padding_n in
         Frame.write_padding padding_f padding_n;
         ( payload_length + padding_n
-        , Cstruct.append
-            plaintext
-            (Cstruct.of_bigarray (Faraday.serialize_to_bigstring padding_f)) )
+        , plaintext ^ Faraday.serialize_to_string padding_f )
       | _ -> payload_length, plaintext
     in
 
@@ -524,9 +527,7 @@ module Writer = struct
       ~pn_length
       ~packet_number:header_info.packet_number;
 
-    let unprotected_header =
-      Cstruct.of_bigarray (Faraday.serialize_to_bigstring hf)
-    in
+    let unprotected_header = Faraday.serialize_to_string hf in
 
     let protected =
       Crypto.AEAD.encrypt_packet
@@ -535,7 +536,7 @@ module Writer = struct
         ~header:unprotected_header
         plaintext
     in
-    Faraday.schedule_bigstring t.encoder (Cstruct.to_bigarray protected)
+    Faraday.write_string t.encoder protected
 
   let faraday t = t.encoder
   let flush t f = flush t.encoder f

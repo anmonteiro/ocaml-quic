@@ -61,19 +61,25 @@ module Preferred_address = struct
     BE.any_uint16 >>= fun ipv6_port ->
     lift2
       (fun cid token ->
+         { ipv4_addr
+         ; ipv4_port
+         ; ipv6_addr
+         ; ipv6_port
+         ; cid
+         ; stateless_reset_token = token
+         })
+      CID.parse
+      (take 16)
+
+  let serialize
+        f
         { ipv4_addr
         ; ipv4_port
         ; ipv6_addr
         ; ipv6_port
         ; cid
-        ; stateless_reset_token = token
-        })
-      CID.parse
-      (take 16)
-
-  let serialize
-      f
-      { ipv4_addr; ipv4_port; ipv6_addr; ipv6_port; cid; stateless_reset_token }
+        ; stateless_reset_token
+        }
     =
     Faraday.write_string f ipv4_addr;
     Faraday.BE.write_uint16 f ipv4_port;
@@ -397,7 +403,7 @@ let default =
 exception Local
 
 let decode_and_validate ~(perspective : Crypto.Mode.t) enc =
-  let bs = Cstruct.to_bigarray enc in
+  let bs = Bigstringaf.of_string ~off:0 ~len:(String.length enc) enc in
   match Angstrom.parse_bigstring ~consume:All Encoding.parser bs with
   | Ok (_ :: _ as t) ->
     (* From RFC<QUIC-RFC>§7.4:
@@ -416,84 +422,84 @@ let decode_and_validate ~(perspective : Crypto.Mode.t) enc =
        let params =
          List.fold_left
            (fun acc item ->
-             match item with
-             | Encoding.Original_destination_connection_id cid ->
-               (match perspective with
-               | Server ->
-                 (* From RFC<QUIC-RFC>§18.2:
-                  *   This transport parameter is only sent by a server. *)
-                 raise Local
-               | Client ->
-                 { acc with original_destination_connection_id = Some cid })
-             | Max_idle_timeout timeout ->
-               { acc with max_idle_timeout = timeout }
-             | Stateless_reset_token token ->
-               (match perspective with
-               | Server ->
-                 (* From RFC<QUIC-RFC>§18.2:
-                  *   This transport parameter MUST NOT be sent by a client,
-                  *   but MAY be sent by a server. *)
-                 raise Local
-               | Client -> { acc with stateless_reset_token = Some token })
-             | Max_udp_payload_size max ->
-               (* From RFC<QUIC-RFC>§18.2:
-                *   The default for this parameter is the maximum permitted
-                *   UDP payload of 65527. Values below 1200 are invalid. *)
-               if max < 1200 || max > 65527
-               then raise Local
-               else { acc with max_udp_payload_size = max }
-             | Initial_max_data max -> { acc with initial_max_data = max }
-             | Initial_max_stream_data_bidi_local max ->
-               { acc with initial_max_stream_data_bidi_local = max }
-             | Initial_max_stream_data_bidi_remote max ->
-               { acc with initial_max_stream_data_bidi_remote = max }
-             | Initial_max_stream_data_uni max ->
-               { acc with initial_max_stream_data_uni = max }
-             | Initial_max_streams_bidi max ->
-               { acc with initial_max_streams_bidi = max }
-             | Initial_max_streams_uni max ->
-               { acc with initial_max_streams_uni = max }
-             | Ack_delay_exponent exp ->
-               (* From RFC<QUIC-RFC>§18.2:
-                *   Values above 20 are invalid. *)
-               if exp > 20
-               then raise Local
-               else
-                 { acc with
-                   ack_delay_exponent = int_of_float (2. ** float_of_int exp)
-                 }
-             | Max_ack_delay max ->
-               (* From RFC<QUIC-RFC>§18.2:
-                *   Values of 2^14 or greater are invalid. *)
-               if max > 1 lsl 14
-               then raise Local
-               else { acc with max_ack_delay = max }
-             | Disable_active_migration disable_active_migration ->
-               assert disable_active_migration;
-               { acc with disable_active_migration }
-             | Preferred_address addr ->
-               (* TODO:
-                * From RFC<QUIC-RFC>§18.2:
-                *   A server that chooses a zero-length connection ID MUST NOT
-                *   provide a preferred address. Similarly, a server MUST NOT
-                *   include a zero-length connection ID in this transport
-                *   parameter. *)
-               { acc with preferred_address = Some addr }
-             | Active_connection_id_limit limit ->
-               (* From RFC<QUIC-RFC>§18.2:
-                *   The value of the active_connection_id_limit parameter MUST
-                *   be at least 2. *)
-               if limit < 2
-               then raise Local
-               else { acc with active_connection_id_limit = limit }
-             | Initial_source_connection_id cid ->
-               { acc with initial_source_connection_id = Some cid }
-             | Retry_source_connection_id cid ->
-               (* From RFC<QUIC-RFC>§18.2:
-                *   This transport parameter is only sent by a server. *)
-               (match perspective with
-               | Server -> raise Local
-               | Client -> { acc with retry_source_connection_id = Some cid }))
+              match item with
+              | Encoding.Original_destination_connection_id cid ->
+                (match perspective with
+                | Server ->
+                  (* From RFC<QUIC-RFC>§18.2:
+                   *   This transport parameter is only sent by a server. *)
+                  raise Local
+                | Client ->
+                  { acc with original_destination_connection_id = Some cid })
+              | Max_idle_timeout timeout ->
+                { acc with max_idle_timeout = timeout }
+              | Stateless_reset_token token ->
+                (match perspective with
+                | Server ->
+                  (* From RFC<QUIC-RFC>§18.2:
+                   *   This transport parameter MUST NOT be sent by a client,
+                   *   but MAY be sent by a server. *)
+                  raise Local
+                | Client -> { acc with stateless_reset_token = Some token })
+              | Max_udp_payload_size max ->
+                (* From RFC<QUIC-RFC>§18.2:
+                 *   The default for this parameter is the maximum permitted
+                 *   UDP payload of 65527. Values below 1200 are invalid. *)
+                if max < 1200 || max > 65527
+                then raise Local
+                else { acc with max_udp_payload_size = max }
+              | Initial_max_data max -> { acc with initial_max_data = max }
+              | Initial_max_stream_data_bidi_local max ->
+                { acc with initial_max_stream_data_bidi_local = max }
+              | Initial_max_stream_data_bidi_remote max ->
+                { acc with initial_max_stream_data_bidi_remote = max }
+              | Initial_max_stream_data_uni max ->
+                { acc with initial_max_stream_data_uni = max }
+              | Initial_max_streams_bidi max ->
+                { acc with initial_max_streams_bidi = max }
+              | Initial_max_streams_uni max ->
+                { acc with initial_max_streams_uni = max }
+              | Ack_delay_exponent exp ->
+                (* From RFC<QUIC-RFC>§18.2:
+                 *   Values above 20 are invalid. *)
+                if exp > 20
+                then raise Local
+                else
+                  { acc with
+                    ack_delay_exponent = int_of_float (2. ** float_of_int exp)
+                  }
+              | Max_ack_delay max ->
+                (* From RFC<QUIC-RFC>§18.2:
+                 *   Values of 2^14 or greater are invalid. *)
+                if max > 1 lsl 14
+                then raise Local
+                else { acc with max_ack_delay = max }
+              | Disable_active_migration disable_active_migration ->
+                assert disable_active_migration;
+                { acc with disable_active_migration }
+              | Preferred_address addr ->
+                (* TODO:
+                 * From RFC<QUIC-RFC>§18.2:
+                 *   A server that chooses a zero-length connection ID MUST NOT
+                 *   provide a preferred address. Similarly, a server MUST NOT
+                 *   include a zero-length connection ID in this transport
+                 *   parameter. *)
+                { acc with preferred_address = Some addr }
+              | Active_connection_id_limit limit ->
+                (* From RFC<QUIC-RFC>§18.2:
+                 *   The value of the active_connection_id_limit parameter MUST
+                 *   be at least 2. *)
+                if limit < 2
+                then raise Local
+                else { acc with active_connection_id_limit = limit }
+              | Initial_source_connection_id cid ->
+                { acc with initial_source_connection_id = Some cid }
+              | Retry_source_connection_id cid ->
+                (* From RFC<QUIC-RFC>§18.2:
+                 *   This transport parameter is only sent by a server. *)
+                (match perspective with
+                | Server -> raise Local
+                | Client -> { acc with retry_source_connection_id = Some cid }))
            default
            t
        in
@@ -522,4 +528,4 @@ let decode_and_validate ~(perspective : Crypto.Mode.t) enc =
 let encode params =
   let f = Faraday.create 0x100 in
   Encoding.serialize f params;
-  Cstruct.of_bigarray (Faraday.serialize_to_bigstring f)
+  Faraday.serialize_to_string f

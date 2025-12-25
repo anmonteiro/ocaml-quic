@@ -58,5 +58,5 @@ let compare = String.compare
 let equal = String.equal
 
 let generate () =
-  let random_bytes n = Mirage_crypto_rng.generate n |> Cstruct.to_string in
+  let random_bytes n = Mirage_crypto_rng.generate n in
   random_bytes 20

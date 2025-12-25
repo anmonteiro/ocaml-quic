@@ -66,12 +66,12 @@ module Packet_number = struct
     let first = List.hd packets in
     List.fold_left
       (fun acc pn ->
-        let cur_range = List.hd acc in
-        if Int64.compare (Int64.add cur_range.Frame.Range.last 1L) pn = 0
-        then { cur_range with last = pn } :: List.tl acc
-        else
-          (* start a new range, ther's a gap. *)
-          { Frame.Range.first = pn; last = pn } :: acc)
+         let cur_range = List.hd acc in
+         if Int64.compare (Int64.add cur_range.Frame.Range.last 1L) pn = 0
+         then { cur_range with last = pn } :: List.tl acc
+         else
+           (* start a new range, ther's a gap. *)
+           { Frame.Range.first = pn; last = pn } :: acc)
       [ { Frame.Range.first; last = first } ]
       (List.tl packets)
 
@@ -139,12 +139,12 @@ module Connection = struct
     }
 
   module Table = Hashtbl.MakeSeeded (struct
-    type t = CID.t
+      type t = CID.t
 
-    let equal = CID.equal
-    let hash i k = Hashtbl.seeded_hash i k
-    let[@warning "-32"] seeded_hash = hash
-  end)
+      let equal = CID.equal
+      let hash i k = Hashtbl.seeded_hash i k
+      let[@warning "-32"] seeded_hash = hash
+    end)
 
   let wakeup_writer t = t.wakeup_writer ()
 
@@ -242,10 +242,10 @@ module Connection = struct
       shutdown t)
 
   let process_reset_stream_frame
-      t
-      ~stream_id
-      ~final_size:_fsiz
-      application_error
+        t
+        ~stream_id
+        ~final_size:_fsiz
+        application_error
     =
     match Hashtbl.find_opt t.streams stream_id with
     | Some stream ->
@@ -305,8 +305,8 @@ module Connection = struct
     let current_cipher = Qtls.current_cipher new_tls_state in
 
     let rec process_packets
-        cur_encryption_level
-        (packets : Qtls.State.rec_resp list)
+              cur_encryption_level
+              (packets : Qtls.State.rec_resp list)
       =
       match packets with
       | `Change_enc enc :: `Change_dec dec :: xs
@@ -357,7 +357,9 @@ module Connection = struct
           Spaces.of_encryption_level t.crypto_streams cur_encryption_level
         in
         let _fragment =
-          Stream.Send.push (Cstruct.to_bigarray cs) crypto_stream.send
+          Stream.Send.push
+            (Bigstringaf.of_string ~off:0 ~len:(String.length cs) cs)
+            crypto_stream.send
         in
         (* Encryption_level.update_exn *)
         (* cur_encryption_level *)
@@ -388,7 +390,7 @@ module Connection = struct
     let { encryption_level; _ } = packet_info in
     match Stream.Recv.pop stream.recv with
     | Some { buffer; _ } ->
-      let fragment_cstruct = Cstruct.of_bigarray buffer in
+      let fragment_cstruct = Bigstringaf.to_string buffer in
       (match t.tls_state.handshake.machina with
       | Server Tls.State.AwaitClientHello | Server13 AwaitClientHelloHRR13 ->
         assert (encryption_level = Initial);
@@ -420,10 +422,9 @@ module Connection = struct
              fragment_cstruct
          with
         | Error e ->
-          let sexp = Tls.State.sexp_of_failure e in
           failwith
-            (Format.asprintf "Crypto failure: %a@." Sexplib.Sexp.pp_hum sexp)
-        | Ok (tls_state', tls_packets, (`Alert _ | `Eof | `No_err)) ->
+            (Format.asprintf "Crypto failure: %a@." Tls.State.pp_failure e)
+        | Ok (tls_state', tls_packets, (None | Some _)) ->
           (* TODO: send alerts as quic error *)
           (match Qtls.transport_params tls_state' with
           | Some quic_transport_params ->
@@ -443,10 +444,9 @@ module Connection = struct
         assert (encryption_level = Handshake);
         (match Qtls.handle_raw_record t.tls_state fragment_cstruct with
         | Error e ->
-          let sexp = Tls.State.sexp_of_failure e in
           failwith
-            (Format.asprintf "Crypto failure: %a@." Sexplib.Sexp.pp_hum sexp)
-        | Ok (tls_state', tls_packets, (`Alert _ | `Eof | `No_err)) ->
+            (Format.asprintf "Crypto failure: %a@." Tls.State.pp_failure e)
+        | Ok (tls_state', tls_packets, (None | Some _)) ->
           (* TODO: send alerts as quic error *)
           process_tls_result t ~new_tls_state:tls_state' ~tls_packets)
       | Server13 Established13 -> failwith "handle key updates here"
@@ -456,10 +456,9 @@ module Connection = struct
         assert (t.encdec.current = Initial);
         (match Qtls.handle_raw_record t.tls_state fragment_cstruct with
         | Error e ->
-          let sexp = Tls.State.sexp_of_failure e in
           failwith
-            (Format.asprintf "Crypto failure: %a@." Sexplib.Sexp.pp_hum sexp)
-        | Ok (tls_state', tls_packets, (`Alert _ | `Eof | `No_err)) ->
+            (Format.asprintf "Crypto failure: %a@." Tls.State.pp_failure e)
+        | Ok (tls_state', tls_packets, (None | Some _)) ->
           (* TODO: send alerts as quic error *)
           process_tls_result t ~new_tls_state:tls_state' ~tls_packets)
       | Client13
@@ -469,10 +468,9 @@ module Connection = struct
         assert (t.encdec.current = Handshake);
         (match Qtls.handle_raw_record t.tls_state fragment_cstruct with
         | Error e ->
-          let sexp = Tls.State.sexp_of_failure e in
           failwith
-            (Format.asprintf "Crypto failure: %a@." Sexplib.Sexp.pp_hum sexp)
-        | Ok (tls_state', tls_packets, (`Alert _ | `Eof | `No_err)) ->
+            (Format.asprintf "Crypto failure: %a@." Tls.State.pp_failure e)
+        | Ok (tls_state', tls_packets, (None | Some _)) ->
           (* TODO: send alerts as quic error *)
           process_tls_result t ~new_tls_state:tls_state' ~tls_packets)
       | Client _ | Client13 _ -> assert false
@@ -531,10 +529,10 @@ module Connection = struct
 
   (* TODO: closing/ draining states, section 10.2 *)
   let process_connection_close_quic_frame
-      (t : t)
-      ~frame_type
-      ~error_code
-      reason_phrase
+        (t : t)
+        ~frame_type
+        ~error_code
+        reason_phrase
     =
     Format.eprintf
       "close_quic: %d %s %d@."
@@ -671,13 +669,13 @@ module Connection = struct
       ~application_data:(Stream.create_crypto ())
 
   let create
-      ~mode
-      ~peer_address
-      ~tls_state
-      ~wakeup_writer
-      ~shutdown
-      ~connection_handler
-      connection_id
+        ~mode
+        ~peer_address
+        ~tls_state
+        ~wakeup_writer
+        ~shutdown
+        ~connection_handler
+        connection_id
     =
     let crypto_streams = initialize_crypto_streams () in
     let source_cid =
@@ -745,7 +743,12 @@ module Connection = struct
         (* Very first initial packet for the connection, push to the crypto
            stream. *)
         let _fragment =
-          Stream.Send.push (Cstruct.to_bigarray raw_record) crypto_stream.send
+          Stream.Send.push
+            (Bigstringaf.of_string
+               ~off:0
+               ~len:(String.length raw_record)
+               raw_record)
+            crypto_stream.send
         in
         ()
       | true ->
@@ -753,7 +756,12 @@ module Connection = struct
           t
           ~encryption_level:current_encryption_level
           [ Frame.Crypto
-              (let buffer = Cstruct.to_bigarray raw_record in
+              (let buffer =
+                 Bigstringaf.of_string
+                   ~off:0
+                   ~len:(String.length raw_record)
+                   raw_record
+               in
                { IOVec.off = 0; len = Bigstringaf.length buffer; buffer })
           ])
     | Client _ | Client13 _ -> assert false
@@ -814,8 +822,7 @@ module Connection = struct
               else Wrote_app_data)
             else inner acc (xs ())
           | Client, Server Unidirectional | Server, Client Unidirectional ->
-            (* Server can't send on unidirectional streams created by the
-               client *)
+            (* Server can't send on unidirectional streams created by the client *)
             inner acc (xs ()))
         | Nil -> acc
       in
@@ -882,26 +889,27 @@ let send_packets t ~packet_info =
    *   pass. *)
   Encryption_level.ordered_iter
     (fun encryption_level frames ->
-      match Encryption_level.mem encryption_level c.encdec with
-      | false ->
-        (* Don't attempt to send packets if we can't encrypt them yet. *)
-        ()
-      | true ->
-        let pn_space =
-          Spaces.of_encryption_level c.packet_number_spaces encryption_level
-        in
-        let frames =
-          if pn_space.ack_elicited
-          then Packet_number.compose_ack_frame pn_space :: frames
-          else frames
-        in
-        (* TODO: bundle e.g. a PING frame with a packet that only contains ACK
-           frames. *)
-        (match frames with
-        | [] ->
-          (* Don't send invalid (payload-less) frames *)
-          ()
-        | frames -> Connection.send_frames c ~encryption_level (List.rev frames)))
+       match Encryption_level.mem encryption_level c.encdec with
+       | false ->
+         (* Don't attempt to send packets if we can't encrypt them yet. *)
+         ()
+       | true ->
+         let pn_space =
+           Spaces.of_encryption_level c.packet_number_spaces encryption_level
+         in
+         let frames =
+           if pn_space.ack_elicited
+           then Packet_number.compose_ack_frame pn_space :: frames
+           else frames
+         in
+         (* TODO: bundle e.g. a PING frame with a packet that only contains ACK
+            frames. *)
+         (match frames with
+         | [] ->
+           (* Don't send invalid (payload-less) frames *)
+           ()
+         | frames ->
+           Connection.send_frames c ~encryption_level (List.rev frames)))
     outgoing_frames;
   wakeup_writer t
 
@@ -918,12 +926,12 @@ let on_close t (connection : Connection.t) =
     ()
 
 let create_new_connection
-    ?(src_cid = CID.generate ())
-    ~peer_address
-    ~tls_state
-    ~connection_handler
-    ~encdec
-    t
+      ?(src_cid = CID.generate ())
+      ~peer_address
+      ~tls_state
+      ~connection_handler
+      ~encdec
+      t
   =
   let connection =
     Connection.create
@@ -942,12 +950,12 @@ let create_new_connection
   connection
 
 let process_retry_packet
-    t
-    (c : Connection.t)
-    ~(header : Packet.Header.t)
-    ~token
-    ~pseudo
-    ~tag
+      t
+      (c : Connection.t)
+      ~(header : Packet.Header.t)
+      ~token
+      ~pseudo
+      ~tag
   =
   assert (t.mode = Client);
   match c.processed_retry_packet with
@@ -973,13 +981,8 @@ let process_retry_packet
         let connection_id = c.dest_cid in
         let retry_identity_tag =
           Crypto.Retry.calculate_integrity_tag connection_id pseudo
-          |> Cstruct.to_bigarray
         in
-        (match
-           Cstruct.equal
-             (Cstruct.of_bigarray retry_identity_tag)
-             (Cstruct.of_bigarray tag)
-         with
+        (match String.equal retry_identity_tag (Bigstringaf.to_string tag) with
         | false ->
           (* From RFC9000§17.2.5.2:
            *   Clients MUST discard Retry packets that have a Retry Integrity Tag
@@ -1155,7 +1158,7 @@ let create ~mode ~config connection_handler =
     packet_handler (Lazy.force t) ?error packet
   and decrypt t ~payload_length ~header bs ~off ~len =
     let t : t = Lazy.force t in
-    let cs = Cstruct.of_bigarray ~off ~len bs in
+    let cs = Bigstringaf.substring ~off ~len bs in
     let connection_id = Packet.Header.destination_cid header in
     if CID.is_empty connection_id
     then
@@ -1277,7 +1280,7 @@ let flush_pending_packets t =
          * frames. Send them. *)
         ignore
           (Connection.Streams.flush connection connection.streams
-            : Connection.flush_ret);
+           : Connection.flush_ret);
         Some (connection.writer, connection.peer_address, CID.to_string cid))
     | Nil -> None
   in
