@@ -150,11 +150,12 @@ module Encoding = struct
         Parse.variable_length_integer
     | 0x0b -> lift (fun max -> Max_ack_delay max) Parse.variable_length_integer
     | 0x0c ->
-      (* From RFC<QUIC-RFC>§18.2:
-       *   This parameter is a zero-length value. *)
-      if length = 0
-      then fail "zero-length param"
-      else return (Disable_active_migration true)
+      (match length with
+      | 0 ->
+        (* From RFC<QUIC-RFC>§18.2:
+         *   This parameter is a zero-length value. *)
+        return (Disable_active_migration true)
+      | _ -> fail "zero-length param")
     | 0x0d -> lift (fun addr -> Preferred_address addr) Preferred_address.parse
     | 0x0e ->
       lift
@@ -181,7 +182,7 @@ module Encoding = struct
       Parse.variable_length_integer >>= fun type_ ->
       Parse.variable_length_integer >>= fun length ->
       parse_transport_parameter type_ length
-      >>| (fun x -> Some x)
+      >>| Option.some
       <|> lift (fun () -> None) (advance length)
     in
     many p >>| List.filter_map (fun x -> x)
