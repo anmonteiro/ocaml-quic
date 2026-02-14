@@ -517,7 +517,7 @@ module Packet = struct
     available >>= fun avail ->
     Unsafe.peek avail (fun bs ~off ~len ->
       if is_protected bs ~off
-      then (
+      then
         if not (Bits.test first_byte 6)
         then
           (* From RFC9000§17.2:
@@ -543,12 +543,11 @@ module Packet = struct
             | Ok x -> x
             | Error e -> failwith e
           in
-          Format.eprintf "mutha %d@." payload_length;
           Decrypted
             { header
             ; payload_length
             ; decrypted = decrypt ~payload_length ~header bs ~off ~len
-            })
+            }
       else
         (* From RFC9001§5.3:
          *   All QUIC packets other than Version Negotiation and Retry

@@ -30,12 +30,11 @@
  *  POSSIBILITY OF SUCH DAMAGE.
  *---------------------------------------------------------------------------*)
 
-type t
+type t = private string
 
 val empty : t
 val length : t -> int
 val src_length : int
-val is_unset : t -> bool
 val is_empty : t -> bool
 val parse : t Angstrom.t
 val serialize : Faraday.t -> t -> unit

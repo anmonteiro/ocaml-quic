@@ -96,7 +96,7 @@ module Connection = struct
     ; mode : Crypto.Mode.t
     ; mutable tls_state : Qtls.t
     ; packet_number_spaces : Packet_number.t Spaces.t
-    ; mutable source_cid : CID.t
+    ; source_cid : CID.t
     ; mutable original_dest_cid : CID.t
     ; mutable dest_cid : CID.t
     ; (* From RFC9000§19.6:
@@ -426,18 +426,22 @@ module Connection = struct
             (Format.asprintf "Crypto failure: %a@." Tls.State.pp_failure e)
         | Ok (tls_state', tls_packets, (None | Some _)) ->
           (* TODO: send alerts as quic error *)
-          (match Qtls.transport_params tls_state' with
-          | Some quic_transport_params ->
-            (match
-               Transport_parameters.decode_and_validate
-                 ~perspective:Server
-                 quic_transport_params
-             with
-            | Ok transport_params ->
-              t.peer_transport_params <- transport_params;
-              process_tls_result t ~new_tls_state:tls_state' ~tls_packets
-            | Error e -> report_error t ~frame_type:Crypto e)
-          | None -> ()))
+          (match tls_packets with
+          | [] -> t.tls_state <- tls_state'
+          | tls_packets ->
+            (match Qtls.transport_params tls_state' with
+            | Some quic_transport_params ->
+              (match
+                 Transport_parameters.decode_and_validate
+                   ~perspective:Server
+                   quic_transport_params
+               with
+              | Ok transport_params ->
+                t.peer_transport_params <- transport_params;
+                process_tls_result t ~new_tls_state:tls_state' ~tls_packets
+                (* assert false *)
+              | Error e -> report_error t ~frame_type:Crypto e)
+            | None -> ())))
       | Server13
           ( AwaitClientCertificate13 _ | AwaitClientCertificateVerify13 _
           | AwaitClientFinished13 _ ) ->

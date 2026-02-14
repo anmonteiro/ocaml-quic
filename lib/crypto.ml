@@ -499,11 +499,11 @@ module AEAD = struct
       decode_packet_number ~largest_pn ~pn_nbits:(8 * pn_length) ~truncated_pn
     in
     let header, ciphertext =
-      ( Bytes.sub ciphertext 0 (off + pn_length) |> Bytes.to_string
+      ( Bytes.sub ciphertext 0 (off + pn_length) |> Bytes.unsafe_to_string
       , (* This cstruct can have coalesced packets. we just want to decrypt the
            ciphertext of `payload_length - packet_number_length`. *)
         Bytes.sub ciphertext (off + pn_length) (payload_length - pn_length)
-        |> Bytes.to_string )
+        |> Bytes.unsafe_to_string )
     in
 
     match decrypt_payload t ~packet_number:pn ~header ciphertext with

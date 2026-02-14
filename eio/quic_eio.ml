@@ -44,12 +44,46 @@ module Addr = struct
     | port :: xs ->
       `Udp (Eio.Net.Ipaddr.of_raw (String.concat "" xs), int_of_string port)
 
-  let serialize (`Udp (addr, port)) =
-    Format.asprintf "%d:%s" port (Obj.magic addr : string)
+  let serialize (dgram : Eio.Net.Sockaddr.datagram) =
+    match dgram with
+    | `Udp (addr, port) ->
+      Format.asprintf "%d:%s" port (Obj.magic addr : string)
+    | `Unix _ -> failwith "NYI"
 end
 
 module IO_loop = struct
   module Io = struct
+    let read_once dsock buffer =
+      let p, u = Promise.create () in
+      let addr_p, addr_u = Promise.create () in
+      Buffer.put
+        ~f:(fun buf ~off ~len k ->
+          let cstruct = Cstruct.of_bigarray buf ~off ~len in
+          match Eio.Net.recv dsock cstruct with
+          | addr, n ->
+            Promise.resolve addr_u addr;
+            k n
+          | exception exn ->
+            Promise.resolve u (`Exn exn);
+            raise exn)
+        buffer
+        (fun read -> Promise.resolve u (`Ok read));
+      match Promise.await p with
+      | `Ok n -> n, Promise.await addr_p
+      | `Exn exn ->
+        Format.eprintf "exn: %s@." (Printexc.to_string exn);
+        assert false
+
+    let read_datagram flow buffer =
+      match read_once flow buffer with
+      | r -> r
+      | exception
+          ( Unix.Unix_error (ENOTCONN, _, _)
+          | Eio.Io (Eio.Exn.X (Eio_unix.Unix_error (ENOTCONN, _, _)), _)
+          | Eio.Io (Eio.Net.E (Connection_reset _), _) ) ->
+        (* TODO(anmonteiro): logging? *)
+        raise End_of_file
+
     (* let close socket = *)
     (* match Lwt_unix.state socket with *)
     (* | Closed -> Lwt.return_unit *)
@@ -60,29 +94,29 @@ module IO_loop = struct
     (* Lwt_unix.close socket) *)
     (* (fun _exn -> Lwt.return_unit) *)
 
-    let read_inner dsock buffer =
-      let p, u = Promise.create () in
-      let addr_p, addr_u = Promise.create () in
-      Buffer.put
-        ~f:(fun buf ~off ~len k ->
-          match Eio.Net.recv dsock (Cstruct.of_bigarray buf ~off ~len) with
-          | addr, n ->
-            Promise.resolve addr_u addr;
-            k (`Ok n)
-          | exception
-              ( End_of_file
-              | Unix.Unix_error (ENOTCONN, _, _)
-              | Eio.Io (Eio.Net.E (Connection_reset _), _) ) ->
-            (* TODO(anmonteiro): logging? *)
-            k `Eof)
-        buffer
-        (Promise.resolve u);
-      match Promise.await p with
-      | `Eof -> `Eof
-      | `Ok n -> `Ok (n, Promise.await addr_p)
+    (* let read_inner dsock buffer = *)
+    (* let p, u = Promise.create () in *)
+    (* let addr_p, addr_u = Promise.create () in *)
+    (* Buffer.put *)
+    (* ~f:(fun buf ~off ~len k -> *)
+    (* match Eio.Net.recv dsock (Cstruct.of_bigarray buf ~off ~len) with *)
+    (* | addr, n -> *)
+    (* Promise.resolve addr_u addr; *)
+    (* k n *)
+    (* | exception *)
+    (* ( End_of_file *)
+    (* | Unix.Unix_error (ENOTCONN, _, _) *)
+    (* | Eio.Io (Eio.Net.E (Connection_reset _), _) ) -> *)
+    (* (* TODO(anmonteiro): logging? *) *)
+    (* k `Eof) *)
+    (* buffer *)
+    (* (Promise.resolve u); *)
+    (* match Promise.await p with *)
+    (* | `Eof -> `Eof *)
+    (* | `Ok n -> `Ok (n, Promise.await addr_p) *)
 
     let rec read flow buffer =
-      match read_inner flow buffer with
+      match read_datagram flow buffer with
       | r -> r
       | exception Unix.Unix_error (Unix.EAGAIN, _, _) ->
         Fiber.yield ();
@@ -96,48 +130,53 @@ module IO_loop = struct
       let _ =
         List.fold_left
           (fun pos { Faraday.buffer; off; len } ->
-            Cstruct.blit
-              (Cstruct.of_bigarray ~off ~len buffer)
-              off
-              cstruct
-              pos
-              len;
-            pos + len)
+             Cstruct.blit
+               (Cstruct.of_bigarray ~off ~len buffer)
+               off
+               cstruct
+               pos
+               len;
+             pos + len)
           0
           iovecs
       in
-      match Eio.Net.send dsock client_address cstruct with
+      match Eio.Net.send dsock ~dst:client_address [ cstruct ] with
       | () -> `Ok lenv
       | exception End_of_file -> `Closed
   end
 
   module Runtime = Quic.Transport
 
-  let start
-      :  sw:Eio.Switch.t -> read_buffer_size:int -> cancel:unit Promise.t
-      -> Runtime.t -> < Eio.Net.datagram_socket ; Eio.Flow.close > -> unit
+  let start :
+     sw:Eio.Switch.t
+    -> read_buffer_size:int
+    -> cancel:unit Promise.t
+    -> Runtime.t
+    -> _ (* < Eio.Net.datagram_socket ; Eio.Flow.close > *)
+    -> unit
     =
-   fun ~sw:_ ~read_buffer_size ~cancel t socket ->
+   fun ~sw:_ ~read_buffer_size ~cancel:_ t socket ->
     let read_buffer = Buffer.create read_buffer_size in
     let rec read_loop () =
       let rec read_loop_step () =
         match Runtime.next_read_operation t with
         | `Read ->
-          let read_result =
-            Fiber.first
-              (fun () -> Io.read socket read_buffer)
-              (fun () ->
-                Promise.await cancel;
-                `Eof)
-          in
-          let (_ : int) =
-            Buffer.get read_buffer ~f:(fun buf ~off ~len ->
-                match read_result with
-                | `Eof -> Runtime.read_eof t buf ~off ~len
-                | `Ok (_, addr) ->
-                  let client_address = Addr.serialize addr in
-                  Runtime.read ~client_address t buf ~off ~len)
-          in
+          (match Io.read socket read_buffer with
+          | _n, addr ->
+            let (_ : int) =
+              Buffer.get read_buffer ~f:(fun buf ~off ~len ->
+                let client_address = Addr.serialize addr in
+                Runtime.read ~client_address t buf ~off ~len)
+            in
+            ()
+          | exception End_of_file ->
+            let (_ : int) =
+              Buffer.get read_buffer ~f:(fun buf ~off ~len ->
+                Runtime.read_eof t buf ~off ~len)
+            in
+            ());
+          (* let read_result = Fiber.first (fun () -> Io.read socket
+             read_buffer) (fun () -> Promise.await cancel; `Eof) in *)
           read_loop_step ()
         | `Yield ->
           let p, u = Promise.create () in
@@ -214,15 +253,15 @@ module Client = struct
     let _shutdown_p, shutdown_u = Promise.create () in
     let cancel_reader, _resolve_cancel_reader = Promise.create () in
     Fiber.fork ~sw (fun () ->
-        Fun.protect ~finally:(Promise.resolve shutdown_u) (fun () ->
-            Switch.run (fun sw ->
-                Fiber.fork ~sw (fun () ->
-                    IO_loop.start
-                      ~sw
-                      ~cancel:cancel_reader
-                      ~read_buffer_size:0x1000
-                      connection
-                      fd))));
+      Fun.protect ~finally:(Promise.resolve shutdown_u) (fun () ->
+        Switch.run (fun sw ->
+          Fiber.fork ~sw (fun () ->
+            IO_loop.start
+              ~sw
+              ~cancel:cancel_reader
+              ~read_buffer_size:0x1000
+              connection
+              fd))));
     connection
 end
 

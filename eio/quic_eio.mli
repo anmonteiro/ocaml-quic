@@ -35,13 +35,14 @@ open Quic
 module Server : sig
   (* XXX: Alternative: ~conn_handler:(conn -> stream_handler) called for each
    * connection. *)
-  val establish_server
-    :  Eio.Stdenv.t
+  val establish_server :
+     Eio_unix.Stdenv.base
     -> sw:Eio.Switch.t
     -> config:Config.t
     -> Eio.Net.Sockaddr.datagram
-    -> (cid:(* Unix.sockaddr -> *)
-            string
+    -> (cid:
+          (* Unix.sockaddr -> *)
+          string
         -> start_stream:Transport.start_stream
         -> Transport.stream_handler)
     -> unit
@@ -52,19 +53,20 @@ type t
 module Client : sig
   (* XXX: Alternative: ~conn_handler:(conn -> stream_handler) called for each
    * connection. *)
-  val create
-    :  Eio.Stdenv.t
+  val create :
+     Eio_unix.Stdenv.base
     -> sw:Eio.Switch.t
     -> config:Config.t
-    -> (cid:(* Unix.sockaddr -> *)
-            string
+    -> (cid:
+          (* Unix.sockaddr -> *)
+          string
         -> start_stream:Transport.start_stream
         -> Transport.stream_handler)
     -> t
 end
 
-val connect
-  :  t
+val connect :
+   t
   -> address:Eio.Net.Sockaddr.datagram
   -> host:string
   -> (cid:string

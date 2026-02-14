@@ -36,7 +36,6 @@ let empty = Sys.opaque_identity ""
 let[@inline] length t = String.length t
 let src_length = 20
 let is_empty t = t == empty
-let is_unset t = t = empty
 
 let parse =
   let open Angstrom in
