@@ -30,7 +30,7 @@ let response_handler ~on_eof response response_body =
   read_response ()
 
 let () =
-  Mirage_crypto_rng_unix.initialize ();
+  Mirage_crypto_rng_unix.use_default ();
   Sys.(set_signal sigpipe Signal_ignore);
   let host = ref None in
   let port = ref 4433 in
@@ -50,60 +50,56 @@ let () =
   in
   let config = { Quic.Config.certificates; alpn_protocols = [ "h3" ] } in
   Eio_main.run (fun env ->
-      Eio.Switch.run (fun sw ->
-          let addrs =
-            let addrs =
-              Eio_unix.run_in_systhread (fun () ->
-                  Unix.getaddrinfo
-                    host
-                    (string_of_int !port)
-                    [ Unix.(AI_FAMILY PF_INET) ])
-            in
-            List.filter_map
-              (fun (addr : Unix.addr_info) ->
-                match addr.ai_addr with
-                | Unix.ADDR_UNIX _ -> None
-                | ADDR_INET (addr, port) -> Some (addr, port))
-              addrs
-          in
-          let address =
-            let inet, port = List.hd addrs in
-            `Udp (Eio_unix.Ipaddr.of_unix inet, port)
-          in
+    Eio.Switch.run (fun sw ->
+      let addrs =
+        let addrs =
+          Eio_unix.run_in_systhread (fun () ->
+            Unix.getaddrinfo
+              host
+              (string_of_int !port)
+              [ Unix.(AI_FAMILY PF_INET) ])
+        in
+        List.filter_map
+          (fun (addr : Unix.addr_info) ->
+             match addr.ai_addr with
+             | Unix.ADDR_UNIX _ -> None
+             | ADDR_INET (addr, port) -> Some (addr, port))
+          addrs
+      in
+      let address =
+        let inet, port = List.hd addrs in
+        `Udp (Eio_unix.Net.Ipaddr.of_unix inet, port)
+      in
 
-          let client_p, client_u = Eio.Promise.create () in
-          let t =
-            Quic_eio.Client.create
-              env
-              ~sw
-              ~config
-              (fun ~cid:_ ~start_stream:_ ->
-                ();
-                F (fun _stream -> assert false))
-          in
-          Quic_eio.connect t ~address ~host (fun ~cid ~start_stream ->
-              let conn, stream_handler =
-                H3.Client_connection.create ~error_handler ~cid ~start_stream
-              in
-              Promise.resolve client_u conn;
-              stream_handler);
-          let client = Eio.Promise.await client_p in
-          let request =
-            H3.Request.create
-              ~scheme:"https"
-              ~headers:Headers.(add_list empty [ ":authority", host ])
-              `GET
-              "/"
-          in
-          let _request_body =
-            H3.Client_connection.request
-              client
-              request
-              ~error_handler
-              ~response_handler:
-                (response_handler ~on_eof:(fun () ->
-                     Format.eprintf "eof@.";
-                     Quic_eio.shutdown t))
-          in
-          (* Body.Writer.close request_body *)
-          ()))
+      let client_p, client_u = Eio.Promise.create () in
+      let t =
+        Quic_eio.Client.create env ~sw ~config (fun ~cid:_ ~start_stream:_ ->
+          ();
+          F (fun _stream -> assert false))
+      in
+      Quic_eio.connect t ~address ~host (fun ~cid ~start_stream ->
+        let conn, stream_handler =
+          H3.Client_connection.create ~error_handler ~cid ~start_stream
+        in
+        Promise.resolve client_u conn;
+        stream_handler);
+      let client = Eio.Promise.await client_p in
+      let request =
+        H3.Request.create
+          ~scheme:"https"
+          ~headers:Headers.(add_list empty [ ":authority", host ])
+          `GET
+          "/"
+      in
+      let _request_body =
+        H3.Client_connection.request
+          client
+          request
+          ~error_handler
+          ~response_handler:
+            (response_handler ~on_eof:(fun () ->
+               Format.eprintf "eof@.";
+               Quic_eio.shutdown t))
+      in
+      (* Body.Writer.close request_body *)
+      ()))

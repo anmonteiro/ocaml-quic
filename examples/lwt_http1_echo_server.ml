@@ -1,18 +1,21 @@
 open Lwt.Infix
 
-let stream_handler stream ~start_stream:_ =
-  let rec on_read bs ~off ~len =
-    Format.eprintf "GOT DATA: %S@." (Bigstringaf.substring bs ~off ~len);
-    Quic.Stream.schedule_read stream ~on_read ~on_eof
-  and on_eof () =
-    Format.eprintf "Got EOF@.";
-    Quic.Stream.write_string stream "HTTP/0.9 200 OK\r\n";
-    Quic.Stream.close_writer stream
-  in
-  Quic.Stream.schedule_read stream ~on_read ~on_eof
+let stream_handler ~cid:_ ~start_stream:_ =
+  Quic.Transport.F
+    (fun stream ->
+      let rec on_read bs ~off ~len =
+        Format.eprintf "GOT DATA: %S@." (Bigstringaf.substring bs ~off ~len);
+        Quic.Stream.schedule_read stream ~on_read ~on_eof
+      and on_eof () =
+        Format.eprintf "Got EOF@.";
+        Quic.Stream.write_string stream "HTTP/0.9 200 OK\r\n";
+        Quic.Stream.close_writer stream
+      in
+      Quic.Stream.schedule_read stream ~on_read ~on_eof;
+      { Quic.Transport.on_error = ignore })
 
 let () =
-  Mirage_crypto_rng_unix.initialize ();
+  Mirage_crypto_rng_unix.use_default ();
   Sys.(set_signal sigpipe Signal_ignore);
   let port = ref 8080 in
   Arg.parse
@@ -27,10 +30,10 @@ let () =
   in
   let config = { Quic.Config.certificates; alpn_protocols = [ "http/0.9" ] } in
   Lwt.async (fun () ->
-      Quic_lwt.Server.establish_server ~config listen_address stream_handler
-      >>= fun () ->
-      Printf.printf "Listening on port %i and echoing POST requests.\n" !port;
-      flush stdout;
-      Lwt.return_unit);
+    Quic_lwt.Server.establish_server ~config listen_address stream_handler
+    >>= fun () ->
+    Printf.printf "Listening on port %i and echoing POST requests.\n" !port;
+    flush stdout;
+    Lwt.return_unit);
   let forever, _ = Lwt.wait () in
   Lwt_main.run forever

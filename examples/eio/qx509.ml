@@ -2,7 +2,7 @@ let read_file path =
   let ic = open_in_bin path in
   let contents = really_input_string ic (in_channel_length ic) in
   close_in ic;
-  Cstruct.of_string contents
+  contents
 
 let private_of_pems ~cert ~priv_key =
   let pem = read_file cert in

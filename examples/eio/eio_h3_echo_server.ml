@@ -14,15 +14,15 @@ let connection_handler clock =
       let response_body = Reqd.respond_with_streaming reqd response in
       Body.Writer.write_string response_body "hello, ";
       set_interval ~clock 1. ~f:(fun () ->
-          Body.Writer.write_string response_body "world.";
-          Body.Writer.flush response_body (fun () ->
-              Body.Writer.close response_body))
+        Body.Writer.write_string response_body "world.";
+        Body.Writer.flush response_body (fun () ->
+          Body.Writer.close response_body))
     | _ -> Reqd.respond_with_string reqd response "hello"
   in
   H3.Server_connection.create request_handler
 
 let () =
-  Mirage_crypto_rng_unix.initialize ();
+  Mirage_crypto_rng_unix.use_default ();
   Sys.(set_signal sigpipe Signal_ignore);
   let port = ref 4433 in
   Arg.parse
@@ -37,11 +37,11 @@ let () =
   in
   let config = { Quic.Config.certificates; alpn_protocols = [ "h3" ] } in
   Eio_main.run (fun env ->
-      Eio.Switch.run (fun sw ->
-          (* let forever, _ = Eio.Promise.create () in *)
-          Quic_eio.Server.establish_server
-            env
-            ~sw
-            ~config
-            listen_address
-            (connection_handler (Eio.Stdenv.clock env))))
+    Eio.Switch.run (fun sw ->
+      (* let forever, _ = Eio.Promise.create () in *)
+      Quic_eio.Server.establish_server
+        env
+        ~sw
+        ~config
+        listen_address
+        (connection_handler (Eio.Stdenv.clock env))))
