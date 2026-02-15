@@ -99,3 +99,117 @@ let drain_acknowledged t ~encryption_level =
     let qseq = Queue.to_seq info.acked in
     Queue.clear info.acked;
     List.of_seq qseq
+
+module Constants = struct
+  (* RFC 9002 Appendix A.2 / B.1 recommended constants *)
+  let k_packet_threshold = 3L
+  let k_time_threshold_num = 9L
+  let k_time_threshold_den = 8L
+  let k_granularity_ms = 1L
+  let k_initial_rtt_ms = 333L
+  let k_persistent_congestion_threshold = 3L
+  let default_max_datagram_size = 1200
+
+  let initial_window ~max_datagram_size =
+    min (10 * max_datagram_size) (max (2 * max_datagram_size) 14720)
+
+  let minimum_window ~max_datagram_size = 2 * max_datagram_size
+end
+
+module Debug = struct
+  type rtt =
+    { latest_rtt_ms : int64 option
+    ; min_rtt_ms : int64 option
+    ; smoothed_rtt_ms : int64
+    ; rttvar_ms : int64
+    ; max_ack_delay_ms : int64
+    }
+
+  type timer =
+    { loss_detection_timer_ms : int64 option
+    ; pto_count : int
+    ; time_of_last_ack_eliciting_packet_ms : int64 option
+    }
+
+  type congestion =
+    { bytes_in_flight : int
+    ; congestion_window : int
+    ; ssthresh : int
+    ; recovery_start_time_ms : int64 option
+    }
+
+  type ecn =
+    { validated : bool
+    ; ect0 : int
+    ; ect1 : int
+    ; ce : int
+    }
+
+  type snapshot =
+    { rtt : rtt
+    ; timer : timer
+    ; congestion : congestion
+    ; ecn : ecn
+    }
+
+  let initial_snapshot =
+    { rtt =
+        { latest_rtt_ms = None
+        ; min_rtt_ms = None
+        ; smoothed_rtt_ms = Constants.k_initial_rtt_ms
+        ; rttvar_ms = Int64.div Constants.k_initial_rtt_ms 2L
+        ; max_ack_delay_ms = 25L
+        }
+    ; timer =
+        { loss_detection_timer_ms = None
+        ; pto_count = 0
+        ; time_of_last_ack_eliciting_packet_ms = None
+        }
+    ; congestion =
+        { bytes_in_flight = 0
+        ; congestion_window =
+            Constants.initial_window
+              ~max_datagram_size:Constants.default_max_datagram_size
+        ; ssthresh = max_int
+        ; recovery_start_time_ms = None
+        }
+    ; ecn = { validated = false; ect0 = 0; ect1 = 0; ce = 0 }
+    }
+
+  let snapshot (_t : t) = initial_snapshot
+
+  let record_packet_sent
+        t
+        ~encryption_level
+        ~packet_number
+        ~bytes_sent:_
+        ~time_sent_ms:_
+        frames
+    =
+    on_packet_sent t ~encryption_level ~packet_number frames
+
+  let record_ack_received
+        t
+        ~encryption_level
+        ~ranges
+        ~ack_delay_ms:_
+        ~now_ms:_
+    =
+    on_ack_received t ~encryption_level ~ranges
+
+  let on_loss_detection_timeout (_t : t) ~now_ms:_ = ()
+
+  let process_ecn
+        (_t : t)
+        ~newly_acked:_
+        ~ect0_count:_
+        ~ect1_count:_
+        ~ce_count:_
+    =
+    ()
+
+  let discard_space t ~encryption_level =
+    let info = Spaces.of_encryption_level t encryption_level in
+    info.sent <- Q.empty;
+    Queue.clear info.acked
+end
