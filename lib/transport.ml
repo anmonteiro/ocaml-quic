@@ -123,12 +123,22 @@ module Connection = struct
     }
 
   let invoke_handler t ~cid ~start_stream stream =
+    let stream_handler =
+      match t.handler with
+      | Uninitialized f ->
+        let (F stream_handler as handler_f) = f ~cid ~start_stream in
+        t.handler <- Initialized handler_f;
+        stream_handler
+      | Initialized (F stream_handler) -> stream_handler
+    in
+    stream_handler stream
+
+  let initialize_handler t ~cid ~start_stream =
     match t.handler with
     | Uninitialized f ->
-      let (F stream_handler as handler_f) = f ~cid ~start_stream in
-      t.handler <- Initialized handler_f;
-      stream_handler stream
-    | Initialized (F stream_handler) -> stream_handler stream
+      let (F _ as handler_f : stream_handler) = f ~cid ~start_stream in
+      t.handler <- Initialized handler_f
+    | Initialized _ -> ()
 
   type packet_info =
     { packet_number : int64
@@ -302,8 +312,6 @@ module Connection = struct
     | None -> ()
 
   let process_tls_result t ~new_tls_state ~tls_packets =
-    let current_cipher = Qtls.current_cipher new_tls_state in
-
     let rec process_packets
               cur_encryption_level
               (packets : Qtls.State.rec_resp list)
@@ -311,6 +319,7 @@ module Connection = struct
       match packets with
       | `Change_enc enc :: `Change_dec dec :: xs
       | `Change_dec dec :: `Change_enc enc :: xs ->
+        let current_cipher = Qtls.current_cipher new_tls_state in
         let next = Encryption_level.next cur_encryption_level in
         t.encdec.current <- next;
         Encryption_level.add
@@ -326,6 +335,7 @@ module Connection = struct
           t.encdec;
         process_packets next xs
       | `Change_enc enc :: xs ->
+        let current_cipher = Qtls.current_cipher new_tls_state in
         let next = Encryption_level.next cur_encryption_level in
         t.encdec.current <- next;
         Encryption_level.add
@@ -337,6 +347,7 @@ module Connection = struct
           t.encdec;
         process_packets next xs
       | `Change_dec dec :: xs ->
+        let current_cipher = Qtls.current_cipher new_tls_state in
         Encryption_level.update_current
           (function
             | None -> assert false
@@ -466,8 +477,10 @@ module Connection = struct
           (* TODO: send alerts as quic error *)
           process_tls_result t ~new_tls_state:tls_state' ~tls_packets)
       | Client13
-          ( AwaitServerEncryptedExtensions13 _ (* | AwaitServerFinished13 _ *)
-          | AwaitServerCertificateRequestOrCertificate13 _ ) ->
+          ( AwaitServerEncryptedExtensions13 _
+          | AwaitServerCertificateRequestOrCertificate13 _
+          | AwaitServerCertificate13 _ | AwaitServerCertificateVerify13 _
+          | AwaitServerFinished13 _ ) ->
         assert (encryption_level = Handshake);
         assert (t.encdec.current = Handshake);
         (match Qtls.handle_raw_record t.tls_state fragment_cstruct with
@@ -476,6 +489,15 @@ module Connection = struct
             (Format.asprintf "Crypto failure: %a@." Tls.State.pp_failure e)
         | Ok (tls_state', tls_packets, (None | Some _)) ->
           (* TODO: send alerts as quic error *)
+          process_tls_result t ~new_tls_state:tls_state' ~tls_packets)
+      | Client13 (AwaitServerHello13 _) ->
+        assert (encryption_level = Initial);
+        assert (t.encdec.current = Initial);
+        (match Qtls.handle_raw_record t.tls_state fragment_cstruct with
+        | Error e ->
+          failwith
+            (Format.asprintf "Crypto failure: %a@." Tls.State.pp_failure e)
+        | Ok (tls_state', tls_packets, (None | Some _)) ->
           process_tls_result t ~new_tls_state:tls_state' ~tls_packets)
       | Client _ | Client13 _ -> assert false
       | Server _ | Server13 _ -> assert false);
@@ -630,7 +652,9 @@ module Connection = struct
       Format.eprintf
         "new conn? %s@."
         (let (`Hex x) = Hex.of_string (CID.to_string cid) in
-         x)
+         x);
+      (* Track the latest peer-provided CID for outgoing packets. *)
+      t.dest_cid <- cid
     | Retire_connection_id _ ->
       failwith
         (Format.asprintf
@@ -682,14 +706,8 @@ module Connection = struct
         connection_id
     =
     let crypto_streams = initialize_crypto_streams () in
-    let source_cid =
-      (* let id = *)
-      (* (* needs to match CID.src_length. *) *)
-      (* Hex.to_string (`Hex "c3eaeabd54582a4ee2cb75bff63b8f0a874a51ad") *)
-      (* in *)
-      assert (String.length (CID.to_string connection_id) = CID.src_length);
-      connection_id
-    in
+    if CID.length connection_id > CID.max_length
+    then failwith "invalid source cid";
     let rec t =
       { encdec = Encryption_level.create ~current:Initial
       ; mode
@@ -700,7 +718,7 @@ module Connection = struct
             ~application_data:(Packet_number.create ())
       ; crypto_streams
       ; tls_state
-      ; source_cid
+      ; source_cid = connection_id
       ; original_dest_cid = CID.empty
       ; dest_cid = CID.empty
       ; peer_address
@@ -790,7 +808,9 @@ module Connection = struct
           | _, Stream.Type.Server Bidirectional
           | _, Client Bidirectional ->
             let _flushed = Stream.Send.flush stream.Stream.send in
-            if Stream.Send.has_pending_output stream.send
+            if
+              Stream.Send.has_pending_output stream.send
+              && Encryption_level.mem encryption_level t.encdec
             then (
               let packet_number =
                 Packet_number.send_next
@@ -882,6 +902,23 @@ let shutdown t =
   (* shutdown_writer t *)
   t.closed <- true
 
+let register_connection_id t ~cid ~(connection : Connection.t) =
+  match Connection.Table.find_opt t.connections cid with
+  | None -> Connection.Table.add t.connections cid connection
+  | Some existing ->
+    if existing == connection
+    then ()
+    else failwith "connection id collision"
+
+let deregister_connection_ids t ~(connection : Connection.t) =
+  let ids =
+    Connection.Table.fold
+      (fun cid candidate acc -> if candidate == connection then cid :: acc else acc)
+      t.connections
+      []
+  in
+  List.iter (fun cid -> Connection.Table.remove t.connections cid) ids
+
 let is_closed t = t.closed
 
 let send_packets t ~packet_info =
@@ -923,20 +960,26 @@ let create_outgoing_frames ~current =
   r
 
 let on_close t (connection : Connection.t) =
-  match Connection.Table.find_opt t.connections connection.source_cid with
-  | None -> ()
-  | Some _ ->
-    Connection.Table.remove t.connections connection.source_cid;
-    ()
+  deregister_connection_ids t ~connection
 
 let create_new_connection
-      ?(src_cid = CID.generate ())
+      ?src_cid
       ~peer_address
       ~tls_state
       ~connection_handler
       ~encdec
       t
   =
+  let src_cid =
+    match src_cid with
+    | Some src_cid -> src_cid
+    | None ->
+      let rec generate_unique_cid () =
+        let cid = CID.generate () in
+        if Connection.Table.mem t.connections cid then generate_unique_cid () else cid
+      in
+      generate_unique_cid ()
+  in
   let connection =
     Connection.create
       ~mode:t.mode
@@ -948,9 +991,7 @@ let create_new_connection
       src_cid
   in
   Encryption_level.add Initial encdec connection.encdec;
-
-  assert (not (Connection.Table.mem t.connections src_cid));
-  Connection.Table.add t.connections connection.source_cid connection;
+  register_connection_id t ~cid:connection.source_cid ~connection;
   connection
 
 let process_retry_packet
@@ -1052,12 +1093,17 @@ let packet_handler t ?error packet =
         }
       in
       let tls_state = Qtls.server ~certificates ~alpn_protocols in
-      create_new_connection
-        t
-        ~peer_address:(Option.get t.current_peer_address)
-        ~tls_state
-        ~connection_handler:t.connection_handler
-        ~encdec
+      let connection =
+        create_new_connection
+          t
+          ~peer_address:(Option.get t.current_peer_address)
+          ~tls_state
+          ~connection_handler:t.connection_handler
+          ~encdec
+      in
+      (* Keep routing the client's original DCID until it switches to our SCID. *)
+      register_connection_id t ~cid:connection_id ~connection;
+      connection
   in
 
   match error with
@@ -1090,6 +1136,11 @@ let packet_handler t ?error packet =
       (* c.packet_number_spaces.application_data.received <- *)
       (* Int64.max c.packet_number_spaces.application_data.received
          packet_number); *)
+      let pn_space =
+        Spaces.of_encryption_level c.packet_number_spaces encryption_level
+      in
+      pn_space.received <- Int64.max pn_space.received packet_number;
+
       (match Packet.source_cid packet with
       | Some src_cid ->
         (* From RFC9000§19.6:
@@ -1172,16 +1223,20 @@ let create ~mode ~config connection_handler =
       let decrypter, largest_pn =
         match Connection.Table.find_opt t.connections connection_id with
         | Some connection ->
+          let encryption_level = Encryption_level.of_header header in
+          let pn_space =
+            Spaces.of_encryption_level
+              connection.packet_number_spaces
+              encryption_level
+          in
           ( Option.get
-              (Encryption_level.find_exn
-                 (Encryption_level.of_header header)
-                 connection.encdec)
+              (Encryption_level.find_exn encryption_level connection.encdec)
                 .decrypter
-          , connection.packet_number_spaces.initial.received )
+          , pn_space.received )
         | None ->
           assert (Encryption_level.of_header header = Initial);
           ( Crypto.InitialAEAD.make ~mode:(Crypto.Mode.peer t.mode) connection_id
-          , 0L )
+          , -1L )
       in
       Crypto.AEAD.decrypt_packet decrypter ~payload_length ~largest_pn cs
   and t =
@@ -1262,9 +1317,14 @@ let connect t ~address ~host connection_handler =
       ~encdec
   in
   new_connection.dest_cid <- dest_cid;
+  Connection.initialize_handler
+    new_connection
+    ~cid:(CID.to_string new_connection.source_cid)
+    ~start_stream:new_connection.start_stream;
   Connection.establish_connection new_connection
 
-let report_exn _t _exn = ()
+let report_exn _t exn =
+  Format.eprintf "transport exception: %s@." (Printexc.to_string exn)
 
 let flush_pending_packets t =
   let rec inner t = function

@@ -34,7 +34,8 @@ type t = string
 
 let empty = Sys.opaque_identity ""
 let[@inline] length t = String.length t
-let src_length = 20
+let max_length = 20
+let src_length = max_length
 let is_empty t = t == empty
 
 let parse =
@@ -58,4 +59,4 @@ let equal = String.equal
 
 let generate () =
   let random_bytes n = Mirage_crypto_rng.generate n in
-  random_bytes 20
+  random_bytes src_length

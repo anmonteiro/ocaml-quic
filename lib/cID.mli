@@ -34,6 +34,7 @@ type t = private string
 
 val empty : t
 val length : t -> int
+val max_length : int
 val src_length : int
 val is_empty : t -> bool
 val parse : t Angstrom.t
