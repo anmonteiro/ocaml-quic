@@ -81,12 +81,39 @@ let second_protected_packet =
 let read_string t s =
   let len = String.length s in
   let bs = Bigstringaf.of_string ~off:0 ~len s in
-  Transport.read_with_more t bs ~off:0 ~len Incomplete
+  Transport.read t ~client_address:"test-client-address" bs ~off:0 ~len
+
+let read_file path =
+  let ic = open_in_bin path in
+  Fun.protect
+    ~finally:(fun () -> close_in_noerr ic)
+    (fun () ->
+       let n = in_channel_length ic in
+       really_input_string ic n)
+
+let server_certificates () =
+  let cert = "./certificates/server.pem" in
+  let priv_key = "./certificates/server.key" in
+  let certchain =
+    let pem = read_file cert in
+    match X509.Certificate.decode_pem_multiple pem with
+    | Ok certchain -> certchain
+    | Error (`Msg m) -> failwith m
+  in
+  let priv_key =
+    let pem = read_file priv_key in
+    match X509.Private_key.decode_pem pem with
+    | Ok x -> x
+    | Error (`Msg m) -> failwith m
+  in
+  `Single (certchain, priv_key)
 
 let test_initial () =
   let t =
     let config =
-      { Quic.Config.certificates = `None; alpn_protocols = [ "h3" ] }
+      { Quic.Config.certificates = server_certificates ()
+      ; alpn_protocols = [ "h3" ]
+      }
     in
     Transport.Server.create ~config (fun ~cid:_ ~start_stream:_ -> assert false)
   in
@@ -96,9 +123,22 @@ let test_initial () =
     (String.length protected_packet)
     read;
   match Transport.next_write_operation t with
-  | `Write (iovecs, _) ->
+  | `Writev (iovecs, _, _) ->
     let packet_hex = Write_operation.iovecs_to_string iovecs in
     Format.eprintf "serialized: %a@." Hex.pp (Hex.of_string packet_hex);
+    let header, payload_length =
+      match
+        Angstrom.parse_string
+          ~consume:Prefix
+          Quic.Parse.Packet.protected_header
+          packet_hex
+      with
+      | Ok x -> x
+      | Error e -> Alcotest.failf "failed to parse protected header: %s" e
+    in
+    (match header with
+    | Quic.Packet.Header.Initial _ -> ()
+    | _ -> Alcotest.fail "expected first server response packet to be Initial");
     let client_decrypter =
       Crypto.InitialAEAD.make ~mode:Server (CID.of_string expected_dest_cid)
     in
@@ -107,7 +147,7 @@ let test_initial () =
         client_decrypter
         ~largest_pn:0L
         packet_hex
-        ~payload_length:(String.length packet_hex - 16)
+        ~payload_length
     in
     Alcotest.(check bool)
       "decrypts successfully using initial secrets"
