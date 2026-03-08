@@ -287,19 +287,23 @@ module Packet = struct
   module Header = struct
     module Long = struct
       let parse =
-        lift3
-          (fun version dst_cid src_cid ->
-             (* From RFC9000§17.2:
-             *   In QUIC version 1, this value MUST NOT exceed 20. Endpoints that
-             *   receive a version 1 long header with a value larger than 20 MUST
-             *   drop the packet.  Servers SHOULD be able to read longer connection
-             *   IDs from other QUIC versions in order to properly form a version
-             *   negotiation packet. *)
-             (* TODO: "drop" the packet. *)
-             Packet.Version.parse version, src_cid, dst_cid)
-          BE.any_int32
-          CID.parse
-          CID.parse
+        BE.any_int32 >>= fun version ->
+        CID.parse >>= fun dst_cid ->
+        CID.parse >>= fun src_cid ->
+        (* From RFC9000§17.2:
+         *   In QUIC version 1, this value MUST NOT exceed 20. Endpoints that
+         *   receive a version 1 long header with a value larger than 20 MUST
+         *   drop the packet.  Servers SHOULD be able to read longer connection
+         *   IDs from other QUIC versions in order to properly form a version
+         *   negotiation packet. *)
+        let version = Packet.Version.parse version in
+        (match version with
+        | Packet.Version.Negotiation -> return ()
+        | Packet.Version.Number _ ->
+          if CID.length dst_cid > CID.max_length || CID.length src_cid > CID.max_length
+          then fail "invalid connection id length"
+          else return ())
+        >>= fun () -> return (version, src_cid, dst_cid)
     end
 
     module Short = struct
