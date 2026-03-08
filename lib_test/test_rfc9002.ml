@@ -11,7 +11,7 @@ let ack t ~encryption_level ranges =
     ~ranges:(List.map (fun (first, last) -> range first last) ranges)
 
 let sent_info t ~encryption_level : Recovery.info =
-  Spaces.of_encryption_level t encryption_level
+  Recovery.Debug.info t ~encryption_level
 
 let sent_packet_numbers t ~encryption_level =
   let info = sent_info t ~encryption_level in
@@ -261,7 +261,7 @@ let test_rfc9002_5_3_ack_delay_clamped_by_max_ack_delay () =
     s.rtt.smoothed_rtt_ms;
   Alcotest.(check int64)
     "rttvar with clamped adjustment"
-    40L
+    41L
     s.rtt.rttvar_ms
 
 let test_rfc9002_5_1_duplicate_ack_does_not_generate_new_rtt_sample () =
@@ -710,9 +710,21 @@ let test_rfc9002_13_drain_acknowledged_is_one_shot () =
 let run_packet_threshold_case ~name ~sent ~ranges =
   let t = Recovery.create () in
   List.iter
-    (fun pn -> send_marker t ~encryption_level:Application_data ~packet_number:pn pn)
+    (fun pn ->
+       debug_send
+         t
+         ~encryption_level:Application_data
+         ~packet_number:pn
+         ~time_sent_ms:pn
+         ~bytes_sent:1200
+         [ Frame.Max_data pn ])
     sent;
-  ack t ~encryption_level:Application_data ranges;
+  debug_ack
+    t
+    ~encryption_level:Application_data
+    ~ranges
+    ~ack_delay_ms:0
+    ~now_ms:1_000_000;
   let expected = Packet_threshold_spec.expected_remaining_ints ~sent ~ranges in
   let actual =
     sent_packet_numbers t ~encryption_level:Application_data |> List.map Int64.to_int

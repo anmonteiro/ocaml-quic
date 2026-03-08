@@ -120,6 +120,7 @@ module Connection = struct
     ; (* TODO: should be retry or initial? *)
       mutable processed_retry_packet : bool
     ; mutable token_value : string
+    ; mutable recovery_now_ms : int64
     }
 
   let invoke_handler t ~cid ~start_stream stream =
@@ -158,8 +159,29 @@ module Connection = struct
 
   let wakeup_writer t = t.wakeup_writer ()
 
-  let on_packet_sent t ~encryption_level ~packet_number frames =
-    Recovery.on_packet_sent t.recovery ~encryption_level ~packet_number frames
+  let next_recovery_time_ms t =
+    let now = t.recovery_now_ms in
+    t.recovery_now_ms <- Int64.add now 1L;
+    now
+
+  let packet_is_in_flight frames =
+    Frame.is_any_ack_eliciting frames
+    || List.exists (function Frame.Padding _ -> true | _ -> false) frames
+
+  let estimated_bytes_sent frames =
+    if packet_is_in_flight frames
+    then Recovery.Constants.default_max_datagram_size
+    else 0
+
+  let on_packet_sent t ~encryption_level ~packet_number ~bytes_sent frames =
+    let time_sent_ms = next_recovery_time_ms t in
+    Recovery.Debug.record_packet_sent
+      t.recovery
+      ~encryption_level
+      ~packet_number
+      ~bytes_sent
+      ~time_sent_ms
+      frames
 
   type flush_ret =
     | Didnt_write
@@ -169,24 +191,29 @@ module Connection = struct
   (* Flushes packets into one datagram *)
   let _flush_pending_packets t =
     let rec inner t acc =
-      match Queue.take_opt t.queued_packets with
+      match Queue.peek_opt t.queued_packets with
       | Some
           ( ({ Writer.encryption_level; packet_number; _ } as header_info)
           , frames ) ->
-        Format.eprintf
-          "Sending %d frames at encryption level: %a %Ld@."
-          (List.length frames)
-          Encryption_level.pp_hum
-          encryption_level
-          packet_number;
-        Writer.write_frames_packet t.writer ~header_info frames;
-        on_packet_sent t ~encryption_level ~packet_number frames;
-        let can_be_followed_by_other_packets =
-          encryption_level <> Application_data
-        in
-        if can_be_followed_by_other_packets
-        then inner t Wrote
-        else Wrote_app_data
+        let bytes_sent = estimated_bytes_sent frames in
+        if bytes_sent > 0 && not (Recovery.can_send t.recovery ~bytes:bytes_sent)
+        then acc
+        else (
+          ignore (Queue.take t.queued_packets : Writer.header_info * Frame.t list);
+          Format.eprintf
+            "Sending %d frames at encryption level: %a %Ld@."
+            (List.length frames)
+            Encryption_level.pp_hum
+            encryption_level
+            packet_number;
+          Writer.write_frames_packet t.writer ~header_info frames;
+          on_packet_sent t ~encryption_level ~packet_number ~bytes_sent frames;
+          let can_be_followed_by_other_packets =
+            encryption_level <> Application_data
+          in
+          if can_be_followed_by_other_packets
+          then inner t Wrote
+          else Wrote_app_data)
       | None -> acc
     in
     inner t Didnt_write
@@ -225,9 +252,14 @@ module Connection = struct
     in
     Queue.add (header_info, frames) t.queued_packets
 
-  let process_ack_frame t ~packet_info ~ranges =
+  let process_ack_frame t ~packet_info ~delay ~ranges =
     let { header; encryption_level; _ } = packet_info in
-    Recovery.on_ack_received t.recovery ~encryption_level ~ranges;
+    Recovery.Debug.record_ack_received
+      t.recovery
+      ~encryption_level
+      ~ranges
+      ~ack_delay_ms:(Int64.of_int delay)
+      ~now_ms:(next_recovery_time_ms t);
     Format.eprintf
       "got ack %a %Ld %Ld %d@."
       Encryption_level.pp_hum
@@ -623,7 +655,8 @@ module Connection = struct
        *   The receiver of a PING frame simply needs to acknowledge the packet
        *   containing this frame. *)
       ()
-    | Ack { ranges; _ } -> process_ack_frame t ~packet_info ~ranges
+    | Ack { delay; ranges; _ } ->
+      process_ack_frame t ~packet_info ~delay ~ranges
     | Reset_stream { stream_id; application_protocol_error; final_size } ->
       process_reset_stream_frame
         t
@@ -747,6 +780,7 @@ module Connection = struct
       ; did_send_connection_close = false
       ; processed_retry_packet = false
       ; token_value = ""
+      ; recovery_now_ms = 0L
       }
     in
     t
@@ -812,38 +846,47 @@ module Connection = struct
               Stream.Send.has_pending_output stream.send
               && Encryption_level.mem encryption_level t.encdec
             then (
-              let packet_number =
-                Packet_number.send_next
-                  (Spaces.of_encryption_level
-                     t.packet_number_spaces
-                     encryption_level)
-              in
-              let { Crypto.encrypter; _ } =
-                Encryption_level.find_exn encryption_level t.encdec
-              in
-              let header_info =
-                Writer.make_header_info
-                  ~encrypter
-                  ~packet_number
+              let bytes_sent = Recovery.Constants.default_max_datagram_size in
+              if not (Recovery.can_send t.recovery ~bytes:bytes_sent)
+              then acc
+              else
+                let packet_number =
+                  Packet_number.send_next
+                    (Spaces.of_encryption_level
+                       t.packet_number_spaces
+                       encryption_level)
+                in
+                let { Crypto.encrypter; _ } =
+                  Encryption_level.find_exn encryption_level t.encdec
+                in
+                let header_info =
+                  Writer.make_header_info
+                    ~encrypter
+                    ~packet_number
+                    ~encryption_level
+                    ~source_cid:t.source_cid
+                    ~token:t.token_value
+                    t.dest_cid
+                in
+                let fragment, is_fin = Stream.Send.pop_exn stream.send in
+                let frames =
+                  match stream_type with
+                  | `Data -> [ Frame.Stream { id = stream.id; fragment; is_fin } ]
+                  | `Crypto -> [ Frame.Crypto fragment ]
+                in
+                Writer.write_frames_packet t.writer ~header_info frames;
+                on_packet_sent
+                  t
                   ~encryption_level
-                  ~source_cid:t.source_cid
-                  ~token:t.token_value
-                  t.dest_cid
-              in
-              let fragment, is_fin = Stream.Send.pop_exn stream.send in
-              let frames =
-                match stream_type with
-                | `Data -> [ Frame.Stream { id = stream.id; fragment; is_fin } ]
-                | `Crypto -> [ Frame.Crypto fragment ]
-              in
-              Writer.write_frames_packet t.writer ~header_info frames;
-              on_packet_sent t ~encryption_level ~packet_number frames;
-              let can_be_followed_by_other_packets =
-                encryption_level <> Application_data
-              in
-              if can_be_followed_by_other_packets
-              then inner Wrote (xs ())
-              else Wrote_app_data)
+                  ~packet_number
+                  ~bytes_sent
+                  frames;
+                let can_be_followed_by_other_packets =
+                  encryption_level <> Application_data
+                in
+                if can_be_followed_by_other_packets
+                then inner Wrote (xs ())
+                else Wrote_app_data)
             else inner acc (xs ())
           | Client, Server Unidirectional | Server, Client Unidirectional ->
             (* Server can't send on unidirectional streams created by the client *)

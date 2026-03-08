@@ -47,8 +47,8 @@ module Buffer : sig
   val create : int -> t
   val get : t -> f:(Bigstringaf.t -> off:int -> len:int -> int) -> int
 
-  val put
-    :  t
+  val put :
+     t
     -> f:
          (Bigstringaf.t
           -> off:int
