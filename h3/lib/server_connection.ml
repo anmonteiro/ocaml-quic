@@ -154,12 +154,15 @@ let process_settings_frame t stream _settings_list =
 
 let process_goaway_frame _t _id = failwith "NYI: goaway"
 
-(* TODO: need to schedule read again. *)
-let read _t _stream ~reader bs ~off ~len:_ =
+let rec read t stream ~reader bs ~off ~len:_ =
   assert (off = 0);
-  Reader.read_with_more reader bs Incomplete
+  Reader.read_with_more reader bs Incomplete;
+  Stream.schedule_read
+    stream.stream
+    ~on_eof:(read_eof t stream ~reader)
+    ~on_read:(read t stream ~reader)
 
-let read_eof _t _stream ~reader () =
+and read_eof _t _stream ~reader () =
   Reader.read_with_more reader Bigstringaf.empty Complete
 
 (* From RFC9114§8.1:
