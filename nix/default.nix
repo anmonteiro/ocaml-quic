@@ -91,7 +91,7 @@ rec {
       # hacl_x25519
       # fiat-p256
       logs
-      hkdf
+      kdf
       ke
       ipaddr-sexp
       eio
