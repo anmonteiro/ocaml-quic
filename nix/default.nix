@@ -56,6 +56,7 @@ rec {
       fs.toSource {
         root = ./..;
         fileset = fs.unions [
+          ../certificates
           ../dune-project
           ../lib
           ../lib_test
