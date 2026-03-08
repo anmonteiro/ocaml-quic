@@ -40,7 +40,7 @@ module Server : sig
     -> Unix.sockaddr
     -> (cid:(* Unix.sockaddr -> *)
             string
-        -> start_stream:Server_connection.start_stream
-        -> Server_connection.stream_handler)
+        -> start_stream:Transport.start_stream
+        -> Transport.stream_handler)
     -> unit Lwt.t
 end

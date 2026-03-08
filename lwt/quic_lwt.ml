@@ -153,7 +153,7 @@ module IO_loop = struct
     let shutdown_receive socket = shutdown socket Unix.SHUTDOWN_RECEIVE
   end
 
-  module Runtime = Quic.Server_connection
+  module Runtime = Quic.Transport
 
   let start t ~read_buffer_size socket =
     let read_buffer = Buffer.create read_buffer_size in
@@ -231,6 +231,6 @@ module Server = struct
       Lwt_unix.socket (Unix.domain_of_sockaddr listen_address) Unix.SOCK_DGRAM 0
     in
     Lwt_unix.bind server_fd listen_address >>= fun () ->
-    let connection = Quic.Server_connection.create ~config handler in
+    let connection = Quic.Transport.Server.create ~config handler in
     IO_loop.start connection ~read_buffer_size:0x1000 server_fd
 end
