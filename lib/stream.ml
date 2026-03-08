@@ -199,14 +199,14 @@ module Recv = struct
     (match t.fin_offset with
     | Some fin_off -> assert (off <= fin_off)
     | None -> ());
+    if is_fin then t.fin_offset <- Some (off + len);
     (* From RFC<QUIC-RFC>§2.2:
      *   An endpoint could receive data for a stream at the same stream offset
      *   multiple times. Data that has already been received can be discarded. *)
-    if t.offset < off + len
-    then (
+    if t.offset < off + len || (is_fin && len = 0)
+    then
       let q' = Q.add off fragment t.q in
-      t.q <- q';
-      if is_fin then t.fin_offset <- Some off)
+      t.q <- q'
 
   let flush t =
     if Buffer.has_pending_output t.consumer
@@ -230,7 +230,7 @@ module Recv = struct
           flush t;
           match t.fin_offset with
           | Some fin_offset ->
-            if fin_offset = off then Buffer.close_reader t.consumer
+            if fin_offset = t.offset then Buffer.close_reader t.consumer
           | None -> ());
         Some fragment)
       else None
