@@ -8,6 +8,9 @@
   pkgs,
 }:
 
+let
+  hsPkgs = import ./h3spec.nix { inherit pkgs; };
+in
 mkShell {
   inputsFrom = [ packages.default ];
   buildInputs =
@@ -29,5 +32,8 @@ mkShell {
       ocamlformat
       ocaml-lsp
       utop
+    ])
+    ++ (with hsPkgs; [
+      h3spec
     ]);
 }
