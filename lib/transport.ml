@@ -1336,117 +1336,98 @@ let packet_handler t ?error packet =
         Some connection)
   in
   match c_opt with
-  | None ->
-    ()
+  | None -> ()
   | Some c ->
     (match error with
     | Some error -> Connection.report_error c error
     | None ->
-    if CID.is_empty c.original_dest_cid
-    then
-      (* From RFC9000§7.3:
-       *   Each endpoint includes the value of the Source Connection ID field
-       *   from the first Initial packet it sent in the
-       *   initial_source_connection_id transport parameter; see Section 18.2. A
-       *   server includes the Destination Connection ID field from the first
-       *   Initial packet it received from the client in the
-       *   original_destination_connection_id transport parameter [...]. *)
-      c.original_dest_cid <- Packet.destination_cid packet;
+      if CID.is_empty c.original_dest_cid
+      then
+        (* From RFC9000§7.3:
+         *   Each endpoint includes the value of the Source Connection ID field
+         *   from the first Initial packet it sent in the
+         *   initial_source_connection_id transport parameter; see Section 18.2. A
+         *   server includes the Destination Connection ID field from the first
+         *   Initial packet it received from the client in the
+         *   original_destination_connection_id transport parameter [...]. *)
+        c.original_dest_cid <- Packet.destination_cid packet;
 
-    (match packet with
-    | Packet.VersionNegotiation _ -> ()
-    | Frames { header; payload; packet_number; _ } ->
-      let encryption_level = Encryption_level.of_header header in
-
-      (* (match encryption_level with *)
-      (* | Initial -> *)
-      (* c.packet_number_spaces.initial.received <- *)
-      (* Int64.max c.packet_number_spaces.initial.received packet_number *)
-      (* | Handshake -> *)
-      (* c.packet_number_spaces.handshake.received <- *)
-      (* Int64.max c.packet_number_spaces.handshake.received packet_number *)
-      (* | Application_data | Zero_RTT -> *)
-      (* c.packet_number_spaces.application_data.received <- *)
-      (* Int64.max c.packet_number_spaces.application_data.received
-         packet_number); *)
-      let pn_space =
-        Spaces.of_encryption_level c.packet_number_spaces encryption_level
-      in
-      pn_space.received <- Int64.max pn_space.received packet_number;
-
-      (match Packet.source_cid packet with
-      | Some src_cid ->
-        (* From RFC9000§19.6:
-         *   Upon receiving a packet, each endpoint sets the Destination Connection
-         *   ID it sends to match the value of the Source Connection ID that it
-         *   receives. *)
-        c.dest_cid <- src_cid
-      | None ->
-        (* TODO: short packets will fail here? *)
-        assert (
-          match packet with
-          | Frames { header = Packet.Header.Short _; _ } -> true
-          | _ -> false));
-
-      let packet_info =
-        { header
-        ; encryption_level
-        ; packet_number
-        ; outgoing_frames = create_outgoing_frames ~current:c.encdec.current
-        ; connection = c
-        }
-      in
-
-      (match
-         Angstrom.parse_bigstring
-           ~consume:All
-           (Parse.Frame.parser (Connection.frame_handler c ~packet_info))
-           payload
-       with
-      | Ok _frames ->
-        (* process streams for packets that have been acknowledged. *)
-        let acked_frames =
-          Recovery.drain_acknowledged
-            c.recovery
-            ~encryption_level:packet_info.encryption_level
+      match packet with
+      | Packet.VersionNegotiation _ -> ()
+      | Frames { header; payload; packet_number; _ } ->
+        let encryption_level = Encryption_level.of_header header in
+        let pn_space =
+          Spaces.of_encryption_level c.packet_number_spaces encryption_level
         in
-        List.iter
-          (function
-            | Frame.Crypto { IOVec.off; _ } ->
-              let crypto_stream =
+        pn_space.received <- Int64.max pn_space.received packet_number;
+
+        (match Packet.source_cid packet with
+        | Some src_cid ->
+          (* From RFC9000§19.6:
+           *   Upon receiving a packet, each endpoint sets the Destination
+           *   Connection ID it sends to match the value of the Source
+           *   Connection ID that it receives. *)
+          c.dest_cid <- src_cid
+        | None ->
+          assert (
+            match packet with
+            | Frames { header = Packet.Header.Short _; _ } -> true
+            | _ -> false));
+
+        let packet_info =
+          { header
+          ; encryption_level
+          ; packet_number
+          ; outgoing_frames = create_outgoing_frames ~current:c.encdec.current
+          ; connection = c
+          }
+        in
+        if Bigstringaf.length payload = 0
+        then Connection.report_error c Protocol_violation
+        else
+          (match
+             Angstrom.parse_bigstring
+               ~consume:All
+               (Parse.Frame.parser (Connection.frame_handler c ~packet_info))
+               payload
+           with
+          | Ok _frames ->
+            let acked_frames =
+              Recovery.drain_acknowledged
+                c.recovery
+                ~encryption_level:packet_info.encryption_level
+            in
+            List.iter
+              (function
+                | Frame.Crypto { IOVec.off; _ } ->
+                  let crypto_stream =
+                    Spaces.of_encryption_level
+                      c.crypto_streams
+                      packet_info.encryption_level
+                  in
+                  Stream.Send.remove off crypto_stream.send
+                | Stream { id; fragment = { IOVec.off; _ }; _ } ->
+                  (match Hashtbl.find_opt c.streams id with
+                  | Some stream -> Stream.Send.remove off stream.send
+                  | None -> ())
+                | Ack { ranges = _; _ } -> ()
+                | _other -> ())
+              acked_frames;
+            if c.did_send_connection_close
+            then ()
+            else (
+              let pn_space =
                 Spaces.of_encryption_level
-                  c.crypto_streams
+                  c.packet_number_spaces
                   packet_info.encryption_level
               in
-              Stream.Send.remove off crypto_stream.send
-            | Stream { id; fragment = { IOVec.off; _ }; _ } ->
-              (match Hashtbl.find_opt c.streams id with
-              | Some stream -> Stream.Send.remove off stream.send
-              | None -> ())
-            | Ack { ranges = _; _ } ->
-              (* TODO: when we track packets that need acknowledgement, update
-                 the largest acknowledged here. *)
-              ()
-            | _other -> ())
-          acked_frames;
-        if c.did_send_connection_close
-        then ()
-        else (
-          (* This packet has been processed, mark it for acknowledgement. *)
-          let pn_space =
-            Spaces.of_encryption_level
-              c.packet_number_spaces
-              packet_info.encryption_level
-          in
-          Packet_number.insert_for_acking pn_space packet_number;
-          (* packet_info should now contain frames we need to send in response. *)
-          send_packets t ~packet_info;
-          (* Reset for the next packet. *)
-          pn_space.ack_elicited <- false)
-      | Error e ->
-        Format.eprintf "discarding malformed packet payload: %s@." e)
-    | Retry { header; token; pseudo; tag } ->
-      process_retry_packet t c ~header ~token ~pseudo ~tag))
+              Packet_number.insert_for_acking pn_space packet_number;
+              send_packets t ~packet_info;
+              pn_space.ack_elicited <- false)
+          | Error e ->
+            Format.eprintf "discarding malformed packet payload: %s@." e)
+      | Retry { header; token; pseudo; tag } ->
+        process_retry_packet t c ~header ~token ~pseudo ~tag)
 
 let create ~mode ~now_ms ~config connection_handler =
   let rec reader_packet_handler t ?error packet =
