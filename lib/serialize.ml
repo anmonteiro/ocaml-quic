@@ -98,7 +98,8 @@ module Frame = struct
     let (_ : int64) =
       List.fold_left
         (fun smallest_ack { Frame.Range.first; last } ->
-           let gap = Int64.sub smallest_ack last in
+           (* RFC9000§19.3.1: gap = previous_smallest - current_largest - 2 *)
+           let gap = Int64.sub (Int64.sub smallest_ack last) 2L in
            let len = Int64.sub last first in
            write_variable_length_integer t (Int64.to_int gap);
            write_variable_length_integer t (Int64.to_int len);

@@ -32,12 +32,30 @@
 
 open Quic
 
+type drop_direction =
+  [ `Receive
+  | `Send
+  ]
+
+type drop_packet_kind =
+  [ `Initial
+  | `Zero_rtt
+  | `Handshake
+  | `Retry
+  | `Short
+  | `Unknown
+  ]
+
+type should_drop =
+  direction:drop_direction -> packet_kind:drop_packet_kind -> seq_no:int -> len:int -> bool
+
 module Server : sig
   (* XXX: Alternative: ~conn_handler:(conn -> stream_handler) called for each
    * connection. *)
   val establish_server :
      Eio_unix.Stdenv.base
     -> sw:Eio.Switch.t
+    -> ?should_drop:should_drop
     -> config:Config.t
     -> Eio.Net.Sockaddr.datagram
     -> (cid:
@@ -56,6 +74,7 @@ module Client : sig
   val create :
      Eio_unix.Stdenv.base
     -> sw:Eio.Switch.t
+    -> ?should_drop:should_drop
     -> config:Config.t
     -> (cid:
           (* Unix.sockaddr -> *)

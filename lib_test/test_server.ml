@@ -16,7 +16,7 @@ end
 module Write_operation = struct
   type t =
     [ `Write of Bigstringaf.t IOVec.t list
-    | `Yield
+    | `Yield of int64 option
     | `Close of int
     ]
 
@@ -44,13 +44,13 @@ module Write_operation = struct
     match t with
     | `Write iovecs ->
       Format.fprintf fmt "Write %S" (iovecs_to_string iovecs |> hex_of_string)
-    | `Yield -> Format.pp_print_string fmt "Yield"
+    | `Yield _ -> Format.pp_print_string fmt "Yield"
     | `Close len -> Format.fprintf fmt "Close %i" len
 
   let to_write_as_string t =
     match t with
     | `Write iovecs -> Some (iovecs_to_string iovecs)
-    | `Close _ | `Yield -> None
+    | `Close _ | `Yield _ -> None
 end
 
 let hex =
@@ -115,7 +115,10 @@ let test_initial () =
       ; alpn_protocols = [ "h3" ]
       }
     in
-    Transport.Server.create ~config (fun ~cid:_ ~start_stream:_ -> assert false)
+    Transport.Server.create
+      ~now_ms:(fun () -> 0L)
+      ~config
+      (fun ~cid:_ ~start_stream:_ -> assert false)
   in
   let read = read_string t protected_packet in
   Alcotest.(check int)

@@ -495,7 +495,7 @@ module Packet = struct
     | Decrypted of
         { header : Packet.Header.t
         ; payload_length : int
-        ; decrypted : Crypto.AEAD.ret option
+        ; decrypted : Crypto.AEAD.ret
         }
 
   type packet_result =
@@ -537,21 +537,22 @@ module Packet = struct
            *   receiver will discard *)
           (Skip len : packet_parsing_type)
         else
-          let header, payload_length =
-            match
-              Angstrom.parse_bigstring
-                ~consume:Prefix
-                protected_header
-                (Bigstringaf.sub bs ~off ~len)
-            with
-            | Ok x -> x
-            | Error e -> failwith e
-          in
-          Decrypted
-            { header
-            ; payload_length
-            ; decrypted = decrypt ~payload_length ~header bs ~off ~len
-            }
+          (match
+             Angstrom.parse_bigstring
+               ~consume:Prefix
+               protected_header
+               (Bigstringaf.sub bs ~off ~len)
+           with
+          | Error _e ->
+            (* Invalid protected header; drop this datagram. *)
+            Skip len
+          | Ok (header, payload_length) ->
+            (match decrypt ~payload_length ~header bs ~off ~len with
+            | Some decrypted -> Decrypted { header; payload_length; decrypted }
+            | None ->
+              (* Couldn't decrypt this protected packet with currently available
+               * keys. Discard the datagram. *)
+              Skip len))
       else
         (* From RFC9001§5.3:
          *   All QUIC packets other than Version Negotiation and Retry
@@ -563,17 +564,15 @@ module Packet = struct
         Unprotected)
     >>= function
     | Skip len -> advance len >>| fun () -> Skip
-    | Decrypted { decrypted = None; _ } -> failwith "failed to decrypt, fix me"
     | Decrypted
         { header
         ; payload_length
         ; decrypted =
-            Some
-              { Crypto.AEAD.packet_number
-              ; pn_length
-              ; plaintext
-              ; header = header_cs
-              }
+            { Crypto.AEAD.packet_number
+            ; pn_length
+            ; plaintext
+            ; header = header_cs
+            }
         } ->
       let header_length = String.length header_cs in
       advance header_length >>= fun () ->
@@ -690,6 +689,7 @@ module Reader = struct
     consumed
 
   let force_close t = t.closed <- true
+  let recover t = t.parse_state <- Done
 
   let next t =
     match t.parse_state with
