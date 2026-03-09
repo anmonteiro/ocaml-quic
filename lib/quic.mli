@@ -100,6 +100,7 @@ module Transport : sig
   type stream_handler = F of (Stream.t -> on_error_handler)
 
   val next_read_operation : t -> [ `Read | `Yield | `Close ]
+  val on_timeout : t -> unit
 
   val read
     :  t
@@ -115,7 +116,7 @@ module Transport : sig
   val next_write_operation
     :  t
     -> [ `Writev of Faraday.bigstring Faraday.iovec list * string * string
-       | `Yield
+       | `Yield of int64 option
        | `Close of int
        ]
 
@@ -127,14 +128,16 @@ module Transport : sig
 
   module Server : sig
     val create
-      :  config:Config.t
+      :  now_ms:(unit -> int64)
+      -> config:Config.t
       -> (cid:string -> start_stream:start_stream -> stream_handler)
       -> t
   end
 
   module Client : sig
     val create
-      :  config:Config.t
+      :  now_ms:(unit -> int64)
+      -> config:Config.t
       -> (cid:string -> start_stream:start_stream -> stream_handler)
       -> t
   end

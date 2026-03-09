@@ -34,6 +34,8 @@
 
 open Lwt.Infix
 
+let now_ms () = Int64.of_float (Unix.gettimeofday () *. 1000.)
+
 module Addr = struct
   (* type t = Eio.Net.Sockaddr.datagram *)
 
@@ -205,8 +207,20 @@ module IO_loop = struct
           >>= fun result ->
           Runtime.report_write_result t ~cid result;
           write_loop_step ()
-        | `Yield ->
+        | `Yield timeout_ms ->
           Runtime.yield_writer t write_loop;
+          (match timeout_ms with
+          | None -> ()
+          | Some timeout_ms ->
+            Lwt.async (fun () ->
+              let now = now_ms () in
+              let delay_s =
+                if Int64.compare now timeout_ms >= 0
+                then 0.
+                else Int64.to_float (Int64.sub timeout_ms now) /. 1000.
+              in
+              Lwt_unix.sleep delay_s >|= fun () ->
+              Runtime.on_timeout t));
           Lwt.return_unit
         | `Close _ ->
           Lwt.wakeup_later notify_write_loop_exited ();
@@ -231,6 +245,6 @@ module Server = struct
       Lwt_unix.socket (Unix.domain_of_sockaddr listen_address) Unix.SOCK_DGRAM 0
     in
     Lwt_unix.bind server_fd listen_address >>= fun () ->
-    let connection = Quic.Transport.Server.create ~config handler in
+    let connection = Quic.Transport.Server.create ~now_ms ~config handler in
     IO_loop.start connection ~read_buffer_size:0x1000 server_fd
 end

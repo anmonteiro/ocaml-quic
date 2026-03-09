@@ -797,6 +797,7 @@ let make_client_connection_for_congestion_tests () =
       ~mode:Client
       ~peer_address:"127.0.0.1:4433"
       ~tls_state
+      ~now_ms:(fun () -> 0L)
       ~wakeup_writer:(fun () -> ())
       ~shutdown:(fun _ -> ())
       ~connection_handler

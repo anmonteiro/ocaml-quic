@@ -120,7 +120,7 @@ module Connection = struct
     ; (* TODO: should be retry or initial? *)
       mutable processed_retry_packet : bool
     ; mutable token_value : string
-    ; mutable recovery_now_ms : int64
+    ; now_ms : unit -> int64
     }
 
   let invoke_handler t ~cid ~start_stream stream =
@@ -158,11 +158,7 @@ module Connection = struct
     end)
 
   let wakeup_writer t = t.wakeup_writer ()
-
-  let next_recovery_time_ms t =
-    let now = t.recovery_now_ms in
-    t.recovery_now_ms <- Int64.add now 1L;
-    now
+  let next_recovery_time_ms t = t.now_ms ()
 
   let packet_is_in_flight frames =
     Frame.is_any_ack_eliciting frames
@@ -196,10 +192,12 @@ module Connection = struct
           ( ({ Writer.encryption_level; packet_number; _ } as header_info)
           , frames ) ->
         let bytes_sent = estimated_bytes_sent frames in
-        if bytes_sent > 0 && not (Recovery.can_send t.recovery ~bytes:bytes_sent)
+        if
+          bytes_sent > 0 && not (Recovery.can_send t.recovery ~bytes:bytes_sent)
         then acc
         else (
-          ignore (Queue.take t.queued_packets : Writer.header_info * Frame.t list);
+          ignore
+            (Queue.take t.queued_packets : Writer.header_info * Frame.t list);
           Format.eprintf
             "Sending %d frames at encryption level: %a %Ld@."
             (List.length frames)
@@ -436,103 +434,105 @@ module Connection = struct
       let fragment_cstruct = Bigstringaf.to_string buffer in
       (match t.tls_state.handshake.machina with
       | Server Tls.State.AwaitClientHello | Server13 AwaitClientHelloHRR13 ->
-        assert (encryption_level = Initial);
-        assert (t.encdec.current = Initial);
-        (match
-           Qtls.handle_raw_record
-             ~embed_quic_transport_params:(fun _raw_transport_params ->
-               (* From RFC9000§7.3:
-                *   When the handshake does not include a Retry (Figure 6), the
-                *   server sets original_destination_connection_id to S1 and
-                *   initial_source_connection_id to S3. In this case, the server
-                *   does not include a retry_source_connection_id transport
-                *   parameter. *)
-               Some
-                 Transport_parameters.(
-                   encode
-                     [ Encoding.Original_destination_connection_id
-                         t.original_dest_cid
-                     ; Initial_source_connection_id t.source_cid
-                     ; (* TODO: get these from configuration *)
-                       Initial_max_data (1 lsl 27)
-                     ; Initial_max_stream_data_bidi_local (1 lsl 27)
-                     ; Initial_max_stream_data_bidi_remote (1 lsl 27)
-                     ; Initial_max_stream_data_uni (1 lsl 27)
-                     ; Initial_max_streams_bidi (1 lsl 8)
-                     ; Initial_max_streams_uni (1 lsl 8)
-                     ]))
-             t.tls_state
-             fragment_cstruct
-         with
-        | Error e ->
-          failwith
-            (Format.asprintf "Crypto failure: %a@." Tls.State.pp_failure e)
-        | Ok (tls_state', tls_packets, (None | Some _)) ->
-          (* TODO: send alerts as quic error *)
-          (match tls_packets with
-          | [] -> t.tls_state <- tls_state'
-          | tls_packets ->
-            (match Qtls.transport_params tls_state' with
-            | Some quic_transport_params ->
-              (match
-                 Transport_parameters.decode_and_validate
-                   ~perspective:Server
-                   quic_transport_params
-               with
-              | Ok transport_params ->
-                t.peer_transport_params <- transport_params;
-                process_tls_result t ~new_tls_state:tls_state' ~tls_packets
-                (* assert false *)
-              | Error e -> report_error t ~frame_type:Crypto e)
-            | None -> ())))
+        if encryption_level <> Initial || t.encdec.current <> Initial
+        then ()
+        else
+          (match
+             Qtls.handle_raw_record
+               ~embed_quic_transport_params:(fun _raw_transport_params ->
+                 (* From RFC9000§7.3:
+                  *   When the handshake does not include a Retry (Figure 6), the
+                  *   server sets original_destination_connection_id to S1 and
+                  *   initial_source_connection_id to S3. In this case, the server
+                  *   does not include a retry_source_connection_id transport
+                  *   parameter. *)
+                 Some
+                   Transport_parameters.(
+                     encode
+                       [ Encoding.Original_destination_connection_id
+                           t.original_dest_cid
+                       ; Initial_source_connection_id t.source_cid
+                       ; (* TODO: get these from configuration *)
+                         Initial_max_data (1 lsl 27)
+                       ; Initial_max_stream_data_bidi_local (1 lsl 27)
+                       ; Initial_max_stream_data_bidi_remote (1 lsl 27)
+                       ; Initial_max_stream_data_uni (1 lsl 27)
+                       ; Initial_max_streams_bidi (1 lsl 8)
+                       ; Initial_max_streams_uni (1 lsl 8)
+                       ]))
+               t.tls_state
+               fragment_cstruct
+           with
+          | Error _e ->
+            report_error t ~frame_type:Crypto Internal_error
+          | Ok (tls_state', tls_packets, (None | Some _)) ->
+            (* TODO: send alerts as quic error *)
+            (match tls_packets with
+            | [] -> t.tls_state <- tls_state'
+            | tls_packets ->
+              (match Qtls.transport_params tls_state' with
+              | Some quic_transport_params ->
+                (match
+                   Transport_parameters.decode_and_validate
+                     ~perspective:Server
+                     quic_transport_params
+                 with
+                | Ok transport_params ->
+                  t.peer_transport_params <- transport_params;
+                  process_tls_result t ~new_tls_state:tls_state' ~tls_packets
+                | Error e -> report_error t ~frame_type:Crypto e)
+              | None -> ())))
       | Server13
           ( AwaitClientCertificate13 _ | AwaitClientCertificateVerify13 _
           | AwaitClientFinished13 _ ) ->
-        assert (encryption_level = Handshake);
-        (match Qtls.handle_raw_record t.tls_state fragment_cstruct with
-        | Error e ->
-          failwith
-            (Format.asprintf "Crypto failure: %a@." Tls.State.pp_failure e)
-        | Ok (tls_state', tls_packets, (None | Some _)) ->
-          (* TODO: send alerts as quic error *)
-          process_tls_result t ~new_tls_state:tls_state' ~tls_packets)
-      | Server13 Established13 -> failwith "handle key updates here"
-      | Server Established -> failwith "expected tls 1.3"
+        if encryption_level <> Handshake
+        then ()
+        else
+          (match Qtls.handle_raw_record t.tls_state fragment_cstruct with
+          | Error _e ->
+            report_error t ~frame_type:Crypto Internal_error
+          | Ok (tls_state', tls_packets, (None | Some _)) ->
+            (* TODO: send alerts as quic error *)
+            process_tls_result t ~new_tls_state:tls_state' ~tls_packets)
+      | Server13 Established13 ->
+        (* TODO: handle key updates *)
+        ()
+      | Server Established -> report_error t ~frame_type:Crypto Internal_error
       | Client (AwaitServerHello (_, _, _)) ->
-        assert (encryption_level = Initial);
-        assert (t.encdec.current = Initial);
-        (match Qtls.handle_raw_record t.tls_state fragment_cstruct with
-        | Error e ->
-          failwith
-            (Format.asprintf "Crypto failure: %a@." Tls.State.pp_failure e)
-        | Ok (tls_state', tls_packets, (None | Some _)) ->
-          (* TODO: send alerts as quic error *)
-          process_tls_result t ~new_tls_state:tls_state' ~tls_packets)
+        if encryption_level <> Initial || t.encdec.current <> Initial
+        then ()
+        else
+          (match Qtls.handle_raw_record t.tls_state fragment_cstruct with
+          | Error _e ->
+            report_error t ~frame_type:Crypto Internal_error
+          | Ok (tls_state', tls_packets, (None | Some _)) ->
+            (* TODO: send alerts as quic error *)
+            process_tls_result t ~new_tls_state:tls_state' ~tls_packets)
       | Client13
           ( AwaitServerEncryptedExtensions13 _
           | AwaitServerCertificateRequestOrCertificate13 _
           | AwaitServerCertificate13 _ | AwaitServerCertificateVerify13 _
           | AwaitServerFinished13 _ ) ->
-        assert (encryption_level = Handshake);
-        assert (t.encdec.current = Handshake);
-        (match Qtls.handle_raw_record t.tls_state fragment_cstruct with
-        | Error e ->
-          failwith
-            (Format.asprintf "Crypto failure: %a@." Tls.State.pp_failure e)
-        | Ok (tls_state', tls_packets, (None | Some _)) ->
-          (* TODO: send alerts as quic error *)
-          process_tls_result t ~new_tls_state:tls_state' ~tls_packets)
+        if encryption_level <> Handshake || t.encdec.current <> Handshake
+        then ()
+        else
+          (match Qtls.handle_raw_record t.tls_state fragment_cstruct with
+          | Error _e ->
+            report_error t ~frame_type:Crypto Internal_error
+          | Ok (tls_state', tls_packets, (None | Some _)) ->
+            (* TODO: send alerts as quic error *)
+            process_tls_result t ~new_tls_state:tls_state' ~tls_packets)
       | Client13 (AwaitServerHello13 _) ->
-        assert (encryption_level = Initial);
-        assert (t.encdec.current = Initial);
-        (match Qtls.handle_raw_record t.tls_state fragment_cstruct with
-        | Error e ->
-          failwith
-            (Format.asprintf "Crypto failure: %a@." Tls.State.pp_failure e)
-        | Ok (tls_state', tls_packets, (None | Some _)) ->
-          process_tls_result t ~new_tls_state:tls_state' ~tls_packets)
-      | Client _ | Client13 _ -> assert false
-      | Server _ | Server13 _ -> assert false);
+        if encryption_level <> Initial || t.encdec.current <> Initial
+        then ()
+        else
+          (match Qtls.handle_raw_record t.tls_state fragment_cstruct with
+          | Error _e ->
+            report_error t ~frame_type:Crypto Internal_error
+          | Ok (tls_state', tls_packets, (None | Some _)) ->
+            process_tls_result t ~new_tls_state:tls_state' ~tls_packets)
+      | Client _ | Client13 _ -> ()
+      | Server _ | Server13 _ -> ());
       exhaust_crypto_stream t ~packet_info ~stream
     | None -> ()
 
@@ -733,6 +733,7 @@ module Connection = struct
         ~mode
         ~peer_address
         ~tls_state
+        ~now_ms
         ~wakeup_writer
         ~shutdown
         ~connection_handler
@@ -780,7 +781,7 @@ module Connection = struct
       ; did_send_connection_close = false
       ; processed_retry_packet = false
       ; token_value = ""
-      ; recovery_now_ms = 0L
+      ; now_ms
       }
     in
     t
@@ -871,7 +872,8 @@ module Connection = struct
                 let fragment, is_fin = Stream.Send.pop_exn stream.send in
                 let frames =
                   match stream_type with
-                  | `Data -> [ Frame.Stream { id = stream.id; fragment; is_fin } ]
+                  | `Data ->
+                    [ Frame.Stream { id = stream.id; fragment; is_fin } ]
                   | `Crypto -> [ Frame.Crypto fragment ]
                 in
                 Writer.write_frames_packet t.writer ~header_info frames;
@@ -925,6 +927,7 @@ type t =
   ; mode : Crypto.Mode.t
   ; config : Config.t
   ; connections : Connection.t Connection.Table.t
+  ; now_ms : unit -> int64
   ; mutable current_peer_address : string option
   ; mutable wakeup_writer : Optional_thunk.t
   ; mutable closed : bool
@@ -949,20 +952,56 @@ let register_connection_id t ~cid ~(connection : Connection.t) =
   match Connection.Table.find_opt t.connections cid with
   | None -> Connection.Table.add t.connections cid connection
   | Some existing ->
-    if existing == connection
-    then ()
-    else failwith "connection id collision"
+    if existing == connection then () else failwith "connection id collision"
 
 let deregister_connection_ids t ~(connection : Connection.t) =
   let ids =
     Connection.Table.fold
-      (fun cid candidate acc -> if candidate == connection then cid :: acc else acc)
+      (fun cid candidate acc ->
+         if candidate == connection then cid :: acc else acc)
       t.connections
       []
   in
   List.iter (fun cid -> Connection.Table.remove t.connections cid) ids
 
 let is_closed t = t.closed
+
+let next_timeout_ms t =
+  Connection.Table.fold
+    (fun _ (connection : Connection.t) acc ->
+       let timeout =
+         (Recovery.Debug.snapshot connection.recovery).timer
+           .loss_detection_timer_ms
+       in
+       match timeout, acc with
+       | None, _ -> acc
+       | Some timeout, None -> Some timeout
+       | Some timeout, Some current -> Some (Int64.min timeout current))
+    t.connections
+    None
+
+let on_timeout t =
+  let now_ms = t.now_ms () in
+  Connection.Table.iter
+    (fun _ (connection : Connection.t) ->
+       match
+         (Recovery.Debug.snapshot connection.recovery).timer
+           .loss_detection_timer_ms
+       with
+       | Some timeout_ms when Int64.compare timeout_ms now_ms <= 0 ->
+         Recovery.Debug.on_loss_detection_timeout
+           connection.recovery
+           ~now_ms:(connection.now_ms ());
+         if Encryption_level.mem connection.encdec.current connection.encdec
+         then
+           Connection.send_frames
+             connection
+             ~encryption_level:connection.encdec.current
+             [ Frame.Ping ];
+         Connection.wakeup_writer connection
+       | Some _ | None -> ())
+    t.connections;
+  wakeup_writer t
 
 let send_packets t ~packet_info =
   let { connection = c; outgoing_frames; _ } = packet_info in
@@ -1019,7 +1058,9 @@ let create_new_connection
     | None ->
       let rec generate_unique_cid () =
         let cid = CID.generate () in
-        if Connection.Table.mem t.connections cid then generate_unique_cid () else cid
+        if Connection.Table.mem t.connections cid
+        then generate_unique_cid ()
+        else cid
       in
       generate_unique_cid ()
   in
@@ -1028,6 +1069,7 @@ let create_new_connection
       ~mode:t.mode
       ~peer_address
       ~tls_state
+      ~now_ms:t.now_ms
       ~wakeup_writer:(ready_to_write t)
       ~shutdown:(on_close t)
       ~connection_handler
@@ -1118,9 +1160,9 @@ let process_retry_packet
 let packet_handler t ?error packet =
   (* TODO: track received packet number. *)
   let connection_id = Packet.destination_cid packet in
-  let c =
+  let c_opt =
     match Connection.Table.find_opt t.connections connection_id with
-    | Some connection -> connection
+    | Some connection -> Some connection
     | None ->
       (* Has to be a new connection. TODO: assert that. *)
       assert (t.mode = Server);
@@ -1136,22 +1178,28 @@ let packet_handler t ?error packet =
         }
       in
       let tls_state = Qtls.server ~certificates ~alpn_protocols in
-      let connection =
-        create_new_connection
-          t
-          ~peer_address:(Option.get t.current_peer_address)
-          ~tls_state
-          ~connection_handler:t.connection_handler
-          ~encdec
-      in
-      (* Keep routing the client's original DCID until it switches to our SCID. *)
-      register_connection_id t ~cid:connection_id ~connection;
-      connection
+      (match t.current_peer_address with
+      | None -> None
+      | Some peer_address ->
+        let connection =
+          create_new_connection
+            t
+            ~peer_address
+            ~tls_state
+            ~connection_handler:t.connection_handler
+            ~encdec
+        in
+        (* Keep routing the client's original DCID until it switches to our SCID. *)
+        register_connection_id t ~cid:connection_id ~connection;
+        Some connection)
   in
-
-  match error with
-  | Some error -> Connection.report_error c error
+  match c_opt with
   | None ->
+    ()
+  | Some c ->
+    (match error with
+    | Some error -> Connection.report_error c error
+    | None ->
     if CID.is_empty c.original_dest_cid
     then
       (* From RFC9000§7.3:
@@ -1164,7 +1212,7 @@ let packet_handler t ?error packet =
       c.original_dest_cid <- Packet.destination_cid packet;
 
     (match packet with
-    | Packet.VersionNegotiation _ -> failwith "NYI: version negotiation"
+    | Packet.VersionNegotiation _ -> ()
     | Frames { header; payload; packet_number; _ } ->
       let encryption_level = Encryption_level.of_header header in
 
@@ -1247,11 +1295,12 @@ let packet_handler t ?error packet =
         send_packets t ~packet_info;
         (* Reset for the next packet. *)
         pn_space.ack_elicited <- false
-      | Error e -> failwith ("Err: " ^ e))
+      | Error e ->
+        Format.eprintf "discarding malformed packet payload: %s@." e)
     | Retry { header; token; pseudo; tag } ->
-      process_retry_packet t c ~header ~token ~pseudo ~tag)
+      process_retry_packet t c ~header ~token ~pseudo ~tag))
 
-let create ~mode ~config connection_handler =
+let create ~mode ~now_ms ~config connection_handler =
   let rec reader_packet_handler t ?error packet =
     packet_handler (Lazy.force t) ?error packet
   and decrypt t ~payload_length ~header bs ~off ~len =
@@ -1260,10 +1309,9 @@ let create ~mode ~config connection_handler =
     let connection_id = Packet.Header.destination_cid header in
     if CID.is_empty connection_id
     then
-      (* TODO: section 5.2 says we should keep track of connections *)
-      failwith "NYI: empty CID"
+      None
     else
-      let decrypter, largest_pn =
+      let decrypter_and_largest_pn =
         match Connection.Table.find_opt t.connections connection_id with
         | Some connection ->
           let encryption_level = Encryption_level.of_header header in
@@ -1272,22 +1320,37 @@ let create ~mode ~config connection_handler =
               connection.packet_number_spaces
               encryption_level
           in
-          ( Option.get
-              (Encryption_level.find_exn encryption_level connection.encdec)
-                .decrypter
-          , pn_space.received )
+          (match Encryption_level.find encryption_level connection.encdec with
+          | Some { decrypter = Some decrypter; _ } ->
+            Some (decrypter, pn_space.received)
+          | Some { decrypter = None; _ } ->
+            (* Keys for this encryption level were dropped; ignore packet. *)
+            None
+          | None ->
+            (* No key material for this level on this connection yet. *)
+            None)
         | None ->
-          assert (Encryption_level.of_header header = Initial);
-          ( Crypto.InitialAEAD.make ~mode:(Crypto.Mode.peer t.mode) connection_id
-          , -1L )
+          if Encryption_level.of_header header = Initial
+          then
+            Some
+              ( Crypto.InitialAEAD.make
+                  ~mode:(Crypto.Mode.peer t.mode)
+                  connection_id
+              , -1L )
+          else
+            None
       in
-      Crypto.AEAD.decrypt_packet decrypter ~payload_length ~largest_pn cs
+      match decrypter_and_largest_pn with
+      | Some (decrypter, largest_pn) ->
+        Crypto.AEAD.decrypt_packet decrypter ~payload_length ~largest_pn cs
+      | None -> None
   and t =
     lazy
       { reader = Reader.packets ~decrypt:(decrypt t) (reader_packet_handler t)
       ; mode
       ; config
       ; connections = Connection.Table.create ~random:true 1024
+      ; now_ms
       ; current_peer_address = None
       ; wakeup_writer = Optional_thunk.none
       ; closed = false
@@ -1297,13 +1360,13 @@ let create ~mode ~config connection_handler =
   Lazy.force t
 
 module Server = struct
-  let create ~config connection_handler =
-    create ~mode:Server ~config connection_handler
+  let create ~now_ms ~config connection_handler =
+    create ~mode:Server ~now_ms ~config connection_handler
 end
 
 module Client = struct
-  let create ~config connection_handler =
-    create ~mode:Client ~config connection_handler
+  let create ~now_ms ~config connection_handler =
+    create ~mode:Client ~now_ms ~config connection_handler
 end
 
 let connect t ~address ~host connection_handler =
@@ -1367,7 +1430,18 @@ let connect t ~address ~host connection_handler =
   Connection.establish_connection new_connection
 
 let report_exn _t exn =
-  Format.eprintf "transport exception: %s@." (Printexc.to_string exn)
+  let bt = Printexc.get_raw_backtrace () in
+  let bt_s = Printexc.raw_backtrace_to_string bt in
+  if String.length bt_s = 0
+  then
+    Format.eprintf
+      "transport exception: %s (no backtrace captured; run with OCAMLRUNPARAM=b)@."
+      (Printexc.to_string exn)
+  else
+    Format.eprintf
+      "transport exception: %s@.%s@."
+      (Printexc.to_string exn)
+      bt_s
 
 let flush_pending_packets t =
   let rec inner t = function
@@ -1401,8 +1475,9 @@ let next_write_operation (t : t) =
     | Some (writer, client_address, cid) ->
       (match Writer.next writer with
       | `Write iovecs -> `Writev (iovecs, client_address, cid)
-      | (`Yield | `Close _) as other -> other)
-    | None -> `Yield
+      | `Yield -> `Yield (next_timeout_ms t)
+      | `Close n -> `Close n)
+    | None -> `Yield (next_timeout_ms t)
 
 let report_write_result t ~cid result =
   match Connection.Table.find_opt t.connections (CID.of_string cid) with
@@ -1435,5 +1510,11 @@ let next_read_operation t =
   match Reader.next t.reader with
   | (`Read | `Close) as operation -> operation
   | `Start -> `Read
-  | `Error (`Parse (_marks, _msg)) -> failwith "NYI: next_read error"
+  | `Error (`Parse (marks, msg)) ->
+    Format.eprintf
+      "transport parser error, dropping datagram (marks=%s): %s@."
+      (String.concat "," marks)
+      msg;
+    Reader.recover t.reader;
+    `Read
 (* `Close *)
