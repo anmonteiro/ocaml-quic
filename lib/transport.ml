@@ -807,6 +807,38 @@ module Connection = struct
      *)
     send_frames t [ Frame.Path_response buf ]
 
+  let process_max_streams_frame t ~direction max_streams =
+    if max_streams > Stream_id.max
+    then
+      report_error
+        t
+        ~frame_type:(Frame.Type.Max_streams direction)
+        Frame_encoding_error
+
+  let process_streams_blocked_frame t ~direction max_streams =
+    if max_streams > Stream_id.max
+    then
+      report_error
+        t
+        ~frame_type:(Frame.Type.Streams_blocked direction)
+        Frame_encoding_error
+
+  let process_new_connection_id_frame
+        t
+        ~cid
+        ~retire_prior_to
+        ~sequence_no
+    =
+    if CID.length cid = 0 || retire_prior_to > sequence_no
+    then report_error t ~frame_type:Frame.Type.New_connection_id Frame_encoding_error
+    else (
+      Format.eprintf
+        "new conn? %s@."
+        (let (`Hex x) = Hex.of_string (CID.to_string cid) in
+         x);
+      (* Track the latest peer-provided CID for outgoing packets. *)
+      t.dest_cid <- cid)
+
   let frame_handler ~packet_info t frame =
     (* TODO: validate that frame can appear at current encryption level. *)
     if Frame.is_ack_eliciting frame
@@ -852,17 +884,14 @@ module Connection = struct
       ()
     | Max_stream_data { stream_id; _ } ->
       process_max_stream_data_frame t ~stream_id
-    | Max_streams (_, _)
-    | Data_blocked _ | Stream_data_blocked _
-    | Streams_blocked (_, _) ->
+    | Max_streams (direction, max_streams) ->
+      process_max_streams_frame t ~direction max_streams
+    | Data_blocked _ | Stream_data_blocked _ ->
       ()
-    | New_connection_id { cid; _ } ->
-      Format.eprintf
-        "new conn? %s@."
-        (let (`Hex x) = Hex.of_string (CID.to_string cid) in
-         x);
-      (* Track the latest peer-provided CID for outgoing packets. *)
-      t.dest_cid <- cid
+    | Streams_blocked (direction, max_streams) ->
+      process_streams_blocked_frame t ~direction max_streams
+    | New_connection_id { cid; retire_prior_to; sequence_no; _ } ->
+      process_new_connection_id_frame t ~cid ~retire_prior_to ~sequence_no
     | Retire_connection_id _ ->
       ()
     | Path_challenge buf ->
