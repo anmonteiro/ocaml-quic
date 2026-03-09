@@ -257,6 +257,11 @@ module Pkt = struct
       | Short _ | Long { packet_type = Retry; _ } -> ()
 
     let write_long_header t ~pn_length ~header =
+      let version =
+        match header with
+        | Packet.Header.Initial { version; _ } | Long { version; _ } -> version
+        | Short _ -> assert false
+      in
       let packet_type = Packet.Header.long_packet_type header in
       assert (1 <= pn_length && pn_length <= 4);
       (* From RFC9000§17.2:
@@ -271,7 +276,7 @@ module Pkt = struct
        *   Long Packet Type: The next two bits (those with a mask of 0x30) of
        *                     byte 0 contain a packet type. Packet types are
        *                     listed in Table 5. *)
-      let first_byte = Packet.Type.serialize packet_type lsl 4 in
+      let first_byte = Packet.Type.serialize ~version packet_type lsl 4 in
       let first_byte = form_and_fixed_bits lor first_byte in
       (* From RFC9000§17.2:
        *   Reserved Bits: Two bits (those with a mask of 0x0c) of byte 0 are
@@ -423,7 +428,7 @@ module Writer = struct
         ~packet_number
         ~encryption_level
         ?(source_cid = CID.empty)
-        ?(version = 0x1l)
+        ?(version = Packet.Version.v1)
         ~token
         dest_cid
     =

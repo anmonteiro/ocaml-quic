@@ -66,7 +66,8 @@ module Client : sig
 end
 
 val connect :
-   t
+   ?version:int32
+  -> t
   -> address:Eio.Net.Sockaddr.datagram
   -> host:string
   -> (cid:string
