@@ -85,6 +85,13 @@ type on_error_handler = { on_error : error_handler }
 type start_stream = ?error_handler:error_handler -> Direction.t -> Stream.t
 type stream_handler = F of (Stream.t -> on_error_handler)
 
+let default_initial_max_data = 1 lsl 26
+let default_initial_max_stream_data_bidi_local = 1 lsl 26
+let default_initial_max_stream_data_bidi_remote = 1 lsl 26
+let default_initial_max_stream_data_uni = 1 lsl 26
+let default_initial_max_streams_bidi = 1 lsl 8
+let default_initial_max_streams_uni = 1 lsl 8
+
 module Connection = struct
   type handler =
     | Uninitialized of
@@ -479,9 +486,11 @@ module Connection = struct
                       ; Initial_source_connection_id t.source_cid
                       ; Initial_max_data (Int64.to_int t.local_initial_max_data)
                       ; Initial_max_stream_data_bidi_local
-                          (Int64.to_int t.local_initial_max_stream_data_bidi_local)
+                          (Int64.to_int
+                             t.local_initial_max_stream_data_bidi_local)
                       ; Initial_max_stream_data_bidi_remote
-                          (Int64.to_int t.local_initial_max_stream_data_bidi_remote)
+                          (Int64.to_int
+                             t.local_initial_max_stream_data_bidi_remote)
                       ; Initial_max_stream_data_uni
                           (Int64.to_int t.local_initial_max_stream_data_uni)
                       ; Initial_max_streams_bidi
@@ -1531,8 +1540,10 @@ let connect t ~address ~host connection_handler =
             transport_parameters.Config.initial_max_stream_data_bidi_remote
         ; Initial_max_stream_data_uni
             transport_parameters.Config.initial_max_stream_data_uni
-        ; Initial_max_streams_bidi transport_parameters.Config.initial_max_streams_bidi
-        ; Initial_max_streams_uni transport_parameters.Config.initial_max_streams_uni
+        ; Initial_max_streams_bidi
+            transport_parameters.Config.initial_max_streams_bidi
+        ; Initial_max_streams_uni
+            transport_parameters.Config.initial_max_streams_uni
         ])
   in
 
