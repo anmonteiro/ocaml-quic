@@ -85,6 +85,13 @@ type on_error_handler = { on_error : error_handler }
 type start_stream = ?error_handler:error_handler -> Direction.t -> Stream.t
 type stream_handler = F of (Stream.t -> on_error_handler)
 
+let default_initial_max_data = 1 lsl 26
+let default_initial_max_stream_data_bidi_local = 1 lsl 26
+let default_initial_max_stream_data_bidi_remote = 1 lsl 26
+let default_initial_max_stream_data_uni = 1 lsl 26
+let default_initial_max_streams_bidi = 1 lsl 8
+let default_initial_max_streams_uni = 1 lsl 8
+
 module Connection = struct
   type handler =
     | Uninitialized of
@@ -107,6 +114,12 @@ module Connection = struct
       crypto_streams : Stream.t Spaces.t
     ; mutable peer_address : string
     ; mutable peer_transport_params : Transport_parameters.t
+    ; local_initial_max_data : int64
+    ; local_initial_max_stream_data_bidi_local : int64
+    ; local_initial_max_stream_data_bidi_remote : int64
+    ; local_initial_max_stream_data_uni : int64
+    ; mutable recv_data_bytes : int64
+    ; recv_stream_highest_offsets : (Stream_id.t, int64) Hashtbl.t
     ; recovery : Recovery.t
     ; queued_packets : (Writer.header_info * Frame.t list) Queue.t
     ; writer : Writer.t
@@ -281,11 +294,13 @@ module Connection = struct
     |> List.iter (fun frames -> send_frames t ~encryption_level frames);
     ()
 
-  let report_error ?frame_type t error =
+  let report_error ?frame_type ?encryption_level t error =
     if not t.did_send_connection_close
     then (
+      Queue.clear t.queued_packets;
       send_frames
         t
+        ?encryption_level
         [ Frame.Connection_close_quic
             { frame_type = Option.value ~default:Frame.Type.Padding frame_type
             ; reason_phrase = ""
@@ -293,7 +308,8 @@ module Connection = struct
             }
         ];
       t.did_send_connection_close <- true;
-      shutdown t)
+      shutdown t;
+      wakeup_writer t)
 
   let process_reset_stream_frame
         t
@@ -467,12 +483,15 @@ module Connection = struct
                            t.original_dest_cid
                        ; Initial_source_connection_id t.source_cid
                        ; (* TODO: get these from configuration *)
-                         Initial_max_data (1 lsl 27)
-                       ; Initial_max_stream_data_bidi_local (1 lsl 27)
-                       ; Initial_max_stream_data_bidi_remote (1 lsl 27)
-                       ; Initial_max_stream_data_uni (1 lsl 27)
-                       ; Initial_max_streams_bidi (1 lsl 8)
-                       ; Initial_max_streams_uni (1 lsl 8)
+                         Initial_max_data default_initial_max_data
+                       ; Initial_max_stream_data_bidi_local
+                           default_initial_max_stream_data_bidi_local
+                       ; Initial_max_stream_data_bidi_remote
+                           default_initial_max_stream_data_bidi_remote
+                       ; Initial_max_stream_data_uni
+                           default_initial_max_stream_data_uni
+                       ; Initial_max_streams_bidi default_initial_max_streams_bidi
+                       ; Initial_max_streams_uni default_initial_max_streams_uni
                        ]))
                t.tls_state
                fragment_cstruct
@@ -573,33 +592,84 @@ module Connection = struct
     Hashtbl.add c.streams id stream;
     stream
 
-  let process_stream_frame c ~id ~fragment ~is_fin =
-    let stream =
-      match Hashtbl.find_opt c.streams id with
-      | Some stream -> stream
-      | None ->
-        let direction = Direction.classify id in
-        let stream =
-          create_stream
-            c
-            ~typ:
-              (match c.mode with
-              | Server -> Client direction
-              | Client -> Server direction)
-            ~id
-        in
-        let error_handler =
-          invoke_handler
-            c
-            ~cid:(CID.to_string c.source_cid)
-            ~start_stream:c.start_stream
-            stream
-        in
-        stream.error_handler <- error_handler.on_error;
-        stream
+  let process_stream_frame c ~encryption_level ~id ~fragment ~is_fin =
+    let stream_frame_type = Frame.to_frame_type (Frame.Stream { id; fragment; is_fin }) in
+    let is_locally_initiated =
+      match c.mode with
+      | Server -> Stream_id.is_server_initiated id
+      | Client -> Stream_id.is_client_initiated id
     in
-    Stream.Recv.push fragment ~is_fin stream.recv;
-    process_stream_data c ~stream:stream.recv
+    let recv_window =
+      match Direction.classify id with
+      | Unidirectional ->
+        if is_locally_initiated
+        then None
+        else Some c.local_initial_max_stream_data_uni
+      | Bidirectional ->
+        if is_locally_initiated
+        then Some c.local_initial_max_stream_data_bidi_local
+        else Some c.local_initial_max_stream_data_bidi_remote
+    in
+    let stream_final_offset =
+      Int64.add (Int64.of_int fragment.IOVec.off) (Int64.of_int fragment.len)
+    in
+    match recv_window with
+    | None ->
+      report_error
+        c
+        ~frame_type:stream_frame_type
+        ~encryption_level
+        Stream_state_error
+    | Some recv_window ->
+      if Int64.compare stream_final_offset recv_window > 0
+      then
+        report_error
+          c
+          ~frame_type:stream_frame_type
+          ~encryption_level
+          Flow_control_error
+      else (
+        let prev_stream_highest =
+          Hashtbl.find_opt c.recv_stream_highest_offsets id
+          |> Option.value ~default:0L
+        in
+        let new_stream_highest = Int64.max prev_stream_highest stream_final_offset in
+        let connection_bytes_delta =
+          Int64.sub new_stream_highest prev_stream_highest
+        in
+        let next_recv_data_bytes =
+          Int64.add c.recv_data_bytes connection_bytes_delta
+        in
+        if Int64.compare next_recv_data_bytes c.local_initial_max_data > 0
+        then
+          report_error
+            c
+            ~frame_type:stream_frame_type
+            ~encryption_level
+            Flow_control_error
+        else (
+          c.recv_data_bytes <- next_recv_data_bytes;
+          Hashtbl.replace
+            c.recv_stream_highest_offsets
+            id
+            new_stream_highest;
+          let stream =
+            match Hashtbl.find_opt c.streams id with
+            | Some stream -> stream
+            | None ->
+              let stream = create_stream c ~typ:(Stream.Type.classify id) ~id in
+              let error_handler =
+                invoke_handler
+                  c
+                  ~cid:(CID.to_string c.source_cid)
+                  ~start_stream:c.start_stream
+                  stream
+              in
+              stream.error_handler <- error_handler.on_error;
+              stream
+          in
+          Stream.Recv.push fragment ~is_fin stream.recv;
+          process_stream_data c ~stream:stream.recv))
 
   (* TODO: closing/ draining states, section 10.2 *)
   let process_connection_close_quic_frame
@@ -686,20 +756,20 @@ module Connection = struct
       process_stop_sending_frame t ~stream_id application_protocol_error
     | Crypto fragment -> process_crypto_frame t ~packet_info fragment
     | New_token _ ->
-      failwith
-        (Format.asprintf
-           "frame NYI: 0x%x"
-           (Frame.Type.serialize (Frame.to_frame_type frame)))
+      (* Optional extension frame; safe to ignore when unsupported. *)
+      ()
     | Stream { id; fragment; is_fin } ->
-      process_stream_frame t ~id ~fragment ~is_fin
+      process_stream_frame
+        t
+        ~encryption_level:packet_info.encryption_level
+        ~id
+        ~fragment
+        ~is_fin
     | Max_data _ | Max_stream_data _
     | Max_streams (_, _)
     | Data_blocked _ | Stream_data_blocked _
     | Streams_blocked (_, _) ->
-      failwith
-        (Format.asprintf
-           "frame NYI: 0x%x"
-           (Frame.Type.serialize (Frame.to_frame_type frame)))
+      ()
     | New_connection_id { cid; _ } ->
       Format.eprintf
         "new conn? %s@."
@@ -708,16 +778,10 @@ module Connection = struct
       (* Track the latest peer-provided CID for outgoing packets. *)
       t.dest_cid <- cid
     | Retire_connection_id _ ->
-      failwith
-        (Format.asprintf
-           "frame NYI: 0x%x"
-           (Frame.Type.serialize (Frame.to_frame_type frame)))
+      ()
     | Path_challenge buf -> process_path_challenge_frame t buf
     | Path_response _ ->
-      failwith
-        (Format.asprintf
-           "frame NYI: 0x%x"
-           (Frame.Type.serialize (Frame.to_frame_type frame)))
+      ()
     | Connection_close_quic { frame_type; reason_phrase; error_code } ->
       process_connection_close_quic_frame
         t
@@ -728,10 +792,7 @@ module Connection = struct
       process_connection_close_app_frame t ~error_code reason_phrase
     | Handshake_done -> process_handshake_done_frame t
     | Unknown _ ->
-      failwith
-        (Format.asprintf
-           "frame NYI: 0x%x"
-           (Frame.Type.serialize (Frame.to_frame_type frame)))
+      ()
 
   let next_unidirectional_stream_id t ~typ =
     let id = Stream.Type.gen_id ~typ t.next_unidirectional_stream_id in
@@ -776,6 +837,15 @@ module Connection = struct
       ; dest_cid = CID.empty
       ; peer_address
       ; peer_transport_params = Transport_parameters.default
+      ; local_initial_max_data = Int64.of_int default_initial_max_data
+      ; local_initial_max_stream_data_bidi_local =
+          Int64.of_int default_initial_max_stream_data_bidi_local
+      ; local_initial_max_stream_data_bidi_remote =
+          Int64.of_int default_initial_max_stream_data_bidi_remote
+      ; local_initial_max_stream_data_uni =
+          Int64.of_int default_initial_max_stream_data_uni
+      ; recv_data_bytes = 0L
+      ; recv_stream_highest_offsets = Hashtbl.create ~random:true 1024
       ; recovery = Recovery.create ()
       ; queued_packets = Queue.create ()
       ; writer = Writer.create 0x1000
@@ -949,6 +1019,7 @@ type t =
   ; now_ms : unit -> int64
   ; mutable current_peer_address : string option
   ; mutable wakeup_writer : Optional_thunk.t
+  ; mutable writer_wakeup_pending : bool
   ; mutable closed : bool
   ; connection_handler :
       cid:string -> start_stream:start_stream -> stream_handler
@@ -957,7 +1028,9 @@ type t =
 let wakeup_writer t =
   let f = t.wakeup_writer in
   t.wakeup_writer <- Optional_thunk.none;
-  Optional_thunk.call_if_some f
+  if Optional_thunk.is_some f
+  then Optional_thunk.call_if_some f
+  else t.writer_wakeup_pending <- true
 
 let ready_to_write t () = wakeup_writer t
 let shutdown_reader t = Reader.force_close t.reader
@@ -1337,17 +1410,20 @@ let packet_handler t ?error packet =
               ()
             | _other -> ())
           acked_frames;
-        (* This packet has been processed, mark it for acknowledgement. *)
-        let pn_space =
-          Spaces.of_encryption_level
-            c.packet_number_spaces
-            packet_info.encryption_level
-        in
-        Packet_number.insert_for_acking pn_space packet_number;
-        (* packet_info should now contain frames we need to send in response. *)
-        send_packets t ~packet_info;
-        (* Reset for the next packet. *)
-        pn_space.ack_elicited <- false
+        if c.did_send_connection_close
+        then ()
+        else (
+          (* This packet has been processed, mark it for acknowledgement. *)
+          let pn_space =
+            Spaces.of_encryption_level
+              c.packet_number_spaces
+              packet_info.encryption_level
+          in
+          Packet_number.insert_for_acking pn_space packet_number;
+          (* packet_info should now contain frames we need to send in response. *)
+          send_packets t ~packet_info;
+          (* Reset for the next packet. *)
+          pn_space.ack_elicited <- false)
       | Error e ->
         Format.eprintf "discarding malformed packet payload: %s@." e)
     | Retry { header; token; pseudo; tag } ->
@@ -1406,6 +1482,7 @@ let create ~mode ~now_ms ~config connection_handler =
       ; now_ms
       ; current_peer_address = None
       ; wakeup_writer = Optional_thunk.none
+      ; writer_wakeup_pending = false
       ; closed = false
       ; connection_handler
       }
@@ -1450,12 +1527,14 @@ let connect t ~address ~host connection_handler =
           (* ; *)
           Encoding.Initial_source_connection_id src_cid
         ; Active_connection_id_limit 2
-        ; Initial_max_data (1 lsl 27)
-        ; Initial_max_stream_data_bidi_local (1 lsl 27)
-        ; Initial_max_stream_data_bidi_remote (1 lsl 27)
-        ; Initial_max_stream_data_uni (1 lsl 27)
-        ; Initial_max_streams_bidi (1 lsl 8)
-        ; Initial_max_streams_uni (1 lsl 8)
+        ; Initial_max_data default_initial_max_data
+        ; Initial_max_stream_data_bidi_local
+            default_initial_max_stream_data_bidi_local
+        ; Initial_max_stream_data_bidi_remote
+            default_initial_max_stream_data_bidi_remote
+        ; Initial_max_stream_data_uni default_initial_max_stream_data_uni
+        ; Initial_max_streams_bidi default_initial_max_streams_bidi
+        ; Initial_max_streams_uni default_initial_max_streams_uni
         ])
   in
 
@@ -1500,7 +1579,11 @@ let flush_pending_packets t =
   let rec inner t = function
     | Seq.Cons ((connection : Connection.t), xs) ->
       let cid = connection.source_cid in
-      (match Connection._flush_pending_packets connection with
+      (match Writer.next connection.writer with
+      | `Write _ ->
+        Some (connection.writer, connection.peer_address, CID.to_string cid)
+      | `Yield | `Close _ ->
+        (match Connection._flush_pending_packets connection with
       | Wrote_app_data ->
         (* Can't write anything else in this datagram. *)
         Some (connection.writer, connection.peer_address, CID.to_string cid)
@@ -1515,7 +1598,7 @@ let flush_pending_packets t =
         ignore
           (Connection.Streams.flush connection connection.streams
            : Connection.flush_ret);
-        Some (connection.writer, connection.peer_address, CID.to_string cid))
+        Some (connection.writer, connection.peer_address, CID.to_string cid)))
     | Nil -> None
   in
   inner t (Connection.Table.to_seq_values t.connections ())
@@ -1544,6 +1627,10 @@ let yield_writer t k =
   then failwith "on_wakeup_writer on closed conn"
   else if Optional_thunk.is_some t.wakeup_writer
   then failwith "on_wakeup: only one callback can be registered at a time"
+  else if t.writer_wakeup_pending
+  then (
+    t.writer_wakeup_pending <- false;
+    k ())
   else t.wakeup_writer <- Optional_thunk.some k
 
 let yield_reader _t _k = ()
