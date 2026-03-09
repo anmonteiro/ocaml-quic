@@ -311,6 +311,13 @@ module Connection = struct
       shutdown t;
       wakeup_writer t)
 
+  let report_tls_failure t failure =
+    let (_level, alert) = Tls.Engine.alert_of_failure failure in
+    report_error
+      t
+      ~frame_type:Frame.Type.Crypto
+      (Crypto_error (Tls.Packet.alert_type_to_int alert))
+
   let process_reset_stream_frame
         t
         ~stream_id
@@ -405,11 +412,21 @@ module Connection = struct
       else ()
 
   let process_tls_result t ~new_tls_state ~tls_packets =
+    let report_unexpected_tls_message () =
+      report_error
+        t
+        ~frame_type:Frame.Type.Crypto
+        (Crypto_error (Tls.Packet.alert_type_to_int Tls.Packet.UNEXPECTED_MESSAGE))
+    in
     let rec process_packets
               cur_encryption_level
               (packets : Qtls.State.rec_resp list)
       =
       match packets with
+      | (`Change_enc _ :: _ | `Change_dec _ :: _)
+        when cur_encryption_level = Encryption_level.Application_data ->
+        report_unexpected_tls_message ();
+        cur_encryption_level
       | `Change_enc enc :: `Change_dec dec :: xs
       | `Change_dec dec :: `Change_enc enc :: xs ->
         let current_cipher = Qtls.current_cipher new_tls_state in
@@ -529,8 +546,8 @@ module Connection = struct
                t.tls_state
                fragment_cstruct
            with
-          | Error _e ->
-            report_error t ~frame_type:Crypto Internal_error
+          | Error e ->
+            report_tls_failure t e
           | Ok (tls_state', tls_packets, (None | Some _)) ->
             (* TODO: send alerts as quic error *)
             (match tls_packets with
@@ -549,7 +566,7 @@ module Connection = struct
                     Int64.of_int transport_params.max_ack_delay;
                   process_tls_result t ~new_tls_state:tls_state' ~tls_packets
                 | Error e -> report_error t ~frame_type:Crypto e)
-              | None -> ())))
+              | None -> report_error t ~frame_type:Crypto (Crypto_error 0x6d))))
       | Server13
           ( AwaitClientCertificate13 _ | AwaitClientCertificateVerify13 _
           | AwaitClientFinished13 _ ) ->
@@ -557,22 +574,24 @@ module Connection = struct
         then ()
         else
           (match Qtls.handle_raw_record t.tls_state fragment_cstruct with
-          | Error _e ->
-            report_error t ~frame_type:Crypto Internal_error
+          | Error e ->
+            report_tls_failure t e
           | Ok (tls_state', tls_packets, (None | Some _)) ->
             (* TODO: send alerts as quic error *)
             process_tls_result t ~new_tls_state:tls_state' ~tls_packets)
       | Server13 Established13 ->
-        (* TODO: handle key updates *)
-        ()
+        report_error
+          t
+          ~frame_type:Crypto
+          (Crypto_error (Tls.Packet.alert_type_to_int Tls.Packet.UNEXPECTED_MESSAGE))
       | Server Established -> report_error t ~frame_type:Crypto Internal_error
       | Client (AwaitServerHello (_, _, _)) ->
         if encryption_level <> Initial || t.encdec.current <> Initial
         then ()
         else
           (match Qtls.handle_raw_record t.tls_state fragment_cstruct with
-          | Error _e ->
-            report_error t ~frame_type:Crypto Internal_error
+          | Error e ->
+            report_tls_failure t e
           | Ok (tls_state', tls_packets, (None | Some _)) ->
             (* TODO: send alerts as quic error *)
             process_tls_result t ~new_tls_state:tls_state' ~tls_packets)
@@ -585,8 +604,8 @@ module Connection = struct
         then ()
         else
           (match Qtls.handle_raw_record t.tls_state fragment_cstruct with
-          | Error _e ->
-            report_error t ~frame_type:Crypto Internal_error
+          | Error e ->
+            report_tls_failure t e
           | Ok (tls_state', tls_packets, (None | Some _)) ->
             (* TODO: send alerts as quic error *)
             process_tls_result t ~new_tls_state:tls_state' ~tls_packets)
@@ -595,8 +614,8 @@ module Connection = struct
         then ()
         else
           (match Qtls.handle_raw_record t.tls_state fragment_cstruct with
-          | Error _e ->
-            report_error t ~frame_type:Crypto Internal_error
+          | Error e ->
+            report_tls_failure t e
           | Ok (tls_state', tls_packets, (None | Some _)) ->
             process_tls_result t ~new_tls_state:tls_state' ~tls_packets)
       | Client _ | Client13 _ -> ()
