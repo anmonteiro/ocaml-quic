@@ -790,7 +790,15 @@ module Connection = struct
       (* Track the latest peer-provided CID for outgoing packets. *)
       t.dest_cid <- cid
     | Retire_connection_id _ -> ()
-    | Path_challenge buf -> process_path_challenge_frame t buf
+    | Path_challenge buf ->
+      if packet_info.encryption_level <> Application_data
+      then
+        report_error
+          t
+          ~frame_type:Frame.Type.Path_challenge
+          ~encryption_level:packet_info.encryption_level
+          Protocol_violation
+      else process_path_challenge_frame t buf
     | Path_response _ -> ()
     | Connection_close_quic { frame_type; reason_phrase; error_code } ->
       process_connection_close_quic_frame
