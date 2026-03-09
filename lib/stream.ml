@@ -323,10 +323,10 @@ module Send = struct
       let writev_len = if max_bytes < lengthv then max_bytes else lengthv in
       List.iter
         (fun { IOVec.buffer; off; len } ->
-          (* XXX(anmonteiro): we might have to copy here since we're shifting
-             below. *)
-          let fragment = Bigstringaf.sub buffer ~off ~len in
-          ignore (push fragment t : Frame.fragment))
+           (* XXX(anmonteiro): we might have to copy here since we're shifting
+              below. *)
+           let fragment = Bigstringaf.sub buffer ~off ~len in
+           ignore (push fragment t : Frame.fragment))
         iovecs;
       Faraday.shift faraday writev_len;
       writev_len
@@ -345,16 +345,18 @@ type t =
   ; typ : Type.t
   ; id : int64
   ; mutable error_handler : int -> unit
+  ; report_application_error : int -> unit
   }
 
 let default_error_handler _ = ()
 
-let create ~typ ~id when_ready =
+let create ~typ ~id ~report_application_error when_ready =
   { send = Send.create when_ready
   ; recv = Recv.create ()
   ; typ
   ; id
   ; error_handler = default_error_handler
+  ; report_application_error
   }
 
 (* These are not consumed by the application, so the `recv` consumer starts out
@@ -366,6 +368,7 @@ let create_crypto () =
   ; typ = Server Bidirectional
   ; id = -1L
   ; error_handler = default_error_handler
+  ; report_application_error = default_error_handler
   }
 
 let id { id; _ } = id
@@ -395,3 +398,5 @@ let close_reader t = Buffer.close_reader t.recv.consumer
 
 let is_closed t =
   Buffer.is_closed t.recv.consumer && Buffer.is_closed t.send.producer
+
+let report_application_error t code = t.report_application_error code

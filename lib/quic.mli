@@ -101,6 +101,7 @@ module Stream : sig
   val close_reader : t -> unit
   val close_writer : t -> unit
   val is_closed : t -> bool
+  val report_application_error : t -> int -> unit
   val unsafe_faraday : t -> Faraday.t
 end
 

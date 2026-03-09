@@ -306,6 +306,17 @@ module Connection = struct
       shutdown t;
       wakeup_writer t)
 
+  let report_application_error t error_code =
+    if not t.did_send_connection_close
+    then (
+      Queue.clear t.queued_packets;
+      send_frames
+        t
+        [ Frame.Connection_close_app { reason_phrase = ""; error_code } ];
+      t.did_send_connection_close <- true;
+      shutdown t;
+      wakeup_writer t)
+
   let report_tls_failure t failure =
     let _level, alert = Tls.Engine.alert_of_failure failure in
     report_error
@@ -531,7 +542,7 @@ module Connection = struct
       let fragment_cstruct = Bigstringaf.to_string buffer in
       (match t.tls_state.handshake.machina with
       | Server Tls.State.AwaitClientHello | Server13 AwaitClientHelloHRR13 ->
-        if encryption_level <> Initial || t.encdec.current <> Initial
+        if encryption_level <> Initial
         then ()
         else (
           match
@@ -605,7 +616,7 @@ module Connection = struct
              (Tls.Packet.alert_type_to_int Tls.Packet.UNEXPECTED_MESSAGE))
       | Server Established -> report_error t ~frame_type:Crypto Internal_error
       | Client (AwaitServerHello (_, _, _)) ->
-        if encryption_level <> Initial || t.encdec.current <> Initial
+        if encryption_level <> Initial
         then ()
         else (
           match Qtls.handle_raw_record t.tls_state fragment_cstruct with
@@ -618,7 +629,7 @@ module Connection = struct
           | AwaitServerCertificateRequestOrCertificate13 _
           | AwaitServerCertificate13 _ | AwaitServerCertificateVerify13 _
           | AwaitServerFinished13 _ ) ->
-        if encryption_level <> Handshake || t.encdec.current <> Handshake
+        if encryption_level <> Handshake
         then ()
         else (
           match Qtls.handle_raw_record t.tls_state fragment_cstruct with
@@ -627,7 +638,7 @@ module Connection = struct
             (* TODO: send alerts as quic error *)
             process_tls_result t ~new_tls_state:tls_state' ~tls_packets)
       | Client13 (AwaitServerHello13 _) ->
-        if encryption_level <> Initial || t.encdec.current <> Initial
+        if encryption_level <> Initial
         then ()
         else (
           match Qtls.handle_raw_record t.tls_state fragment_cstruct with
@@ -656,7 +667,13 @@ module Connection = struct
     | None -> ()
 
   let create_stream (c : t) ~typ ~id =
-    let stream = Stream.create ~typ ~id c.wakeup_writer in
+    let stream =
+      Stream.create
+        ~typ
+        ~id
+        ~report_application_error:(report_application_error c)
+        c.wakeup_writer
+    in
     Hashtbl.add c.streams id stream;
     stream
 
