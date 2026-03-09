@@ -596,13 +596,21 @@ module Connection = struct
     let stream_frame_type =
       Frame.to_frame_type (Frame.Stream { id; fragment; is_fin })
     in
+    let direction = Direction.classify id in
     let is_locally_initiated =
       match c.mode with
       | Server -> Stream_id.is_server_initiated id
       | Client -> Stream_id.is_client_initiated id
     in
+    let is_peer_initiated = not is_locally_initiated in
+    let stream_count = Int64.add (Int64.shift_right_logical id 2) 1L in
+    let max_peer_streams =
+      match direction with
+      | Bidirectional -> Int64.of_int default_initial_max_streams_bidi
+      | Unidirectional -> Int64.of_int default_initial_max_streams_uni
+    in
     let recv_window =
-      match Direction.classify id with
+      match direction with
       | Unidirectional ->
         if is_locally_initiated
         then None
@@ -615,62 +623,72 @@ module Connection = struct
     let stream_final_offset =
       Int64.add (Int64.of_int fragment.IOVec.off) (Int64.of_int fragment.len)
     in
-    match recv_window with
-    | None ->
+    if is_peer_initiated && Int64.compare stream_count max_peer_streams > 0
+    then
       report_error
         c
         ~frame_type:stream_frame_type
         ~encryption_level
-        Stream_state_error
-    | Some recv_window ->
-      if Int64.compare stream_final_offset recv_window > 0
-      then
+        Stream_limit_error
+    else
+      match recv_window with
+      | None ->
         report_error
           c
           ~frame_type:stream_frame_type
           ~encryption_level
-          Flow_control_error
-      else
-        let prev_stream_highest =
-          Hashtbl.find_opt c.recv_stream_highest_offsets id
-          |> Option.value ~default:0L
-        in
-        let new_stream_highest =
-          Int64.max prev_stream_highest stream_final_offset
-        in
-        let connection_bytes_delta =
-          Int64.sub new_stream_highest prev_stream_highest
-        in
-        let next_recv_data_bytes =
-          Int64.add c.recv_data_bytes connection_bytes_delta
-        in
-        if Int64.compare next_recv_data_bytes c.local_initial_max_data > 0
+          Stream_state_error
+      | Some recv_window ->
+        if Int64.compare stream_final_offset recv_window > 0
         then
           report_error
             c
             ~frame_type:stream_frame_type
             ~encryption_level
             Flow_control_error
-        else (
-          c.recv_data_bytes <- next_recv_data_bytes;
-          Hashtbl.replace c.recv_stream_highest_offsets id new_stream_highest;
-          let stream =
-            match Hashtbl.find_opt c.streams id with
-            | Some stream -> stream
-            | None ->
-              let stream = create_stream c ~typ:(Stream.Type.classify id) ~id in
-              let error_handler =
-                invoke_handler
-                  c
-                  ~cid:(CID.to_string c.source_cid)
-                  ~start_stream:c.start_stream
-                  stream
-              in
-              stream.error_handler <- error_handler.on_error;
-              stream
+        else
+          let prev_stream_highest =
+            Hashtbl.find_opt c.recv_stream_highest_offsets id
+            |> Option.value ~default:0L
           in
-          Stream.Recv.push fragment ~is_fin stream.recv;
-          process_stream_data c ~stream:stream.recv)
+          let new_stream_highest =
+            Int64.max prev_stream_highest stream_final_offset
+          in
+          let connection_bytes_delta =
+            Int64.sub new_stream_highest prev_stream_highest
+          in
+          let next_recv_data_bytes =
+            Int64.add c.recv_data_bytes connection_bytes_delta
+          in
+          if Int64.compare next_recv_data_bytes c.local_initial_max_data > 0
+          then
+            report_error
+              c
+              ~frame_type:stream_frame_type
+              ~encryption_level
+              Flow_control_error
+          else (
+            c.recv_data_bytes <- next_recv_data_bytes;
+            Hashtbl.replace c.recv_stream_highest_offsets id new_stream_highest;
+            let stream =
+              match Hashtbl.find_opt c.streams id with
+              | Some stream -> stream
+              | None ->
+                let stream =
+                  create_stream c ~typ:(Stream.Type.classify id) ~id
+                in
+                let error_handler =
+                  invoke_handler
+                    c
+                    ~cid:(CID.to_string c.source_cid)
+                    ~start_stream:c.start_stream
+                    stream
+                in
+                stream.error_handler <- error_handler.on_error;
+                stream
+            in
+            Stream.Recv.push fragment ~is_fin stream.recv;
+            process_stream_data c ~stream:stream.recv)
 
   (* TODO: closing/ draining states, section 10.2 *)
   let process_connection_close_quic_frame
