@@ -31,9 +31,21 @@
  *---------------------------------------------------------------------------*)
 
 module Config : sig
+  type transport_parameters =
+    { initial_max_data : int
+    ; initial_max_stream_data_bidi_local : int
+    ; initial_max_stream_data_bidi_remote : int
+    ; initial_max_stream_data_uni : int
+    ; initial_max_streams_bidi : int
+    ; initial_max_streams_uni : int
+    }
+
+  val default_transport_parameters : transport_parameters
+
   type t =
     { certificates : Tls.Config.own_cert
     ; alpn_protocols : string list
+    ; transport_parameters : transport_parameters
     }
 end
 

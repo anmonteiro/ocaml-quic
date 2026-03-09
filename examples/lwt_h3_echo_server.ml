@@ -45,7 +45,10 @@ let () =
     `Single (Qx509.private_of_pems ~cert ~priv_key)
   in
   let config =
-    { Quic.Config.certificates; alpn_protocols = [ "h3"; "h3-30"; "h3-29" ] }
+    { Quic.Config.certificates
+    ; alpn_protocols = [ "h3"; "h3-30"; "h3-29" ]
+    ; transport_parameters = Quic.Config.default_transport_parameters
+    }
   in
   Lwt.async (fun () ->
     Quic_lwt.Server.establish_server ~config listen_address connection_handler

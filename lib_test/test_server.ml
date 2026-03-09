@@ -113,6 +113,7 @@ let test_initial () =
     let config =
       { Quic.Config.certificates = server_certificates ()
       ; alpn_protocols = [ "h3" ]
+      ; transport_parameters = Quic.Config.default_transport_parameters
       }
     in
     Transport.Server.create

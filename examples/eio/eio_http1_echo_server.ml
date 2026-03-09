@@ -26,7 +26,12 @@ let () =
     let priv_key = "./certificates/server.key" in
     `Single (Qx509.private_of_pems ~cert ~priv_key)
   in
-  let config = { Quic.Config.certificates; alpn_protocols = [ "http/0.9" ] } in
+  let config =
+    { Quic.Config.certificates
+    ; alpn_protocols = [ "http/0.9" ]
+    ; transport_parameters = Quic.Config.default_transport_parameters
+    }
+  in
   Eio_main.run (fun env ->
     Eio.Switch.run (fun sw ->
       (* let forever, _ = Eio.Promise.create () in *)

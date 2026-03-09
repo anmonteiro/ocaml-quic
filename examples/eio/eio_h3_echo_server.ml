@@ -58,7 +58,22 @@ let () =
     let priv_key = "./certificates/server.key" in
     `Single (Qx509.private_of_pems ~cert ~priv_key)
   in
-  let config = { Quic.Config.certificates; alpn_protocols = [ "h3" ] } in
+  let transport_parameters =
+    Quic.Config.
+      { initial_max_data = 1 lsl 26
+      ; initial_max_stream_data_bidi_local = 1 lsl 26
+      ; initial_max_stream_data_bidi_remote = 1 lsl 26
+      ; initial_max_stream_data_uni = 1 lsl 26
+      ; initial_max_streams_bidi = 1 lsl 8
+      ; initial_max_streams_uni = 1 lsl 8
+      }
+  in
+  let config =
+    { Quic.Config.certificates
+    ; alpn_protocols = [ "h3" ]
+    ; transport_parameters
+    }
+  in
   let rng = Random.State.make [| !drop_seed |] in
   let should_drop ~direction ~packet_kind ~seq_no ~len =
     let pct =

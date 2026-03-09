@@ -85,13 +85,6 @@ type on_error_handler = { on_error : error_handler }
 type start_stream = ?error_handler:error_handler -> Direction.t -> Stream.t
 type stream_handler = F of (Stream.t -> on_error_handler)
 
-let default_initial_max_data = 1 lsl 26
-let default_initial_max_stream_data_bidi_local = 1 lsl 26
-let default_initial_max_stream_data_bidi_remote = 1 lsl 26
-let default_initial_max_stream_data_uni = 1 lsl 26
-let default_initial_max_streams_bidi = 1 lsl 8
-let default_initial_max_streams_uni = 1 lsl 8
-
 module Connection = struct
   type handler =
     | Uninitialized of
@@ -118,6 +111,8 @@ module Connection = struct
     ; local_initial_max_stream_data_bidi_local : int64
     ; local_initial_max_stream_data_bidi_remote : int64
     ; local_initial_max_stream_data_uni : int64
+    ; local_initial_max_streams_bidi : int64
+    ; local_initial_max_streams_uni : int64
     ; mutable recv_data_bytes : int64
     ; recv_stream_highest_offsets : (Stream_id.t, int64) Hashtbl.t
     ; recovery : Recovery.t
@@ -466,38 +461,38 @@ module Connection = struct
       | Server Tls.State.AwaitClientHello | Server13 AwaitClientHelloHRR13 ->
         if encryption_level <> Initial || t.encdec.current <> Initial
         then ()
-        else
-          (match
-             Qtls.handle_raw_record
-               ~embed_quic_transport_params:(fun _raw_transport_params ->
-                 (* From RFC9000§7.3:
-                  *   When the handshake does not include a Retry (Figure 6), the
-                  *   server sets original_destination_connection_id to S1 and
-                  *   initial_source_connection_id to S3. In this case, the server
-                  *   does not include a retry_source_connection_id transport
-                  *   parameter. *)
-                 Some
-                   Transport_parameters.(
-                     encode
-                       [ Encoding.Original_destination_connection_id
-                           t.original_dest_cid
-                       ; Initial_source_connection_id t.source_cid
-                       ; (* TODO: get these from configuration *)
-                         Initial_max_data default_initial_max_data
-                       ; Initial_max_stream_data_bidi_local
-                           default_initial_max_stream_data_bidi_local
-                       ; Initial_max_stream_data_bidi_remote
-                           default_initial_max_stream_data_bidi_remote
-                       ; Initial_max_stream_data_uni
-                           default_initial_max_stream_data_uni
-                       ; Initial_max_streams_bidi default_initial_max_streams_bidi
-                       ; Initial_max_streams_uni default_initial_max_streams_uni
-                       ]))
-               t.tls_state
-               fragment_cstruct
-           with
-          | Error _e ->
-            report_error t ~frame_type:Crypto Internal_error
+        else (
+          match
+            Qtls.handle_raw_record
+              ~embed_quic_transport_params:(fun _raw_transport_params ->
+                (* From RFC9000§7.3:
+                 *   When the handshake does not include a Retry (Figure 6), the
+                 *   server sets original_destination_connection_id to S1 and
+                 *   initial_source_connection_id to S3. In this case, the server
+                 *   does not include a retry_source_connection_id transport
+                 *   parameter. *)
+                Some
+                  Transport_parameters.(
+                    encode
+                      [ Encoding.Original_destination_connection_id
+                          t.original_dest_cid
+                      ; Initial_source_connection_id t.source_cid
+                      ; Initial_max_data (Int64.to_int t.local_initial_max_data)
+                      ; Initial_max_stream_data_bidi_local
+                          (Int64.to_int t.local_initial_max_stream_data_bidi_local)
+                      ; Initial_max_stream_data_bidi_remote
+                          (Int64.to_int t.local_initial_max_stream_data_bidi_remote)
+                      ; Initial_max_stream_data_uni
+                          (Int64.to_int t.local_initial_max_stream_data_uni)
+                      ; Initial_max_streams_bidi
+                          (Int64.to_int t.local_initial_max_streams_bidi)
+                      ; Initial_max_streams_uni
+                          (Int64.to_int t.local_initial_max_streams_uni)
+                      ]))
+              t.tls_state
+              fragment_cstruct
+          with
+          | Error _e -> report_error t ~frame_type:Crypto Internal_error
           | Ok (tls_state', tls_packets, (None | Some _)) ->
             (* TODO: send alerts as quic error *)
             (match tls_packets with
@@ -522,10 +517,9 @@ module Connection = struct
           | AwaitClientFinished13 _ ) ->
         if encryption_level <> Handshake
         then ()
-        else
-          (match Qtls.handle_raw_record t.tls_state fragment_cstruct with
-          | Error _e ->
-            report_error t ~frame_type:Crypto Internal_error
+        else (
+          match Qtls.handle_raw_record t.tls_state fragment_cstruct with
+          | Error _e -> report_error t ~frame_type:Crypto Internal_error
           | Ok (tls_state', tls_packets, (None | Some _)) ->
             (* TODO: send alerts as quic error *)
             process_tls_result t ~new_tls_state:tls_state' ~tls_packets)
@@ -536,10 +530,9 @@ module Connection = struct
       | Client (AwaitServerHello (_, _, _)) ->
         if encryption_level <> Initial || t.encdec.current <> Initial
         then ()
-        else
-          (match Qtls.handle_raw_record t.tls_state fragment_cstruct with
-          | Error _e ->
-            report_error t ~frame_type:Crypto Internal_error
+        else (
+          match Qtls.handle_raw_record t.tls_state fragment_cstruct with
+          | Error _e -> report_error t ~frame_type:Crypto Internal_error
           | Ok (tls_state', tls_packets, (None | Some _)) ->
             (* TODO: send alerts as quic error *)
             process_tls_result t ~new_tls_state:tls_state' ~tls_packets)
@@ -550,20 +543,18 @@ module Connection = struct
           | AwaitServerFinished13 _ ) ->
         if encryption_level <> Handshake || t.encdec.current <> Handshake
         then ()
-        else
-          (match Qtls.handle_raw_record t.tls_state fragment_cstruct with
-          | Error _e ->
-            report_error t ~frame_type:Crypto Internal_error
+        else (
+          match Qtls.handle_raw_record t.tls_state fragment_cstruct with
+          | Error _e -> report_error t ~frame_type:Crypto Internal_error
           | Ok (tls_state', tls_packets, (None | Some _)) ->
             (* TODO: send alerts as quic error *)
             process_tls_result t ~new_tls_state:tls_state' ~tls_packets)
       | Client13 (AwaitServerHello13 _) ->
         if encryption_level <> Initial || t.encdec.current <> Initial
         then ()
-        else
-          (match Qtls.handle_raw_record t.tls_state fragment_cstruct with
-          | Error _e ->
-            report_error t ~frame_type:Crypto Internal_error
+        else (
+          match Qtls.handle_raw_record t.tls_state fragment_cstruct with
+          | Error _e -> report_error t ~frame_type:Crypto Internal_error
           | Ok (tls_state', tls_packets, (None | Some _)) ->
             process_tls_result t ~new_tls_state:tls_state' ~tls_packets)
       | Client _ | Client13 _ -> ()
@@ -593,7 +584,9 @@ module Connection = struct
     stream
 
   let process_stream_frame c ~encryption_level ~id ~fragment ~is_fin =
-    let stream_frame_type = Frame.to_frame_type (Frame.Stream { id; fragment; is_fin }) in
+    let stream_frame_type =
+      Frame.to_frame_type (Frame.Stream { id; fragment; is_fin })
+    in
     let is_locally_initiated =
       match c.mode with
       | Server -> Stream_id.is_server_initiated id
@@ -628,12 +621,14 @@ module Connection = struct
           ~frame_type:stream_frame_type
           ~encryption_level
           Flow_control_error
-      else (
+      else
         let prev_stream_highest =
           Hashtbl.find_opt c.recv_stream_highest_offsets id
           |> Option.value ~default:0L
         in
-        let new_stream_highest = Int64.max prev_stream_highest stream_final_offset in
+        let new_stream_highest =
+          Int64.max prev_stream_highest stream_final_offset
+        in
         let connection_bytes_delta =
           Int64.sub new_stream_highest prev_stream_highest
         in
@@ -649,10 +644,7 @@ module Connection = struct
             Flow_control_error
         else (
           c.recv_data_bytes <- next_recv_data_bytes;
-          Hashtbl.replace
-            c.recv_stream_highest_offsets
-            id
-            new_stream_highest;
+          Hashtbl.replace c.recv_stream_highest_offsets id new_stream_highest;
           let stream =
             match Hashtbl.find_opt c.streams id with
             | Some stream -> stream
@@ -669,7 +661,7 @@ module Connection = struct
               stream
           in
           Stream.Recv.push fragment ~is_fin stream.recv;
-          process_stream_data c ~stream:stream.recv))
+          process_stream_data c ~stream:stream.recv)
 
   (* TODO: closing/ draining states, section 10.2 *)
   let process_connection_close_quic_frame
@@ -777,11 +769,9 @@ module Connection = struct
          x);
       (* Track the latest peer-provided CID for outgoing packets. *)
       t.dest_cid <- cid
-    | Retire_connection_id _ ->
-      ()
+    | Retire_connection_id _ -> ()
     | Path_challenge buf -> process_path_challenge_frame t buf
-    | Path_response _ ->
-      ()
+    | Path_response _ -> ()
     | Connection_close_quic { frame_type; reason_phrase; error_code } ->
       process_connection_close_quic_frame
         t
@@ -791,8 +781,7 @@ module Connection = struct
     | Connection_close_app { reason_phrase; error_code } ->
       process_connection_close_app_frame t ~error_code reason_phrase
     | Handshake_done -> process_handshake_done_frame t
-    | Unknown _ ->
-      ()
+    | Unknown _ -> ()
 
   let next_unidirectional_stream_id t ~typ =
     let id = Stream.Type.gen_id ~typ t.next_unidirectional_stream_id in
@@ -813,6 +802,7 @@ module Connection = struct
         ~mode
         ~peer_address
         ~tls_state
+        ~transport_parameters
         ~now_ms
         ~wakeup_writer
         ~shutdown
@@ -837,13 +827,20 @@ module Connection = struct
       ; dest_cid = CID.empty
       ; peer_address
       ; peer_transport_params = Transport_parameters.default
-      ; local_initial_max_data = Int64.of_int default_initial_max_data
+      ; local_initial_max_data =
+          Int64.of_int transport_parameters.Config.initial_max_data
       ; local_initial_max_stream_data_bidi_local =
-          Int64.of_int default_initial_max_stream_data_bidi_local
+          Int64.of_int
+            transport_parameters.Config.initial_max_stream_data_bidi_local
       ; local_initial_max_stream_data_bidi_remote =
-          Int64.of_int default_initial_max_stream_data_bidi_remote
+          Int64.of_int
+            transport_parameters.Config.initial_max_stream_data_bidi_remote
       ; local_initial_max_stream_data_uni =
-          Int64.of_int default_initial_max_stream_data_uni
+          Int64.of_int transport_parameters.Config.initial_max_stream_data_uni
+      ; local_initial_max_streams_bidi =
+          Int64.of_int transport_parameters.Config.initial_max_streams_bidi
+      ; local_initial_max_streams_uni =
+          Int64.of_int transport_parameters.Config.initial_max_streams_uni
       ; recv_data_bytes = 0L
       ; recv_stream_highest_offsets = Hashtbl.create ~random:true 1024
       ; recovery = Recovery.create ()
@@ -1093,7 +1090,7 @@ let on_timeout t =
                 if
                   !remaining_probes > 0
                   && Encryption_level.mem encryption_level connection.encdec
-                then (
+                then
                   let candidates =
                     Recovery.drain_lost connection.recovery ~encryption_level
                     @ Recovery.pto_probe_packets
@@ -1108,7 +1105,7 @@ let on_timeout t =
                          decr remaining_probes;
                          retransmissions_rev :=
                            (encryption_level, frames) :: !retransmissions_rev))
-                    candidates))
+                    candidates)
              [ Initial; Handshake; Application_data ];
            match List.rev !retransmissions_rev with
            | [] ->
@@ -1192,6 +1189,7 @@ let create_new_connection
       ~mode:t.mode
       ~peer_address
       ~tls_state
+      ~transport_parameters:t.config.transport_parameters
       ~now_ms:t.now_ms
       ~wakeup_writer:(ready_to_write t)
       ~shutdown:(on_close t)
@@ -1289,7 +1287,7 @@ let packet_handler t ?error packet =
     | None ->
       (* Has to be a new connection. TODO: assert that. *)
       assert (t.mode = Server);
-      let { Config.certificates; alpn_protocols } = t.config in
+      let { Config.certificates; alpn_protocols; _ } = t.config in
 
       let encdec =
         { Crypto.encrypter = Crypto.InitialAEAD.make ~mode:t.mode connection_id
@@ -1312,122 +1310,123 @@ let packet_handler t ?error packet =
             ~connection_handler:t.connection_handler
             ~encdec
         in
-        (* Keep routing the client's original DCID until it switches to our SCID. *)
+        (* Keep routing the client's original DCID until it switches to our
+           SCID. *)
         register_connection_id t ~cid:connection_id ~connection;
         Some connection)
   in
   match c_opt with
-  | None ->
-    ()
+  | None -> ()
   | Some c ->
     (match error with
     | Some error -> Connection.report_error c error
     | None ->
-    if CID.is_empty c.original_dest_cid
-    then
-      (* From RFC9000§7.3:
-       *   Each endpoint includes the value of the Source Connection ID field
-       *   from the first Initial packet it sent in the
-       *   initial_source_connection_id transport parameter; see Section 18.2. A
-       *   server includes the Destination Connection ID field from the first
-       *   Initial packet it received from the client in the
-       *   original_destination_connection_id transport parameter [...]. *)
-      c.original_dest_cid <- Packet.destination_cid packet;
+      if CID.is_empty c.original_dest_cid
+      then
+        (* From RFC9000§7.3:
+         *   Each endpoint includes the value of the Source Connection ID field
+         *   from the first Initial packet it sent in the
+         *   initial_source_connection_id transport parameter; see Section 18.2. A
+         *   server includes the Destination Connection ID field from the first
+         *   Initial packet it received from the client in the
+         *   original_destination_connection_id transport parameter [...]. *)
+        c.original_dest_cid <- Packet.destination_cid packet;
 
-    (match packet with
-    | Packet.VersionNegotiation _ -> ()
-    | Frames { header; payload; packet_number; _ } ->
-      let encryption_level = Encryption_level.of_header header in
+      (match packet with
+      | Packet.VersionNegotiation _ -> ()
+      | Frames { header; payload; packet_number; _ } ->
+        let encryption_level = Encryption_level.of_header header in
 
-      (* (match encryption_level with *)
-      (* | Initial -> *)
-      (* c.packet_number_spaces.initial.received <- *)
-      (* Int64.max c.packet_number_spaces.initial.received packet_number *)
-      (* | Handshake -> *)
-      (* c.packet_number_spaces.handshake.received <- *)
-      (* Int64.max c.packet_number_spaces.handshake.received packet_number *)
-      (* | Application_data | Zero_RTT -> *)
-      (* c.packet_number_spaces.application_data.received <- *)
-      (* Int64.max c.packet_number_spaces.application_data.received
+        (* (match encryption_level with *)
+        (* | Initial -> *)
+        (* c.packet_number_spaces.initial.received <- *)
+        (* Int64.max c.packet_number_spaces.initial.received packet_number *)
+        (* | Handshake -> *)
+        (* c.packet_number_spaces.handshake.received <- *)
+        (* Int64.max c.packet_number_spaces.handshake.received packet_number *)
+        (* | Application_data | Zero_RTT -> *)
+        (* c.packet_number_spaces.application_data.received <- *)
+        (* Int64.max c.packet_number_spaces.application_data.received
          packet_number); *)
-      let pn_space =
-        Spaces.of_encryption_level c.packet_number_spaces encryption_level
-      in
-      pn_space.received <- Int64.max pn_space.received packet_number;
-
-      (match Packet.source_cid packet with
-      | Some src_cid ->
-        (* From RFC9000§19.6:
-         *   Upon receiving a packet, each endpoint sets the Destination Connection
-         *   ID it sends to match the value of the Source Connection ID that it
-         *   receives. *)
-        c.dest_cid <- src_cid
-      | None ->
-        (* TODO: short packets will fail here? *)
-        assert (
-          match packet with
-          | Frames { header = Packet.Header.Short _; _ } -> true
-          | _ -> false));
-
-      let packet_info =
-        { header
-        ; encryption_level
-        ; packet_number
-        ; outgoing_frames = create_outgoing_frames ~current:c.encdec.current
-        ; connection = c
-        }
-      in
-
-      (match
-         Angstrom.parse_bigstring
-           ~consume:All
-           (Parse.Frame.parser (Connection.frame_handler c ~packet_info))
-           payload
-       with
-      | Ok _frames ->
-        (* process streams for packets that have been acknowledged. *)
-        let acked_frames =
-          Recovery.drain_acknowledged
-            c.recovery
-            ~encryption_level:packet_info.encryption_level
+        let pn_space =
+          Spaces.of_encryption_level c.packet_number_spaces encryption_level
         in
-        List.iter
-          (function
-            | Frame.Crypto { IOVec.off; _ } ->
-              let crypto_stream =
-                Spaces.of_encryption_level
-                  c.crypto_streams
-                  packet_info.encryption_level
-              in
-              Stream.Send.remove off crypto_stream.send
-            | Stream { id; fragment = { IOVec.off; _ }; _ } ->
-              (match Hashtbl.find_opt c.streams id with
-              | Some stream -> Stream.Send.remove off stream.send
-              | None -> ())
-            | Ack { ranges = _; _ } ->
-              (* TODO: when we track packets that need acknowledgement, update
-                 the largest acknowledged here. *)
-              ()
-            | _other -> ())
-          acked_frames;
-        if c.did_send_connection_close
-        then ()
-        else (
-          (* This packet has been processed, mark it for acknowledgement. *)
-          let pn_space =
-            Spaces.of_encryption_level
-              c.packet_number_spaces
-              packet_info.encryption_level
+        pn_space.received <- Int64.max pn_space.received packet_number;
+
+        (match Packet.source_cid packet with
+        | Some src_cid ->
+          (* From RFC9000§19.6:
+           *   Upon receiving a packet, each endpoint sets the Destination Connection
+           *   ID it sends to match the value of the Source Connection ID that it
+           *   receives. *)
+          c.dest_cid <- src_cid
+        | None ->
+          (* TODO: short packets will fail here? *)
+          assert (
+            match packet with
+            | Frames { header = Packet.Header.Short _; _ } -> true
+            | _ -> false));
+
+        let packet_info =
+          { header
+          ; encryption_level
+          ; packet_number
+          ; outgoing_frames = create_outgoing_frames ~current:c.encdec.current
+          ; connection = c
+          }
+        in
+
+        (match
+           Angstrom.parse_bigstring
+             ~consume:All
+             (Parse.Frame.parser (Connection.frame_handler c ~packet_info))
+             payload
+         with
+        | Ok _frames ->
+          (* process streams for packets that have been acknowledged. *)
+          let acked_frames =
+            Recovery.drain_acknowledged
+              c.recovery
+              ~encryption_level:packet_info.encryption_level
           in
-          Packet_number.insert_for_acking pn_space packet_number;
-          (* packet_info should now contain frames we need to send in response. *)
-          send_packets t ~packet_info;
-          (* Reset for the next packet. *)
-          pn_space.ack_elicited <- false)
-      | Error e ->
-        Format.eprintf "discarding malformed packet payload: %s@." e)
-    | Retry { header; token; pseudo; tag } ->
-      process_retry_packet t c ~header ~token ~pseudo ~tag))
+          List.iter
+            (function
+              | Frame.Crypto { IOVec.off; _ } ->
+                let crypto_stream =
+                  Spaces.of_encryption_level
+                    c.crypto_streams
+                    packet_info.encryption_level
+                in
+                Stream.Send.remove off crypto_stream.send
+              | Stream { id; fragment = { IOVec.off; _ }; _ } ->
+                (match Hashtbl.find_opt c.streams id with
+                | Some stream -> Stream.Send.remove off stream.send
+                | None -> ())
+              | Ack { ranges = _; _ } ->
+                (* TODO: when we track packets that need acknowledgement, update
+                   the largest acknowledged here. *)
+                ()
+              | _other -> ())
+            acked_frames;
+          if c.did_send_connection_close
+          then ()
+          else
+            (* This packet has been processed, mark it for acknowledgement. *)
+            let pn_space =
+              Spaces.of_encryption_level
+                c.packet_number_spaces
+                packet_info.encryption_level
+            in
+            Packet_number.insert_for_acking pn_space packet_number;
+            (* packet_info should now contain frames we need to send in
+               response. *)
+            send_packets t ~packet_info;
+            (* Reset for the next packet. *)
+            pn_space.ack_elicited <- false
+        | Error e ->
+          Format.eprintf "discarding malformed packet payload: %s@." e)
+      | Retry { header; token; pseudo; tag } ->
+        process_retry_packet t c ~header ~token ~pseudo ~tag))
 
 let create ~mode ~now_ms ~config connection_handler =
   let rec reader_packet_handler t ?error packet =
@@ -1437,8 +1436,7 @@ let create ~mode ~now_ms ~config connection_handler =
     let cs = Bigstringaf.substring ~off ~len bs in
     let connection_id = Packet.Header.destination_cid header in
     if CID.is_empty connection_id
-    then
-      None
+    then None
     else
       let decrypter_and_largest_pn =
         match Connection.Table.find_opt t.connections connection_id with
@@ -1466,8 +1464,7 @@ let create ~mode ~now_ms ~config connection_handler =
                   ~mode:(Crypto.Mode.peer t.mode)
                   connection_id
               , -1L )
-          else
-            None
+          else None
       in
       match decrypter_and_largest_pn with
       | Some (decrypter, largest_pn) ->
@@ -1500,7 +1497,7 @@ module Client = struct
 end
 
 let connect t ~address ~host connection_handler =
-  let { Config.alpn_protocols; _ } = t.config in
+  let { Config.alpn_protocols; transport_parameters; _ } = t.config in
   let dest_cid = CID.generate () in
   let src_cid = CID.generate () in
   let encdec =
@@ -1527,14 +1524,15 @@ let connect t ~address ~host connection_handler =
           (* ; *)
           Encoding.Initial_source_connection_id src_cid
         ; Active_connection_id_limit 2
-        ; Initial_max_data default_initial_max_data
+        ; Initial_max_data transport_parameters.Config.initial_max_data
         ; Initial_max_stream_data_bidi_local
-            default_initial_max_stream_data_bidi_local
+            transport_parameters.Config.initial_max_stream_data_bidi_local
         ; Initial_max_stream_data_bidi_remote
-            default_initial_max_stream_data_bidi_remote
-        ; Initial_max_stream_data_uni default_initial_max_stream_data_uni
-        ; Initial_max_streams_bidi default_initial_max_streams_bidi
-        ; Initial_max_streams_uni default_initial_max_streams_uni
+            transport_parameters.Config.initial_max_stream_data_bidi_remote
+        ; Initial_max_stream_data_uni
+            transport_parameters.Config.initial_max_stream_data_uni
+        ; Initial_max_streams_bidi transport_parameters.Config.initial_max_streams_bidi
+        ; Initial_max_streams_uni transport_parameters.Config.initial_max_streams_uni
         ])
   in
 
@@ -1567,13 +1565,11 @@ let report_exn _t exn =
   if String.length bt_s = 0
   then
     Format.eprintf
-      "transport exception: %s (no backtrace captured; run with OCAMLRUNPARAM=b)@."
+      "transport exception: %s (no backtrace captured; run with \
+       OCAMLRUNPARAM=b)@."
       (Printexc.to_string exn)
   else
-    Format.eprintf
-      "transport exception: %s@.%s@."
-      (Printexc.to_string exn)
-      bt_s
+    Format.eprintf "transport exception: %s@.%s@." (Printexc.to_string exn) bt_s
 
 let flush_pending_packets t =
   let rec inner t = function
@@ -1584,21 +1580,21 @@ let flush_pending_packets t =
         Some (connection.writer, connection.peer_address, CID.to_string cid)
       | `Yield | `Close _ ->
         (match Connection._flush_pending_packets connection with
-      | Wrote_app_data ->
-        (* Can't write anything else in this datagram. *)
-        Some (connection.writer, connection.peer_address, CID.to_string cid)
-      | Didnt_write ->
-        (match Connection.Streams.flush connection connection.streams with
-        | Wrote | Wrote_app_data ->
+        | Wrote_app_data ->
+          (* Can't write anything else in this datagram. *)
           Some (connection.writer, connection.peer_address, CID.to_string cid)
-        | _ -> inner t (xs ()))
-      | Wrote ->
-        (* There might be space in this datagram for some application data
-         * frames. Send them. *)
-        ignore
-          (Connection.Streams.flush connection connection.streams
-           : Connection.flush_ret);
-        Some (connection.writer, connection.peer_address, CID.to_string cid)))
+        | Didnt_write ->
+          (match Connection.Streams.flush connection connection.streams with
+          | Wrote | Wrote_app_data ->
+            Some (connection.writer, connection.peer_address, CID.to_string cid)
+          | _ -> inner t (xs ()))
+        | Wrote ->
+          (* There might be space in this datagram for some application data
+           * frames. Send them. *)
+          ignore
+            (Connection.Streams.flush connection connection.streams
+             : Connection.flush_ret);
+          Some (connection.writer, connection.peer_address, CID.to_string cid)))
     | Nil -> None
   in
   inner t (Connection.Table.to_seq_values t.connections ())
