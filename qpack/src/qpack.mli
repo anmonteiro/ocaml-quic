@@ -45,6 +45,7 @@ type header =
 type error =
   | QPACK_DECOMPRESSION_FAILED
   | QPACK_ENCODER_STREAM_ERROR
+  | QPACK_DECODER_STREAM_ERROR
 
 module Encoder : sig
   type t
@@ -121,7 +122,7 @@ module Decoder : sig
 
     val create : max_size:int -> max_blocked_streams:int -> t
 
-    val parse_instructions : t -> Faraday.t -> unit Angstrom.t
+    val parse_instructions : t -> Faraday.t -> (unit, error) result Angstrom.t
 
     val parser
       :  t

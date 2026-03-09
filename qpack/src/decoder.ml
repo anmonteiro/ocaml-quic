@@ -36,27 +36,23 @@ open Angstrom
 module Helpers = struct
   let manyp ~init ~f p =
     fix (fun m ->
-        lift2
-          (fun x y ->
-            match x, y with
-            | Ok x, Ok y ->
-              Ok (f x y)
-            | (Error _ as e), _ | _, (Error _ as e) ->
-              e)
-          p
-          m
-        <|> return (Ok init))
+      lift2
+        (fun x y ->
+           match x, y with
+           | Ok x, Ok y -> Ok (f x y)
+           | (Error _ as e), _ | _, (Error _ as e) -> e)
+        p
+        m
+      <|> return (Ok init))
 
   let cons x xs = x :: xs
 
   let many1p ~init ~f p =
     lift2
       (fun x y ->
-        match x, y with
-        | Ok x, Ok y ->
-          Ok (f x y)
-        | (Error _ as e), _ | _, (Error _ as e) ->
-          e)
+         match x, y with
+         | Ok x, Ok y -> Ok (f x y)
+         | (Error _ as e), _ | _, (Error _ as e) -> e)
       p
       (manyp ~f ~init p)
 end
@@ -74,7 +70,8 @@ let create max_capacity =
   }
 
 let set_capacity { table; max_capacity; _ } capacity =
-  if capacity > max_capacity then
+  if capacity > max_capacity
+  then
     (* From RFC<QPACK-RFC>§4.3.1:
      *   The decoder MUST treat a new dynamic table capacity value that exceeds
      *   this limit as a connection error of type QPACK_ENCODER_STREAM_ERROR. *)
@@ -88,15 +85,14 @@ let add t name value =
    *   It is an error if the encoder attempts to add an entry that is larger
    *   than the dynamic table capacity; the decoder MUST treat this as a
    *   connection error of type QPACK_ENCODER_STREAM_ERROR. *)
-  if Dynamic_table.entry_size name value > t.table.max_size then
-    encoder_stream_error
+  if Dynamic_table.entry_size name value > t.table.max_size
+  then encoder_stream_error
   else
     let ret = Dynamic_table.add t.table name value in
     if ret then t.insertion_count <- t.insertion_count + 1;
     Ok ret
 
 let[@inline] absolute_of_relative ~base relative = base - 1 - relative
-
 let[@inline] absolute_of_post_base ~base post_base = base + post_base
 
 module Instruction = struct
@@ -124,12 +120,9 @@ module Instruction = struct
 
   let add_returning_insert_count_increment t name value =
     match add t name value with
-    | Ok true ->
-      Ok 1
-    | Ok false ->
-      Ok 0
-    | Error _ as err ->
-      err
+    | Ok true -> Ok 1
+    | Ok false -> Ok 0
+    | Error _ as err -> err
 
   (* Reads encoder instructions, returns the insert count increment for the
    * instruction processed *)
@@ -143,42 +136,45 @@ module Instruction = struct
      *   table using an instruction that starts with the '1' one-bit pattern.
      *   The second ('T') bit indicates whether the reference is to the static
      *   or dynamic table. *)
-    if b land 0b1100_0000 = 0b1100_0000 then
+    if b land 0b1100_0000 = 0b1100_0000
+    then
       lift2
         (fun idx value ->
-          (* When T=1, the number represents the static table index *)
-          let name, _ = Static_table.table.(idx) in
-          Result.bind value (add_returning_insert_count_increment t name))
+           (* When T=1, the number represents the static table index *)
+           let name, _ = Static_table.table.(idx) in
+           Result.bind value (add_returning_insert_count_increment t name))
         (any_uint8 >>= fun b -> Qint.decode b 6)
         (Qstring.decode 8)
-    else if b land 0b1000_0000 = 0b1000_0000 then
+    else if b land 0b1000_0000 = 0b1000_0000
+    then
       (* when T=0,* the number is the relative index of the entry in the dynamic
          table. *)
       lift2
         (fun idx value ->
-          let name, _ =
-            Dynamic_table.get
-              t.table
-              (absolute_of_relative ~base:t.insertion_count idx)
-          in
-          Result.bind value (add_returning_insert_count_increment t name))
+           let name, _ =
+             Dynamic_table.get
+               t.table
+               (absolute_of_relative ~base:t.insertion_count idx)
+           in
+           Result.bind value (add_returning_insert_count_increment t name))
         (any_uint8 >>= fun b -> Qint.decode b 6)
         (Qstring.decode 8)
-    else if b land 0b0100_0000 = 0b0100_0000 then
+    else if b land 0b0100_0000 = 0b0100_0000
+    then
       (* From RFC<QPACK-RFC>§4.3.3:
        *   An encoder adds an entry to the dynamic table where both the field
        *   name and the field value are represented as string literals using an
        *   instruction that starts with the '01' two-bit pattern. *)
       lift2
         (fun name value ->
-          match name, value with
-          | Ok name, Ok value ->
-            add_returning_insert_count_increment t name value
-          | (Error _ as err), _ | _, (Error _ as err) ->
-            err)
+           match name, value with
+           | Ok name, Ok value ->
+             add_returning_insert_count_increment t name value
+           | (Error _ as err), _ | _, (Error _ as err) -> err)
         (Qstring.decode 6)
         (Qstring.decode 8)
-    else if b land 0b0010_0000 = 0b0010_0000 then
+    else if b land 0b0010_0000 = 0b0010_0000
+    then
       lift
         (fun max -> Result.map (fun () -> 0) (set_capacity t max))
         (any_uint8 >>= fun b -> Qint.decode b 5)
@@ -186,53 +182,58 @@ module Instruction = struct
       assert (b land 0b1110_0000 = 0);
       lift
         (fun idx ->
-          let name, value =
-            Dynamic_table.get
-              t.table
-              (absolute_of_relative ~base:t.insertion_count idx)
-          in
-          add_returning_insert_count_increment t name value)
+           let name, value =
+             Dynamic_table.get
+               t.table
+               (absolute_of_relative ~base:t.insertion_count idx)
+           in
+           add_returning_insert_count_increment t name value)
         (any_uint8 >>= fun b -> Qint.decode b 5))
 
   let parser t ~f faraday =
-    skip_many1
-      (parse_encoder_instruction t >>| function
-       | Ok insert_count_increment ->
-         if insert_count_increment > 0 then (
-           (* From RFC<QPACK-RFC>§4.4.3:
-            *   An encoder that receives an Increment field equal to zero, or
-            *   one that increases the Known Received Count beyond what the
-            *   encoder has sent MUST treat this as a connection error of type
-            *   QPACK_DECODER_STREAM_ERROR. *)
-           encode_insert_count_increment faraday insert_count_increment;
-           f ());
-         Ok ()
-       | Error _ as e ->
-         e)
+    let open Angstrom in
+    let rec loop () =
+      peek_char >>= function
+      | None -> return (Ok ())
+      | Some _ ->
+        parse_encoder_instruction t >>= ( function
+         | Ok insert_count_increment ->
+           if insert_count_increment > 0
+           then (
+             (* From RFC<QPACK-RFC>§4.4.3:
+              *   An encoder that receives an Increment field equal to zero, or
+              *   one that increases the Known Received Count beyond what the
+              *   encoder has sent MUST treat this as a connection error of type
+              *   QPACK_DECODER_STREAM_ERROR. *)
+             encode_insert_count_increment faraday insert_count_increment;
+             f ());
+           loop ()
+         | Error _ as e -> return e )
+    in
+    loop ()
 end
 
 let reconstruct_required_insert_count t ~encoded_insert_count =
   let max_entries = t.table.max_size / 32 in
   let full_range = 2 * max_entries in
-  if encoded_insert_count = 0 then
-    Ok 0
-  else if encoded_insert_count > full_range then
-    decompression_failed
+  if encoded_insert_count = 0
+  then Ok 0
+  else if encoded_insert_count > full_range
+  then decompression_failed
   else
     let max_value = t.insertion_count + max_entries in
     let max_wrapped = max_value / full_range * full_range in
     let req_insert_count = max_wrapped + encoded_insert_count - 1 in
     (* If ReqInsertCount exceeds MaxValue, the Encoder's value must have wrapped
      * one fewer time *)
-    if req_insert_count > max_value then
-      if req_insert_count <= full_range then
-        decompression_failed
-      else
-        Ok (req_insert_count - full_range)
-    else if req_insert_count = 0 then
-      decompression_failed
-    else
-      Ok req_insert_count
+    if req_insert_count > max_value
+    then
+      if req_insert_count <= full_range
+      then decompression_failed
+      else Ok (req_insert_count - full_range)
+    else if req_insert_count = 0
+    then decompression_failed
+    else Ok req_insert_count
 
 let section_prefix t =
   let open Angstrom in
@@ -246,85 +247,85 @@ let section_prefix t =
   with
   | Ok req_insert_count ->
     let base =
-      if not sign then
-        req_insert_count + delta_base
-      else
-        req_insert_count - delta_base - 1
+      if not sign
+      then req_insert_count + delta_base
+      else req_insert_count - delta_base - 1
     in
     Ok (req_insert_count, base)
-  | Error _ as e ->
-    e
+  | Error _ as e -> e
 
 let decode_header_block { table; _ } ~base =
   let open Angstrom in
   peek_char_fail >>= fun c ->
   let b = Char.code c in
-  if b land 0b1100_0000 = 0b1100_0000 then
+  if b land 0b1100_0000 = 0b1100_0000
+  then
     (* From RFC<QPACK-RFC>§4.5.2:
      *   This representation starts with the '1' 1-bit pattern, followed by the
      *   'T' bit indicating whether the reference is into the static or dynamic
      *   table. *)
     lift
       (* When T=1, the number represents the static table index; *)
-        (fun index ->
-        let name, value = Static_table.table.(index) in
-        Ok { name; value; sensitive = false })
+      (fun index ->
+         let name, value = Static_table.table.(index) in
+         Ok { name; value; sensitive = false })
       (any_uint8 >>= fun b -> Qint.decode b 6)
-  else if b land 0b1000_0000 = 0b1000_0000 then
+  else if b land 0b1000_0000 = 0b1000_0000
+  then
     lift
       (* when T=0, the number is the relative index of the entry in the dynamic
          table. *)
-        (fun idx ->
-        let index = absolute_of_relative ~base idx in
-        let name, value = Dynamic_table.get table index in
-        Ok { name; value; sensitive = false })
+      (fun idx ->
+         let index = absolute_of_relative ~base idx in
+         let name, value = Dynamic_table.get table index in
+         Ok { name; value; sensitive = false })
       (any_uint8 >>= fun b -> Qint.decode b 6)
-  else if b land 0b0100_0000 = 0b0100_0000 then
+  else if b land 0b0100_0000 = 0b0100_0000
+  then
     (* From RFC<QPACK-RFC>§4.5.4:
      *   This representation starts with the '01' two-bit pattern. [...] The
      *   fourth ('T') bit indicates whether the reference is to the static or
      *   dynamic table. *)
     lift2
       (fun index value ->
-        (* When T=1, the number represents the static table index; when T=0, the
-         * number is the relative index of the entry in the dynamic table. *)
-        let is_static = b land 0b0001_0000 = 0b0001_0000 in
-        let name, _ =
-          if is_static then
-            Static_table.table.(index)
-          else
-            Dynamic_table.get table (absolute_of_relative ~base index)
-        in
-        Result.map
-          (fun value ->
-            let header = { name; value; sensitive = false } in
-            { header with
-              sensitive =
-                is_static && Encoder.should_skip_indexing ~token:index header
-            })
-          value)
+         (* When T=1, the number represents the static table index; when T=0, the
+          * number is the relative index of the entry in the dynamic table. *)
+         let is_static = b land 0b0001_0000 = 0b0001_0000 in
+         let name, _ =
+           if is_static
+           then Static_table.table.(index)
+           else Dynamic_table.get table (absolute_of_relative ~base index)
+         in
+         Result.map
+           (fun value ->
+              let header = { name; value; sensitive = false } in
+              { header with
+                sensitive =
+                  is_static && Encoder.should_skip_indexing ~token:index header
+              })
+           value)
       (any_uint8 >>= fun b -> Qint.decode b 4)
       (Qstring.decode 8)
-  else if b land 0b0010_0000 = 0b0010_0000 then
+  else if b land 0b0010_0000 = 0b0010_0000
+  then
     (* From RFC<QPACK-RFC>§4.5.6:
      *   This representation begins with the '001' three-bit pattern. *)
     lift2
       (fun name value ->
-        match name, value with
-        | Ok name, Ok value ->
-          Ok { name; value; sensitive = false }
-        | (Error _ as e), _ | _, (Error _ as e) ->
-          e)
+         match name, value with
+         | Ok name, Ok value -> Ok { name; value; sensitive = false }
+         | (Error _ as e), _ | _, (Error _ as e) -> e)
       (Qstring.decode 4)
       (Qstring.decode 8)
-  else if b land 0b0001_0000 = 0b0001_0000 then
+  else if b land 0b0001_0000 = 0b0001_0000
+  then
     (* From RFC<QPACK-RFC>§4.5.3:
      *   This representation starts with the '0001' 4-bit pattern. *)
     lift
       (fun idx ->
-        let index = absolute_of_post_base ~base idx in
-        let name, value = Dynamic_table.get table index in
-        Ok { name; value; sensitive = false })
+         let index = absolute_of_post_base ~base idx in
+         let name, value = Dynamic_table.get table index in
+         Ok { name; value; sensitive = false })
       (any_uint8 >>= fun b -> Qint.decode b 4)
   else (
     (* From RFC<QPACK-RFC>§4.5.5:
@@ -332,9 +333,9 @@ let decode_header_block { table; _ } ~base =
     assert (b land 0b1111_0000 = 0b0000_0000);
     lift2
       (fun idx value ->
-        let index = absolute_of_post_base ~base idx in
-        let name, _ = Dynamic_table.get table index in
-        Result.map (fun value -> { name; value; sensitive = false }) value)
+         let index = absolute_of_post_base ~base idx in
+         let name, _ = Dynamic_table.get table index in
+         Result.map (fun value -> { name; value; sensitive = false }) value)
       (any_uint8 >>= fun b -> Qint.decode b 3)
       (Qstring.decode 8))
 
@@ -349,11 +350,9 @@ let parser t ~stream_id =
             f
             ~stream_id:(Int64.to_int stream_id);
           Ok (headers, Faraday.serialize_to_string f)
-        | Error _ as e ->
-          e)
+        | Error _ as e -> e)
       (Helpers.many1p ~init:[] ~f:Helpers.cons (decode_header_block t ~base))
-  | Error _ as e ->
-    return e
+  | Error _ as e -> return e
 
 module Buffered = struct
   module AB = Angstrom.Buffered
@@ -372,8 +371,8 @@ module Buffered = struct
         type t = blocked
 
         let compare
-            { required_insertion_count = ric1; _ }
-            { required_insertion_count = ric2; _ }
+              { required_insertion_count = ric1; _ }
+              { required_insertion_count = ric2; _ }
           =
           compare ric1 ric2
       end)
@@ -400,15 +399,15 @@ module Buffered = struct
         , q' ) ->
       assert (List.length bs = 1);
       assert (stream_id > 0L);
-      if ric <= t.decoder.insertion_count then (
+      if ric <= t.decoder.insertion_count
+      then (
         t.blocked_blocks <- q';
-        if not (Q.mem stream_id q') then
-          t.blocked_streams <- StreamIdSet.remove stream_id t.blocked_streams;
+        if not (Q.mem stream_id q')
+        then t.blocked_streams <- StreamIdSet.remove stream_id t.blocked_streams;
         let chunks = List.rev bs in
         List.iter callback chunks;
         process_blocked_streams t)
-    | None ->
-      ()
+    | None -> ()
 
   let parse_instructions t f =
     Instruction.parser t.decoder ~f:(fun () -> process_blocked_streams t) f
@@ -420,7 +419,8 @@ module Buffered = struct
       Angstrom.parse_bigstring ~consume:Prefix (section_prefix t.decoder) bs
     with
     | Ok (Ok (required_insertion_count, _base)) ->
-      if required_insertion_count > t.decoder.insertion_count then (
+      if required_insertion_count > t.decoder.insertion_count
+      then (
         (* From RFC<QPACK-RFC>§2.1.2:
          *   When the decoder receives an encoded field section with a Required
          *   Insert Count greater than its own Insert Count, the stream cannot
@@ -439,11 +439,8 @@ module Buffered = struct
             t.blocked_blocks
         in
         t.blocked_blocks <- q')
-      else
-        f bs;
+      else f bs;
       ok
-    | Ok (Error _ as e) ->
-      e
-    | Error _ ->
-      decompression_failed
+    | Ok (Error _ as e) -> e
+    | Error _ -> decompression_failed
 end
