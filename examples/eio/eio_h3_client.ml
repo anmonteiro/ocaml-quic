@@ -29,15 +29,29 @@ let response_handler ~on_eof response response_body =
   in
   read_response ()
 
+let parse_wire_version s =
+  let s = String.trim s in
+  let s =
+    if String.length s >= 2 && String.sub s 0 2 = "0x"
+    then String.sub s 2 (String.length s - 2)
+    else s
+  in
+  Int64.of_string ("0x" ^ s) |> Int64.to_int32
+
 let () =
   Mirage_crypto_rng_unix.use_default ();
   Sys.(set_signal sigpipe Signal_ignore);
   let host = ref None in
   let port = ref 4433 in
+  let version = ref 0x6b3343cfl in
   Arg.parse
-    [ "-p", Set_int port, " Port number (4433 by default)" ]
+    [ "-p", Set_int port, " Port number (4433 by default)"
+    ; ( "-v"
+      , String (fun s -> version := parse_wire_version s)
+      , " QUIC wire version in hex (default: 6b3343cf)" )
+    ]
     (fun host_argument -> host := Some host_argument)
-    "eio_h3_client.exe [-p N] HOST";
+    "eio_h3_client.exe [-p N] [-v VERSION_HEX] HOST";
   let host =
     match !host with
     | None -> failwith "No hostname provided"
@@ -77,7 +91,7 @@ let () =
           ();
           F (fun _stream -> assert false))
       in
-      Quic_eio.connect t ~address ~host (fun ~cid ~start_stream ->
+      Quic_eio.connect t ~version:!version ~address ~host (fun ~cid ~start_stream ->
         let conn, stream_handler =
           H3.Client_connection.create ~error_handler ~cid ~start_stream
         in

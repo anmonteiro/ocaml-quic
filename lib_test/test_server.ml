@@ -162,6 +162,35 @@ let test_initial () =
     Alcotest.fail
       "Expected state machine to issue a write operation after seeing headers."
 
+let test_client_initial_v2_version () =
+  let config =
+    { Quic.Config.certificates = server_certificates (); alpn_protocols = [ "h3" ] }
+  in
+  let t =
+    Transport.Client.create ~config (fun ~cid:_ ~start_stream:_ ->
+      Transport.F (fun _stream -> { Transport.on_error = (fun _ -> ()) }))
+  in
+  Transport.connect
+    ~version:0x6b3343cfl
+    t
+    ~address:"127.0.0.1:4433"
+    ~host:"localhost"
+    (fun ~cid:_ ~start_stream:_ ->
+      Transport.F (fun _stream -> { Transport.on_error = (fun _ -> ()) }));
+  match Transport.next_write_operation t with
+  | `Writev (iovecs, _client_address, _cid) ->
+    let packet = Write_operation.iovecs_to_string iovecs in
+    if String.length packet < 5
+    then Alcotest.fail "packet too short"
+    else
+      let version = Bytes.get_int32_be (Bytes.of_string packet) 1 in
+      Alcotest.(check int32)
+        "client Initial packet uses v2"
+        0x6b3343cfl
+        version
+  | `Yield | `Close _ ->
+    Alcotest.fail "expected client to write initial packet"
+
 (* match *)
 (* Angstrom.parse_string ~consume:All Quic.Parse.Packet.parser protected_packet *)
 (* with *)
@@ -204,7 +233,10 @@ let test_initial () =
 (* | Error _ -> *)
 (* Alcotest.fail "Expected the parser to succeed" *)
 
-let suites = [ "initial", `Quick, test_initial ]
+let suites =
+  [ "initial", `Quick, test_initial
+  ; "client-initial-v2-version", `Quick, test_client_initial_v2_version
+  ]
 
 let setup_logging ?style_renderer level =
   Fmt_tty.setup_std_outputs ?style_renderer ();

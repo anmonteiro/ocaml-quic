@@ -6,6 +6,7 @@ let dest_cid = Hex.to_string (`Hex "8394c8f03e515708")
 module Crypto = Quic.Crypto
 module InitialAEAD = Quic.Crypto.InitialAEAD
 module AEAD = Quic.Crypto.AEAD
+module Packet = Quic.Packet
 
 module Keys = struct
   let test_initial_secret () =
@@ -71,6 +72,99 @@ module Keys = struct
       hex
       "server_hp"
       (`Hex "c206b8d9b9f0f37644430b490eeaa314")
+      (Hex.of_string server_hp)
+
+  let suite =
+    [ "initial secret", `Quick, test_initial_secret
+    ; "client secrets", `Quick, test_client_secrets
+    ; "server secrets", `Quick, test_server_secrets
+    ]
+end
+
+module V2_Keys = struct
+  let version = Packet.Version.v2
+
+  let test_initial_secret () =
+    Alcotest.check
+      hex
+      "Initial Secret v2"
+      (`Hex "2062e8b3cd8d52092614b8071d0aa1fb7c2e3ac193f78b280e72d8f5751f6aba")
+      (Hex.of_string (InitialAEAD.get_initial_secret ~version dest_cid))
+
+  let test_client_secrets () =
+    let client_secret = InitialAEAD.get_secret ~version ~mode:Client dest_cid in
+    Alcotest.check
+      hex
+      "client_initial_secret v2"
+      (`Hex "14ec9d6eb9fd7af83bf5a668bc17a7e283766aade7ecd0891f70f9ff7f4bf47b")
+      (Hex.of_string client_secret);
+    let client_key, client_iv =
+      Crypto.Kdf.get_key_and_iv
+        ~version
+        ~hash:`SHA256
+        ~kn:16
+        ~ivn:12
+        client_secret
+    in
+    Alcotest.check
+      hex
+      "client_key v2"
+      (`Hex "8b1a0bc121284290a29e0971b5cd045d")
+      (Hex.of_string client_key);
+    Alcotest.check
+      hex
+      "client_iv v2"
+      (`Hex "91f73e2351d8fa91660e909f")
+      (Hex.of_string client_iv);
+    let client_hp =
+      Crypto.Kdf.get_header_protection_key
+        ~version
+        ~hash:`SHA256
+        ~kn:16
+        client_secret
+    in
+    Alcotest.check
+      hex
+      "client_hp v2"
+      (`Hex "45b95e15235d6f45a6b19cbcb0294ba9")
+      (Hex.of_string client_hp)
+
+  let test_server_secrets () =
+    let server_secret = InitialAEAD.get_secret ~version ~mode:Server dest_cid in
+    Alcotest.check
+      hex
+      "server_initial_secret v2"
+      (`Hex "0263db1782731bf4588e7e4d93b7463907cb8cd8200b5da55a8bd488eafc37c1")
+      (Hex.of_string server_secret);
+    let server_key, server_iv =
+      Crypto.Kdf.get_key_and_iv
+        ~version
+        ~hash:`SHA256
+        ~kn:16
+        ~ivn:12
+        server_secret
+    in
+    Alcotest.check
+      hex
+      "server_key v2"
+      (`Hex "82db637861d55e1d011f19ea71d5d2a7")
+      (Hex.of_string server_key);
+    Alcotest.check
+      hex
+      "server_iv v2"
+      (`Hex "dd13c276499c0249d3310652")
+      (Hex.of_string server_iv);
+    let server_hp =
+      Crypto.Kdf.get_header_protection_key
+        ~version
+        ~hash:`SHA256
+        ~kn:16
+        server_secret
+    in
+    Alcotest.check
+      hex
+      "server_hp v2"
+      (`Hex "edf6d05c83121201b436e16877593c3a")
       (Hex.of_string server_hp)
 
   let suite =
@@ -242,6 +336,78 @@ module Retry = struct
     | _ -> assert false
 
   let suite = [ "check retry integrity", `Quick, test_retry_integrity_check ]
+end
+
+module V2_Retry = struct
+  let test_retry_integrity_check () =
+    let data =
+      Hex.to_string
+        (`Hex
+            "cf6b3343cf0008f067a5502a4262b5746f6b656ec8646ce8bfe33952d955543665dcc7b6")
+    in
+    match
+      Angstrom.parse_string ~consume:All Quic__.Parse.Packet.Payload.retry data
+    with
+    | Ok
+        (Retry
+           { header : Quic.Packet.Header.t = _
+           ; token : string = _
+           ; pseudo : Bigstringaf.t
+           ; tag : Bigstringaf.t = _
+           }) ->
+      let integrity_tag =
+        Crypto.Retry.calculate_integrity_tag
+          ~version:Packet.Version.v2
+          (Quic.CID.of_string dest_cid)
+          (Bigstringaf.of_string ~off:0 ~len:(String.length data - 16) data)
+      in
+      Alcotest.check
+        hex
+        "integrity tag"
+        (Hex.of_string (String.sub data (String.length data - 16) 16))
+        (Hex.of_string integrity_tag);
+      Alcotest.check
+        hex
+        "pseudo packet suffix"
+        (Hex.of_string (String.sub data 0 (String.length data - 16)))
+        (Hex.of_bigstring pseudo)
+    | _ -> assert false
+
+  let suite = [ "check retry integrity", `Quick, test_retry_integrity_check ]
+end
+
+module Versioned_long_header_types = struct
+  let test_type_mapping () =
+    Alcotest.(check int)
+      "v1 initial serialized type"
+      0
+      (Packet.Type.serialize ~version:Packet.Version.v1 Packet.Type.Initial);
+    Alcotest.(check int)
+      "v2 initial serialized type"
+      1
+      (Packet.Type.serialize ~version:Packet.Version.v2 Packet.Type.Initial);
+    Alcotest.(check int)
+      "v1 retry serialized type"
+      3
+      (Packet.Type.serialize ~version:Packet.Version.v1 Packet.Type.Retry);
+    Alcotest.(check int)
+      "v2 retry serialized type"
+      0
+      (Packet.Type.serialize ~version:Packet.Version.v2 Packet.Type.Retry);
+    Alcotest.(check bool)
+      "v2 parse retry"
+      true
+      (match Packet.parse_type ~version:Packet.Version.v2 0x00 with
+      | Packet.Type.Retry -> true
+      | _ -> false);
+    Alcotest.(check bool)
+      "v2 parse initial"
+      true
+      (match Packet.parse_type ~version:Packet.Version.v2 0x10 with
+      | Packet.Type.Initial -> true
+      | _ -> false)
+
+  let suite = [ "mapping", `Quick, test_type_mapping ]
 end
 
 module ChaCha = struct
@@ -710,10 +876,13 @@ let () =
   Alcotest.run
     "packets"
     [ "A.1. Keys", Keys.suite
+    ; "A.1. Keys (v2)", V2_Keys.suite
     ; "A.2. Client Initial", Client_initial.suite
     ; "A.3. Server Initial", Server_initial.suite
     ; "A.4. Retry", Retry.suite
+    ; "A.4. Retry (v2)", V2_Retry.suite
     ; "A.5. ChaCha20-Poly1305 Short Header Packet", ChaCha.suite
+    ; "Long Header Type Mapping", Versioned_long_header_types.suite
     ; "Initial AEAD", InitialAEAD_encryption.suite
     ; "ChaCha20", ChaCha20_encryption.suite
     ]

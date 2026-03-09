@@ -24,6 +24,7 @@ mkShell {
       else
         [ ]
     )
+    ++ (with pkgs; [ uv ])
     ++ (with ocamlPackages; [
       merlin
       ocamlformat

@@ -140,7 +140,8 @@ module Transport : sig
   end
 
   val connect
-    :  t
+    :  ?version:int32
+    -> t
     -> address:string
     -> host:string
     -> (cid:string -> start_stream:start_stream -> stream_handler)

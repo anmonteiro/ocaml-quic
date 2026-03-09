@@ -403,13 +403,13 @@ module Packet = struct
 
   let unprotected =
     peek_char_fail >>= fun first_byte ->
-    match Packet.parse_type (Char.code first_byte) with
-    | Retry -> Payload.retry
-    | _ ->
-      advance 1 *> Header.Long.parse >>= fun (version, source_cid, dest_cid) ->
-      (match version with
-      | Negotiation -> Payload.version_negotiation ~source_cid ~dest_cid
-      | Number _ -> Payload.retry)
+    advance 1 *> Header.Long.parse >>= fun (version, source_cid, dest_cid) ->
+    match version with
+    | Negotiation -> Payload.version_negotiation ~source_cid ~dest_cid
+    | Number version ->
+      (match Packet.parse_type ~version (Char.code first_byte) with
+      | Retry -> Payload.retry
+      | _ -> fail "expected retry or version negotiation packet")
 
   (*
    *  Long Header Packet {
@@ -424,11 +424,12 @@ module Packet = struct
    *    Source Connection ID (0..160),
    *  }
    *)
-  let protected_long_header ~packet_type =
+  let protected_long_header ~first_byte =
     Header.Long.parse >>= fun (version, source_cid, dest_cid) ->
     match version with
     | Negotiation -> assert false
     | Number version ->
+      let packet_type = Packet.parse_type ~version first_byte in
       (match packet_type with
       | Packet.Type.Initial ->
         variable_length_integer >>= fun token_length ->
@@ -466,7 +467,7 @@ module Packet = struct
     any_uint8 >>= fun first_byte ->
     match Packet.Header.Type.parse first_byte with
     | Packet.Header.Type.Long ->
-      protected_long_header ~packet_type:(Packet.parse_type first_byte)
+      protected_long_header ~first_byte
     | Short ->
       short_header >>= fun hdr ->
       available >>| fun avail -> hdr, avail
@@ -483,7 +484,9 @@ module Packet = struct
       (match Packet.Version.parse version with
       | Negotiation -> false
       | Number _ ->
-        (match Packet.parse_type first_byte with Retry -> false | _ -> true))
+        (match Packet.parse_type_opt ~version first_byte with
+        | Some Retry -> false
+        | Some _ | None -> true))
 
   type packet_parsing_type =
     | Skip of int

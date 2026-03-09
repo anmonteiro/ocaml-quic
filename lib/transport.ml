@@ -93,6 +93,7 @@ module Connection = struct
 
   type t =
     { encdec : Crypto.encdec Encryption_level.t
+    ; version : int32
     ; mode : Crypto.Mode.t
     ; mutable tls_state : Qtls.t
     ; packet_number_spaces : Packet_number.t Spaces.t
@@ -219,6 +220,7 @@ module Connection = struct
         ~encrypter
         ~packet_number
         ~encryption_level
+        ~version:t.version
         ~source_cid:t.source_cid
         ~token:t.token_value
         t.dest_cid
@@ -325,10 +327,14 @@ module Connection = struct
         Encryption_level.add
           next
           { Crypto.encrypter =
-              Crypto.AEAD.make ~ciphersuite:current_cipher enc.traffic_secret
+              Crypto.AEAD.make
+                ~version:t.version
+                ~ciphersuite:current_cipher
+                enc.traffic_secret
           ; decrypter =
               Some
                 (Crypto.AEAD.make
+                   ~version:t.version
                    ~ciphersuite:current_cipher
                    dec.traffic_secret)
           }
@@ -341,7 +347,10 @@ module Connection = struct
         Encryption_level.add
           next
           { Crypto.encrypter =
-              Crypto.AEAD.make ~ciphersuite:current_cipher enc.traffic_secret
+              Crypto.AEAD.make
+                ~version:t.version
+                ~ciphersuite:current_cipher
+                enc.traffic_secret
           ; decrypter = None
           }
           t.encdec;
@@ -357,6 +366,7 @@ module Connection = struct
                   Crypto.decrypter =
                     Some
                       (Crypto.AEAD.make
+                         ~version:t.version
                          ~ciphersuite:current_cipher
                          dec.traffic_secret)
                 })
@@ -698,6 +708,7 @@ module Connection = struct
 
   let create
         ~mode
+        ~version
         ~peer_address
         ~tls_state
         ~wakeup_writer
@@ -710,6 +721,7 @@ module Connection = struct
     then failwith "invalid source cid";
     let rec t =
       { encdec = Encryption_level.create ~current:Initial
+      ; version
       ; mode
       ; packet_number_spaces =
           Spaces.create
@@ -826,6 +838,7 @@ module Connection = struct
                   ~encrypter
                   ~packet_number
                   ~encryption_level
+                  ~version:t.version
                   ~source_cid:t.source_cid
                   ~token:t.token_value
                   t.dest_cid
@@ -882,6 +895,8 @@ type t =
   ; mode : Crypto.Mode.t
   ; config : Config.t
   ; connections : Connection.t Connection.Table.t
+  ; stateless_writes : (string * string) Queue.t
+  ; stateless_writers : (string, Writer.t) Hashtbl.t
   ; mutable current_peer_address : string option
   ; mutable wakeup_writer : Optional_thunk.t
   ; mutable closed : bool
@@ -902,18 +917,66 @@ let shutdown t =
   (* shutdown_writer t *)
   t.closed <- true
 
+let supported_versions = [ Packet.Version.v1; Packet.Version.v2 ]
+
+let queue_stateless_packet t ~client_address packet =
+  let writer = Writer.create 0x400 in
+  Serialize.Pkt.write_packet (Writer.faraday writer) packet;
+  Writer.close writer;
+  let id =
+    let (`Hex hex) = Hex.of_string (CID.to_string (CID.generate ())) in
+    "stateless-" ^ hex
+  in
+  Queue.add (id, client_address) t.stateless_writes;
+  Hashtbl.add t.stateless_writers id writer;
+  wakeup_writer t
+
+let parse_unsupported_version_packet bs ~off ~len =
+  if len < 7
+  then None
+  else
+    let first_byte = Char.code (Bigstringaf.unsafe_get bs off) in
+    if (not (Bits.test first_byte 7)) || not (Bits.test first_byte 6)
+    then None
+    else
+      let version = Bigstringaf.unsafe_get_int32_be bs (off + 1) in
+      if
+        Int32.equal version 0l
+        || List.exists (Int32.equal version) supported_versions
+      then None
+      else
+        let dest_cid_len = Char.code (Bigstringaf.unsafe_get bs (off + 5)) in
+        let src_cid_len_offset = off + 6 + dest_cid_len in
+        if src_cid_len_offset >= off + len
+        then None
+        else
+          let src_cid_len =
+            Char.code (Bigstringaf.unsafe_get bs src_cid_len_offset)
+          in
+          let dest_cid_start = off + 6 in
+          let src_cid_start = src_cid_len_offset + 1 in
+          if src_cid_start + src_cid_len > off + len
+          then None
+          else
+            let dest_cid =
+              Bigstringaf.substring bs ~off:dest_cid_start ~len:dest_cid_len
+            in
+            let src_cid =
+              Bigstringaf.substring bs ~off:src_cid_start ~len:src_cid_len
+            in
+            Some (version, dest_cid, src_cid)
+
 let register_connection_id t ~cid ~(connection : Connection.t) =
   match Connection.Table.find_opt t.connections cid with
   | None -> Connection.Table.add t.connections cid connection
   | Some existing ->
-    if existing == connection
-    then ()
-    else failwith "connection id collision"
+    if existing == connection then () else failwith "connection id collision"
 
 let deregister_connection_ids t ~(connection : Connection.t) =
   let ids =
     Connection.Table.fold
-      (fun cid candidate acc -> if candidate == connection then cid :: acc else acc)
+      (fun cid candidate acc ->
+         if candidate == connection then cid :: acc else acc)
       t.connections
       []
   in
@@ -962,8 +1025,17 @@ let create_outgoing_frames ~current =
 let on_close t (connection : Connection.t) =
   deregister_connection_ids t ~connection
 
+let version_of_header = function
+  | Packet.Header.Initial { version; _ } | Long { version; _ } -> Some version
+  | Short _ -> None
+
+let version_of_packet = function
+  | Packet.Frames { header; _ } | Retry { header; _ } -> version_of_header header
+  | VersionNegotiation _ -> None
+
 let create_new_connection
       ?src_cid
+      ~version
       ~peer_address
       ~tls_state
       ~connection_handler
@@ -976,13 +1048,16 @@ let create_new_connection
     | None ->
       let rec generate_unique_cid () =
         let cid = CID.generate () in
-        if Connection.Table.mem t.connections cid then generate_unique_cid () else cid
+        if Connection.Table.mem t.connections cid
+        then generate_unique_cid ()
+        else cid
       in
       generate_unique_cid ()
   in
   let connection =
     Connection.create
       ~mode:t.mode
+      ~version
       ~peer_address
       ~tls_state
       ~wakeup_writer:(ready_to_write t)
@@ -1014,7 +1089,7 @@ let process_retry_packet
     ()
   | false ->
     (match header with
-    | Long { source_cid = pkt_src_cid; _ } ->
+    | Long { version; source_cid = pkt_src_cid; _ } ->
       if CID.equal pkt_src_cid c.dest_cid
       then
         (* From RFC9000§7.3:
@@ -1022,10 +1097,15 @@ let process_retry_packet
          *   Connection ID field that is identical to the Destination Connection
          *   ID field of its Initial packet. *)
         ()
+      else if not (Int32.equal version c.version)
+      then ()
       else
         let connection_id = c.dest_cid in
         let retry_identity_tag =
-          Crypto.Retry.calculate_integrity_tag connection_id pseudo
+          Crypto.Retry.calculate_integrity_tag
+            ~version:c.version
+            connection_id
+            pseudo
         in
         (match String.equal retry_identity_tag (Bigstringaf.to_string tag) with
         | false ->
@@ -1058,10 +1138,14 @@ let process_retry_packet
                *   Changing the Destination Connection ID field also results in
                *   a change to the keys used to protect the Initial packet. *)
               { Crypto.encrypter =
-                  Crypto.InitialAEAD.make ~mode:t.mode c.dest_cid
+                  Crypto.InitialAEAD.make
+                    ~version:c.version
+                    ~mode:t.mode
+                    c.dest_cid
               ; decrypter =
                   Some
                     (Crypto.InitialAEAD.make
+                       ~version:c.version
                        ~mode:(Crypto.Mode.peer t.mode)
                        c.dest_cid)
               }
@@ -1081,13 +1165,16 @@ let packet_handler t ?error packet =
     | None ->
       (* Has to be a new connection. TODO: assert that. *)
       assert (t.mode = Server);
+      let version = Option.get (version_of_packet packet) in
       let { Config.certificates; alpn_protocols } = t.config in
 
       let encdec =
-        { Crypto.encrypter = Crypto.InitialAEAD.make ~mode:t.mode connection_id
+        { Crypto.encrypter =
+            Crypto.InitialAEAD.make ~version ~mode:t.mode connection_id
         ; decrypter =
             Some
               (Crypto.InitialAEAD.make
+                 ~version
                  ~mode:(Crypto.Mode.peer t.mode)
                  connection_id)
         }
@@ -1096,6 +1183,7 @@ let packet_handler t ?error packet =
       let connection =
         create_new_connection
           t
+          ~version
           ~peer_address:(Option.get t.current_peer_address)
           ~tls_state
           ~connection_handler:t.connection_handler
@@ -1120,93 +1208,100 @@ let packet_handler t ?error packet =
        *   original_destination_connection_id transport parameter [...]. *)
       c.original_dest_cid <- Packet.destination_cid packet;
 
-    (match packet with
-    | Packet.VersionNegotiation _ -> failwith "NYI: version negotiation"
-    | Frames { header; payload; packet_number; _ } ->
-      let encryption_level = Encryption_level.of_header header in
+    let version_mismatch =
+      match version_of_packet packet with
+      | Some packet_version -> not (Int32.equal packet_version c.version)
+      | None -> false
+    in
+    if not version_mismatch
+    then
+      match packet with
+      | Packet.VersionNegotiation _ -> failwith "NYI: version negotiation"
+      | Frames { header; payload; packet_number; _ } ->
+        let encryption_level = Encryption_level.of_header header in
 
-      (* (match encryption_level with *)
-      (* | Initial -> *)
-      (* c.packet_number_spaces.initial.received <- *)
-      (* Int64.max c.packet_number_spaces.initial.received packet_number *)
-      (* | Handshake -> *)
-      (* c.packet_number_spaces.handshake.received <- *)
-      (* Int64.max c.packet_number_spaces.handshake.received packet_number *)
-      (* | Application_data | Zero_RTT -> *)
-      (* c.packet_number_spaces.application_data.received <- *)
-      (* Int64.max c.packet_number_spaces.application_data.received
-         packet_number); *)
-      let pn_space =
-        Spaces.of_encryption_level c.packet_number_spaces encryption_level
-      in
-      pn_space.received <- Int64.max pn_space.received packet_number;
-
-      (match Packet.source_cid packet with
-      | Some src_cid ->
-        (* From RFC9000§19.6:
-         *   Upon receiving a packet, each endpoint sets the Destination Connection
-         *   ID it sends to match the value of the Source Connection ID that it
-         *   receives. *)
-        c.dest_cid <- src_cid
-      | None ->
-        (* TODO: short packets will fail here? *)
-        assert (
-          match packet with
-          | Frames { header = Packet.Header.Short _; _ } -> true
-          | _ -> false));
-
-      let packet_info =
-        { header
-        ; encryption_level
-        ; packet_number
-        ; outgoing_frames = create_outgoing_frames ~current:c.encdec.current
-        ; connection = c
-        }
-      in
-
-      (match
-         Angstrom.parse_bigstring
-           ~consume:All
-           (Parse.Frame.parser (Connection.frame_handler c ~packet_info))
-           payload
-       with
-      | Ok _frames ->
-        (* process streams for packets that have been acknowledged. *)
-        let acked_frames =
-          Recovery.drain_acknowledged
-            c.recovery
-            ~encryption_level:packet_info.encryption_level
-        in
-        List.iter
-          (function
-            | Frame.Crypto { IOVec.off; _ } ->
-              let crypto_stream =
-                Spaces.of_encryption_level
-                  c.crypto_streams
-                  packet_info.encryption_level
-              in
-              Stream.Send.remove off crypto_stream.send
-            | Stream { id = _; fragment = _; _ } -> ()
-            | Ack { ranges = _; _ } ->
-              (* TODO: when we track packets that need acknowledgement, update
-                 the largest acknowledged here. *)
-              ()
-            | _other -> ())
-          acked_frames;
-        (* This packet has been processed, mark it for acknowledgement. *)
+        (* (match encryption_level with *)
+        (* | Initial -> *)
+        (* c.packet_number_spaces.initial.received <- *)
+        (* Int64.max c.packet_number_spaces.initial.received packet_number *)
+        (* | Handshake -> *)
+        (* c.packet_number_spaces.handshake.received <- *)
+        (* Int64.max c.packet_number_spaces.handshake.received packet_number *)
+        (* | Application_data | Zero_RTT -> *)
+        (* c.packet_number_spaces.application_data.received <- *)
+        (* Int64.max c.packet_number_spaces.application_data.received
+           packet_number); *)
         let pn_space =
-          Spaces.of_encryption_level
-            c.packet_number_spaces
-            packet_info.encryption_level
+          Spaces.of_encryption_level c.packet_number_spaces encryption_level
         in
-        Packet_number.insert_for_acking pn_space packet_number;
-        (* packet_info should now contain frames we need to send in response. *)
-        send_packets t ~packet_info;
-        (* Reset for the next packet. *)
-        pn_space.ack_elicited <- false
-      | Error e -> failwith ("Err: " ^ e))
-    | Retry { header; token; pseudo; tag } ->
-      process_retry_packet t c ~header ~token ~pseudo ~tag)
+        pn_space.received <- Int64.max pn_space.received packet_number;
+
+        (match Packet.source_cid packet with
+        | Some src_cid ->
+          (* From RFC9000§19.6:
+           *   Upon receiving a packet, each endpoint sets the Destination Connection
+           *   ID it sends to match the value of the Source Connection ID that it
+           *   receives. *)
+          c.dest_cid <- src_cid
+        | None ->
+          (* TODO: short packets will fail here? *)
+          assert (
+            match packet with
+            | Frames { header = Packet.Header.Short _; _ } -> true
+            | _ -> false));
+
+        let packet_info =
+          { header
+          ; encryption_level
+          ; packet_number
+          ; outgoing_frames = create_outgoing_frames ~current:c.encdec.current
+          ; connection = c
+          }
+        in
+
+        (match
+           Angstrom.parse_bigstring
+             ~consume:All
+             (Parse.Frame.parser (Connection.frame_handler c ~packet_info))
+             payload
+         with
+        | Ok _frames ->
+          (* process streams for packets that have been acknowledged. *)
+          let acked_frames =
+            Recovery.drain_acknowledged
+              c.recovery
+              ~encryption_level:packet_info.encryption_level
+          in
+          List.iter
+            (function
+              | Frame.Crypto { IOVec.off; _ } ->
+                let crypto_stream =
+                  Spaces.of_encryption_level
+                    c.crypto_streams
+                    packet_info.encryption_level
+                in
+                Stream.Send.remove off crypto_stream.send
+              | Stream { id = _; fragment = _; _ } -> ()
+              | Ack { ranges = _; _ } ->
+                (* TODO: when we track packets that need acknowledgement, update
+                   the largest acknowledged here. *)
+                ()
+              | _other -> ())
+            acked_frames;
+          (* This packet has been processed, mark it for acknowledgement. *)
+          let pn_space =
+            Spaces.of_encryption_level
+              c.packet_number_spaces
+              packet_info.encryption_level
+          in
+          Packet_number.insert_for_acking pn_space packet_number;
+          (* packet_info should now contain frames we need to send in response. *)
+          send_packets t ~packet_info;
+          (* Reset for the next packet. *)
+          pn_space.ack_elicited <- false
+        | Error e -> failwith ("Err: " ^ e))
+      | Retry { header; token; pseudo; tag } ->
+        process_retry_packet t c ~header ~token ~pseudo ~tag
 
 let create ~mode ~config connection_handler =
   let rec reader_packet_handler t ?error packet =
@@ -1235,7 +1330,11 @@ let create ~mode ~config connection_handler =
           , pn_space.received )
         | None ->
           assert (Encryption_level.of_header header = Initial);
-          ( Crypto.InitialAEAD.make ~mode:(Crypto.Mode.peer t.mode) connection_id
+          let version = Option.get (version_of_header header) in
+          ( Crypto.InitialAEAD.make
+              ~version
+              ~mode:(Crypto.Mode.peer t.mode)
+              connection_id
           , -1L )
       in
       Crypto.AEAD.decrypt_packet decrypter ~payload_length ~largest_pn cs
@@ -1245,6 +1344,8 @@ let create ~mode ~config connection_handler =
       ; mode
       ; config
       ; connections = Connection.Table.create ~random:true 1024
+      ; stateless_writes = Queue.create ()
+      ; stateless_writers = Hashtbl.create ~random:true 16
       ; current_peer_address = None
       ; wakeup_writer = Optional_thunk.none
       ; closed = false
@@ -1263,7 +1364,7 @@ module Client = struct
     create ~mode:Client ~config connection_handler
 end
 
-let connect t ~address ~host connection_handler =
+let connect ?(version = Packet.Version.v1) t ~address ~host connection_handler =
   let { Config.alpn_protocols; _ } = t.config in
   let dest_cid = CID.generate () in
   let src_cid = CID.generate () in
@@ -1272,9 +1373,13 @@ let connect t ~address ~host connection_handler =
      *   Initial packets apply the packet protection process, but use a secret
      *   derived from the Destination Connection ID field from the client's
      *   first Initial packet. *)
-    { Crypto.encrypter = Crypto.InitialAEAD.make ~mode:t.mode dest_cid
+    { Crypto.encrypter = Crypto.InitialAEAD.make ~version ~mode:t.mode dest_cid
     ; decrypter =
-        Some (Crypto.InitialAEAD.make ~mode:(Crypto.Mode.peer t.mode) dest_cid)
+        Some
+          (Crypto.InitialAEAD.make
+             ~version
+             ~mode:(Crypto.Mode.peer t.mode)
+             dest_cid)
     }
   in
   Format.eprintf
@@ -1310,6 +1415,7 @@ let connect t ~address ~host connection_handler =
   let new_connection =
     create_new_connection
       t
+      ~version
       ~peer_address:address
       ~tls_state
       ~src_cid
@@ -1350,23 +1456,47 @@ let flush_pending_packets t =
   in
   inner t (Connection.Table.to_seq_values t.connections ())
 
+let rec next_stateless_write t =
+  match Queue.take_opt t.stateless_writes with
+  | None -> None
+  | Some (id, client_address) ->
+    (match Hashtbl.find_opt t.stateless_writers id with
+    | None -> next_stateless_write t
+    | Some writer ->
+      (match Writer.next writer with
+      | `Write iovecs ->
+        Queue.add (id, client_address) t.stateless_writes;
+        Some (`Writev (iovecs, client_address, id))
+      | `Yield ->
+        Queue.add (id, client_address) t.stateless_writes;
+        None
+      | `Close _ ->
+        Hashtbl.remove t.stateless_writers id;
+        next_stateless_write t))
+
 let next_write_operation (t : t) =
   if t.closed
   then `Close 0
   else
-    match flush_pending_packets t with
-    | Some (writer, client_address, cid) ->
-      (match Writer.next writer with
-      | `Write iovecs -> `Writev (iovecs, client_address, cid)
-      | (`Yield | `Close _) as other -> other)
-    | None -> `Yield
+    match next_stateless_write t with
+    | Some writev -> writev
+    | None ->
+      (match flush_pending_packets t with
+      | Some (writer, client_address, cid) ->
+        (match Writer.next writer with
+        | `Write iovecs -> `Writev (iovecs, client_address, cid)
+        | (`Yield | `Close _) as other -> other)
+      | None -> `Yield)
 
 let report_write_result t ~cid result =
   match Connection.Table.find_opt t.connections (CID.of_string cid) with
   | Some conn -> Writer.report_result conn.writer result
   | None ->
-    Format.eprintf "connection not found: probably already retired?@.";
-    ()
+    (match Hashtbl.find_opt t.stateless_writers cid with
+    | Some writer -> Writer.report_result writer result
+    | None ->
+      Format.eprintf "connection not found: probably already retired?@.";
+      ())
 
 let yield_writer t k =
   if t.closed
@@ -1384,7 +1514,18 @@ let read t ~client_address bs ~off ~len =
   (* let hex = Hex.of_string (Bigstringaf.substring bs ~off ~len) in *)
   (* Format.eprintf "wtf(%d): %a@." len Hex.pp hex; *)
   t.current_peer_address <- Some client_address;
-  read_with_more t bs ~off ~len Incomplete
+  match t.mode, parse_unsupported_version_packet bs ~off ~len with
+  | Server, Some (_version, packet_dest_cid, packet_source_cid) ->
+    let packet =
+      Packet.VersionNegotiation
+        { source_cid = CID.of_string packet_dest_cid
+        ; dest_cid = CID.of_string packet_source_cid
+        ; versions = supported_versions
+        }
+    in
+    queue_stateless_packet t ~client_address packet;
+    len
+  | _ -> read_with_more t bs ~off ~len Incomplete
 
 let read_eof t bs ~off ~len = read_with_more t bs ~off ~len Complete
 
