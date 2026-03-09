@@ -317,6 +317,17 @@ module Connection = struct
         ~final_size:_fsiz
         application_error
     =
+    let is_locally_initiated =
+      match t.mode with
+      | Server -> Stream_id.is_server_initiated stream_id
+      | Client -> Stream_id.is_client_initiated stream_id
+    in
+    let is_send_only_stream =
+      Stream_id.is_uni stream_id && is_locally_initiated
+    in
+    if is_send_only_stream
+    then report_error t ~frame_type:Reset_stream Stream_state_error
+    else
     match Hashtbl.find_opt t.streams stream_id with
     | Some stream ->
       (match stream.typ, t.mode with
@@ -338,10 +349,25 @@ module Connection = struct
   (* has not yet been created MUST be treated as a connection error of type *)
   (* STREAM_STATE_ERROR. *)
   let process_stop_sending_frame t ~stream_id application_protocol_error =
+    let is_locally_initiated =
+      match t.mode with
+      | Server -> Stream_id.is_server_initiated stream_id
+      | Client -> Stream_id.is_client_initiated stream_id
+    in
+    let is_receive_only_stream =
+      Stream_id.is_uni stream_id && not is_locally_initiated
+    in
+    if is_receive_only_stream
+    then
+      report_error
+        t
+        ~frame_type:Frame.Type.Stop_sending
+        Error.Stream_state_error
+    else
     match Hashtbl.find_opt t.streams stream_id with
     | Some stream ->
       (match stream.typ, t.mode with
-      | Client Unidirectional, Client | Server Unidirectional, Server ->
+      | Client Unidirectional, Server | Server Unidirectional, Client ->
         (* From RFC9000§19.5:
          *   An endpoint that receives a STOP_SENDING frame for a receive-only
          *   stream MUST terminate the connection with error
@@ -369,7 +395,14 @@ module Connection = struct
               ; final_size
               }
           ])
-    | None -> ()
+    | None ->
+      if is_locally_initiated
+      then
+        report_error
+          t
+          ~frame_type:Frame.Type.Stop_sending
+          Error.Stream_state_error
+      else ()
 
   let process_tls_result t ~new_tls_state ~tls_packets =
     let rec process_packets
@@ -772,8 +805,9 @@ module Connection = struct
       process_stop_sending_frame t ~stream_id application_protocol_error
     | Crypto fragment -> process_crypto_frame t ~packet_info fragment
     | New_token _ ->
-      (* Optional extension frame; safe to ignore when unsupported. *)
-      ()
+      (match t.mode with
+      | Server -> report_error t ~frame_type:Frame.Type.New_token Protocol_violation
+      | Client -> ())
     | Stream { id; fragment; is_fin } ->
       process_stream_frame
         t
