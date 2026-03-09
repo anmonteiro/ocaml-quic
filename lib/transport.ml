@@ -594,13 +594,21 @@ module Connection = struct
 
   let process_stream_frame c ~encryption_level ~id ~fragment ~is_fin =
     let stream_frame_type = Frame.to_frame_type (Frame.Stream { id; fragment; is_fin }) in
+    let direction = Direction.classify id in
     let is_locally_initiated =
       match c.mode with
       | Server -> Stream_id.is_server_initiated id
       | Client -> Stream_id.is_client_initiated id
     in
+    let is_peer_initiated = not is_locally_initiated in
+    let stream_count = Int64.add (Int64.shift_right_logical id 2) 1L in
+    let max_peer_streams =
+      match direction with
+      | Bidirectional -> Int64.of_int default_initial_max_streams_bidi
+      | Unidirectional -> Int64.of_int default_initial_max_streams_uni
+    in
     let recv_window =
-      match Direction.classify id with
+      match direction with
       | Unidirectional ->
         if is_locally_initiated
         then None
@@ -613,7 +621,15 @@ module Connection = struct
     let stream_final_offset =
       Int64.add (Int64.of_int fragment.IOVec.off) (Int64.of_int fragment.len)
     in
-    match recv_window with
+    if is_peer_initiated && Int64.compare stream_count max_peer_streams > 0
+    then
+      report_error
+        c
+        ~frame_type:stream_frame_type
+        ~encryption_level
+        Stream_limit_error
+    else
+      match recv_window with
     | None ->
       report_error
         c
