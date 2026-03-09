@@ -157,17 +157,22 @@ let instruction = Instruction.testable
 let header ?(sensitive = false) name value = { Types.name; value; sensitive }
 
 let decode_instructions t buf =
-  let f = Faraday.create 0x10 in
-  match
-    Angstrom.parse_string
-      ~consume:All
-      (Decoder.Instruction.parser ~f:ignore t f)
-      buf
-  with
-  | Ok () ->
-    Ok (Faraday.serialize_to_string f)
-  | Error _ as e ->
-    e
+  if String.length buf = 0
+  then Error "instruction too short"
+  else
+    let f = Faraday.create 0x10 in
+    match
+      Angstrom.parse_string
+        ~consume:All
+        (Decoder.Instruction.parser ~f:ignore t f)
+        buf
+    with
+    | Ok (Ok ()) ->
+      Ok (Faraday.serialize_to_string f)
+    | Ok (Error _) ->
+      Error "decoder instruction error"
+    | Error _ as e ->
+      e
 
 let decode_header_block t hs =
   match

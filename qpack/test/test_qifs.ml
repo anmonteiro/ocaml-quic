@@ -15,14 +15,24 @@ let test t ~f { Qif.stream_id; encoded } =
   let faraday = Faraday.create 0x100 in
   let bs = Bigstringaf.of_string ~off:0 ~len:(String.length encoded) encoded in
   if Int64.equal stream_id 0L then
-    Angstrom.parse_bigstring
-      ~consume:All
-      (Decoder.Buffered.parse_instructions t faraday)
-      bs
-    |> Result.get_ok
+    (match
+       Angstrom.parse_bigstring
+         ~consume:All
+         (Decoder.Buffered.parse_instructions t faraday)
+         bs
+     with
+    | Ok (Ok ()) ->
+      ()
+    | Ok (Error _) ->
+      assert false
+    | Error _ ->
+      assert false)
   else
-    Decoder.Buffered.decode_header_block ~stream_id t bs (f ~stream_id)
-    |> Result.get_ok
+    (match Decoder.Buffered.decode_header_block ~stream_id t bs (f ~stream_id) with
+    | Ok () ->
+      ()
+    | Error _ ->
+      assert false)
 
 let test_case ~max_size ~max_blocked_streams ~expected f () =
   let content = Qif.read_entire_file f in
