@@ -739,7 +739,14 @@ module Connection = struct
     else
       match Hashtbl.find_opt t.streams stream_id with
       | None ->
-        report_error t ~frame_type:Frame.Type.Max_stream_data Stream_state_error
+        if is_locally_initiated
+        then
+          report_error
+            t
+            ~frame_type:Frame.Type.Max_stream_data
+            Stream_state_error
+        else
+          ()
       | Some _ -> ()
 
   (* TODO: closing/ draining states, section 10.2 *)
