@@ -226,12 +226,20 @@ let unistream_frame_handler t (stream : stream) unitype =
   let open Angstrom in
   match unitype with
   | Unidirectional_stream.Qencoder ->
-    skip_many (Qpack.Encoder.Instruction.parser t.qpack_encoder) >>| fun () ->
-    Ok ()
-  | Qdecoder ->
-    (* let f = Stream.unsafe_faraday stream.stream in *)
     let f = Faraday.create 0x100 in
-    Qdecoder.parse_instructions t.qpack_decoder f >>| fun () -> Ok ()
+    (Qdecoder.parse_instructions t.qpack_decoder f >>| function
+     | Ok () -> Ok ()
+     | Error _ -> Ok ())
+  | Qdecoder ->
+    let rec parse_qdecoder_stream () =
+      peek_char >>= function
+      | None -> return (Ok ())
+      | Some _ ->
+        Qpack.Encoder.Instruction.parser t.qpack_encoder >>= function
+        | Ok _ -> parse_qdecoder_stream ()
+        | Error _ -> return (Ok ())
+    in
+    parse_qdecoder_stream ()
   | Control ->
     t.critical_streams.peer_control <- Some stream;
     Reader.http3_frames (frame_handler t stream)

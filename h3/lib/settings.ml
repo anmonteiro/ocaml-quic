@@ -44,6 +44,9 @@ module Type = struct
   let is_unknown x = unknown_n x > 0
 end
 
-type t = { max_field_section_size : int }
+type t =
+  { max_field_section_size : int
+  ; has_h2_forbidden : bool
+  }
 
-let default = { max_field_section_size = Int.max_int }
+let default = { max_field_section_size = Int.max_int; has_h2_forbidden = false }

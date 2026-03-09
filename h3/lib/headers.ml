@@ -315,7 +315,7 @@ let method_path_and_scheme_or_malformed t =
   | [ "CONNECT" ], _, _ ->
     `Malformed
   | [ meth ], [ scheme ], [ path ] ->
-    if valid_request_headers t then
+    if valid_request_headers t && mem t ":authority" then
       `Valid (meth, path, scheme)
     else
       `Malformed
