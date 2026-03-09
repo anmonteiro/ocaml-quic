@@ -99,7 +99,7 @@ let write_cancel_push_frame t id =
   write_variable_length_integer t (varint_encoding_length id);
   write_variable_length_integer t id
 
-let write_settings_frame t { Settings.max_field_section_size } =
+let write_settings_frame t { Settings.max_field_section_size; _ } =
   let settings =
     [ Settings.Type.max_field_section_size, max_field_section_size
     ; (* From RFC<HTTP3-RFC>§7.2.4.1:

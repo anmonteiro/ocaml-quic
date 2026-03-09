@@ -195,20 +195,22 @@ module Instruction = struct
         (any_uint8 >>= fun b -> Qint.decode b 5))
 
   let parser t ~f faraday =
-    skip_many1
-      (parse_encoder_instruction t >>| function
-       | Ok insert_count_increment ->
-         if insert_count_increment > 0 then (
-           (* From RFC<QPACK-RFC>§4.4.3:
-            *   An encoder that receives an Increment field equal to zero, or
-            *   one that increases the Known Received Count beyond what the
-            *   encoder has sent MUST treat this as a connection error of type
-            *   QPACK_DECODER_STREAM_ERROR. *)
-           encode_insert_count_increment faraday insert_count_increment;
-           f ());
-         Ok ()
-       | Error _ as e ->
-         e)
+    let open Angstrom in
+    let rec loop () =
+      peek_char >>= function
+      | None ->
+        return (Ok ())
+      | Some _ ->
+        parse_encoder_instruction t >>= function
+        | Ok insert_count_increment ->
+          if insert_count_increment > 0
+          then encode_insert_count_increment faraday insert_count_increment;
+          f ();
+          loop ()
+        | Error _ as e ->
+          return e
+    in
+    loop ()
 end
 
 let reconstruct_required_insert_count t ~encoded_insert_count =

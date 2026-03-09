@@ -41,9 +41,11 @@ type header =
 type error =
   | QPACK_DECOMPRESSION_FAILED
   | QPACK_ENCODER_STREAM_ERROR
+  | QPACK_DECODER_STREAM_ERROR
 
 let ok = Ok ()
 
 let decompression_failed = Error QPACK_DECOMPRESSION_FAILED
 
 let encoder_stream_error = Error QPACK_ENCODER_STREAM_ERROR
+let decoder_stream_error = Error QPACK_DECODER_STREAM_ERROR

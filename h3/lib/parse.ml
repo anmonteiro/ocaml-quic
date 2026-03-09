@@ -65,45 +65,47 @@ let parse_headers_frame length =
     (Angstrom.Unsafe.take length Bigstringaf.sub)
 
 let parse_cancel_push_frame length =
-  lift
-    (fun i ->
-      assert (length = varint_encoding_length i);
-      Frame.Cancel_push (Int64.of_int i))
-    variable_length_integer
+  Angstrom.Unsafe.take length Bigstringaf.sub >>= fun bs ->
+  match
+    Angstrom.parse_bigstring ~consume:Prefix variable_length_integer bs
+  with
+  | Ok i -> return (Frame.Cancel_push (Int64.of_int i))
+  | Error _ -> return (Frame.Cancel_push 0L)
 
-let parse_settings =
-  fix (fun m ->
-      lift3
-        (fun k v (settings, acc) ->
-          let acc' =
-            varint_encoding_length k + varint_encoding_length v + acc
-          in
-          match k with
-          | x when Settings.Type.is_unknown x ->
-            (* From RFC9114§7.2.4.1:
-             *   Setting identifiers of the format 0x1f * N + 0x21 for
-             *   non-negative integer values of N are reserved to exercise the
-             *   requirement that unknown identifiers be ignored. Such settings
-             *   have no defined meaning.  Endpoints SHOULD include at least
-             *   one such setting in their SETTINGS frame. Endpoints MUST NOT
-             *   consider such settings to have any meaning upon receipt. *)
-            settings, acc'
-          | 0x6 ->
-            (* From RFC9114§7.2.4.1:
-             *   SETTINGS_MAX_FIELD_SECTION_SIZE (0x6): The default value is
-             *   unlimited. See Section 4.1.1 for usage. *)
-            { Settings.max_field_section_size = v }, acc'
-          | _ -> assert false)
-        variable_length_integer
-        variable_length_integer
-        m
-      <|> return (Settings.default, 0))
+let is_forbidden_h2_setting = function
+  | 0x2 | 0x3 | 0x4 | 0x5 -> true
+  | _ -> false
+
+let apply_setting settings k v =
+  match k with
+  | x when Settings.Type.is_unknown x ->
+    (* From RFC9114§7.2.4.1:
+     *   Setting identifiers of the format 0x1f * N + 0x21 for non-negative
+     *   integer values of N are reserved to exercise the requirement that
+     *   unknown identifiers be ignored. *)
+    settings
+  | 0x6 ->
+    (* From RFC9114§7.2.4.1:
+     *   SETTINGS_MAX_FIELD_SECTION_SIZE (0x6). *)
+    { settings with Settings.max_field_section_size = v }
+  | _ ->
+    if is_forbidden_h2_setting k
+    then { settings with Settings.has_h2_forbidden = true }
+    else settings
 
 let parse_settings_frame length =
-  (match length with 0 -> return (Settings.default, 0) | _n -> parse_settings)
-  >>| fun (settings, total_length) ->
-  assert (total_length = length);
-  Frame.Settings settings
+  let rec loop remaining settings =
+    if remaining = 0
+    then return settings
+    else
+      variable_length_integer >>= fun k ->
+      variable_length_integer >>= fun v ->
+      let consumed = varint_encoding_length k + varint_encoding_length v in
+      if consumed > remaining
+      then fail "SETTINGS payload length mismatch"
+      else loop (remaining - consumed) (apply_setting settings k v)
+  in
+  loop length Settings.default >>| fun settings -> Frame.Settings settings
 
 let parse_push_promise_frame length =
   variable_length_integer >>= fun push_id ->
@@ -113,18 +115,20 @@ let parse_push_promise_frame length =
     (Unsafe.take (length - id_len) Bigstringaf.sub)
 
 let parse_goaway_frame length =
-  lift
-    (fun i ->
-      assert (length = varint_encoding_length i);
-      Frame.GoAway i)
-    variable_length_integer
+  Angstrom.Unsafe.take length Bigstringaf.sub >>= fun bs ->
+  match
+    Angstrom.parse_bigstring ~consume:All variable_length_integer bs
+  with
+  | Ok i -> return (Frame.GoAway i)
+  | Error _ -> fail "invalid GOAWAY payload"
 
 let parse_max_push_id_frame length =
-  lift
-    (fun i ->
-      assert (length = varint_encoding_length i);
-      Frame.Max_push_id i)
-    variable_length_integer
+  Angstrom.Unsafe.take length Bigstringaf.sub >>= fun bs ->
+  match
+    Angstrom.parse_bigstring ~consume:All variable_length_integer bs
+  with
+  | Ok i -> return (Frame.Max_push_id i)
+  | Error _ -> fail "invalid MAX_PUSH_ID payload"
 
 let parse_frame =
   variable_length_integer >>= fun frame_type ->
@@ -197,11 +201,24 @@ module Reader = struct
   type frame = parse_error t
 
   let create parser = { parser; parse_state = AB.parse parser; closed = false }
-  let ignored_stream = skip_many (any_char <* commit) >>| fun () -> Ok ()
+  let ignored_stream =
+    let rec loop () =
+      peek_char >>= function
+      | None -> return (Ok ())
+      | Some _ -> any_char *> loop ()
+    in
+    loop ()
 
   let http3_frames handler =
-    skip_many (parse_frame <* commit >>| fun frame -> handler frame)
-    >>| fun () -> Ok ()
+    let rec loop () =
+      peek_char >>= function
+      | None -> return (Ok ())
+      | Some _ ->
+        parse_frame <* commit >>= fun frame ->
+        handler frame;
+        loop ()
+    in
+    loop ()
 
   let unirectional_frames select_stream_parser =
     let parser =

@@ -50,6 +50,7 @@ type stream =
   { stream : Stream.t
   ; direction : Quic.Direction.t
   ; mutable reqd : Reqd.t option
+  ; mutable saw_headers : bool
   ; writer : Writer.t
   }
 
@@ -75,6 +76,24 @@ type t =
   ; qpack_decoder : Qdecoder.t
   }
 
+let qpack_decompression_failed = 0x200
+let qpack_encoder_stream_error = 0x201
+let qpack_decoder_stream_error = 0x202
+
+let close_connection stream code =
+  Quic.Stream.report_application_error stream.stream code
+
+let close_with_h3_error stream code =
+  close_connection stream (Error.Code.serialize code)
+
+let close_with_qpack_error stream = function
+  | Qpack.QPACK_DECOMPRESSION_FAILED ->
+    close_connection stream qpack_decompression_failed
+  | Qpack.QPACK_ENCODER_STREAM_ERROR ->
+    close_connection stream qpack_encoder_stream_error
+  | Qpack.QPACK_DECODER_STREAM_ERROR ->
+    close_connection stream qpack_decoder_stream_error
+
 let default_error_handler ?request:_ error handle =
   let message =
     match error with
@@ -86,13 +105,13 @@ let default_error_handler ?request:_ error handle =
   Body.Writer.write_string body message;
   Body.Writer.close body
 
-let handle_headers t { stream; writer; _ } headers =
+let handle_headers t ({ stream; writer; _ } as stream_state) headers =
   let stream_id = Stream.id stream in
   match Headers.method_path_and_scheme_or_malformed headers with
-  | `Malformed -> failwith "`Bad_request ProtocolError"
+  | `Malformed -> `Malformed
   | `Valid (meth, path, scheme) ->
     (match Message.body_length headers with
-    | `Error _e -> failwith "ProtocolError"
+    | `Error _e -> `Malformed
     | _body_length ->
       let request =
         Request.create ~scheme ~headers (Httpaf.Method.of_string meth) path
@@ -109,50 +128,95 @@ let handle_headers t { stream; writer; _ } headers =
           stream
           writer
       in
-      t.request_handler reqd)
+      stream_state.reqd <- Some reqd;
+      stream_state.saw_headers <- true;
+      t.request_handler reqd;
+      `Ok)
 
 let process_headers_frame t stream headers_block =
   let stream_id = Stream.id stream.stream in
   let f bs =
-    match
-      Angstrom.parse_bigstring
-        ~consume:All
-        (Qdecoder.parser t.qpack_decoder ~stream_id)
-        bs
+    try
+      match
+        Angstrom.parse_bigstring
+          ~consume:All
+          (Qdecoder.parser t.qpack_decoder ~stream_id)
+          bs
+      with
+      | Ok (Ok (headers, _instructions)) ->
+        (match handle_headers t stream (Headers.of_qpack_list headers) with
+        | `Ok -> ()
+        | `Malformed -> close_with_h3_error stream Error.Code.Message_error)
+      | Ok (Error qpack_error) ->
+        close_with_qpack_error stream qpack_error
+      | Error _ ->
+        close_with_qpack_error stream Qpack.QPACK_DECOMPRESSION_FAILED
     with
-    | Ok (Ok (headers, _instructions)) ->
-      handle_headers t stream (Headers.of_qpack_list headers)
-    | Ok (Error _) | Error _ -> assert false
+    | _exn ->
+      close_with_qpack_error stream Qpack.QPACK_DECOMPRESSION_FAILED
   in
-  match
-    Qdecoder.decode_header_block t.qpack_decoder ~stream_id headers_block f
+  try
+    match
+      Qdecoder.decode_header_block t.qpack_decoder ~stream_id headers_block f
+    with
+    | Ok () -> ()
+    | Error qpack_error -> close_with_qpack_error stream qpack_error
   with
-  | _ -> ()
+  | _exn ->
+    close_with_qpack_error stream Qpack.QPACK_DECOMPRESSION_FAILED
 
-let process_data_frame _t _bs = failwith "NYI: process_data"
+let process_data_frame stream bs =
+  match stream.reqd with
+  | None -> close_with_h3_error stream Error.Code.Frame_unexpected
+  | Some reqd ->
+    let request_body = Reqd.request_body reqd in
+    let faraday = Body.Reader.unsafe_faraday request_body in
+    if not (Faraday.is_closed faraday)
+    then (
+      Faraday.schedule_bigstring faraday bs;
+      Body.Reader.execute_read request_body)
 
-let process_settings_frame t stream _settings_list =
+let process_settings_frame t stream settings =
   match t.saw_control_settings with
   | false ->
     (match t.critical_streams.peer_control with
     | Some control_stream
       when Stream.id stream.stream = Stream.id control_stream.stream ->
-      t.saw_control_settings <- true;
-      () (* TODO: actually process settings *)
+      if settings.Settings.has_h2_forbidden
+      then close_with_h3_error stream Error.Code.Settings_error
+      else t.saw_control_settings <- true
     | _ ->
       (* From RFC9114§7.2.4:
        *   If an endpoint receives a SETTINGS frame on a different stream, the
        *   endpoint MUST respond with a connection error of type
        *   H3_FRAME_UNEXPECTED. *)
-      failwith "TODO: report error")
+      close_with_h3_error stream Error.Code.Frame_unexpected)
   | true ->
     (* From RFC9114§7.2.4:
      *   If an endpoint receives a second SETTINGS frame on the control stream,
      *   the endpoint MUST respond with a connection error of type
      *   H3_FRAME_UNEXPECTED. *)
-    failwith "TODO: report error"
+    close_with_h3_error stream Error.Code.Frame_unexpected
 
-let process_goaway_frame _t _id = failwith "NYI: goaway"
+let process_goaway_frame _t _id = ()
+
+let is_peer_critical_stream t stream_id =
+  let is_control =
+    match t.critical_streams.peer_control with
+    | Some stream -> Stream.id stream.stream = stream_id
+    | None -> false
+  in
+  let is_qencoder =
+    match t.critical_streams.peer_qencoder with
+    | Some stream -> Stream.id stream = stream_id
+    | None -> false
+  in
+  let is_qdecoder =
+    match t.critical_streams.peer_qdecoder with
+    | Some stream -> Stream.id stream = stream_id
+    | None -> false
+  in
+  is_control || is_qencoder || is_qdecoder
 
 let rec read t stream ~reader bs ~off ~len:_ =
   assert (off = 0);
@@ -162,24 +226,44 @@ let rec read t stream ~reader bs ~off ~len:_ =
     ~on_eof:(read_eof t stream ~reader)
     ~on_read:(read t stream ~reader)
 
-and read_eof _t _stream ~reader () =
-  Reader.read_with_more reader Bigstringaf.empty Complete
+and read_eof t stream ~reader () =
+  Reader.read_with_more reader Bigstringaf.empty Complete;
+  if is_peer_critical_stream t (Stream.id stream.stream)
+  then close_with_h3_error stream Error.Code.Closed_critical_stream
 
 (* From RFC9114§8.1:
  *   After the QUIC connection is established, a SETTINGS frame (Section
  *   7.2.4) MUST be sent by each endpoint as the initial frame of their
  *   respective HTTP control stream; see Section 6.2.1. *)
 let frame_handler t (stream : stream) frame =
-  Format.eprintf "FR: %d@." (Frame.to_frame_type frame |> Frame.Type.serialize);
-  match frame with
-  | Frame.Headers header_block -> process_headers_frame t stream header_block
-  | Data bs -> process_data_frame t bs
-  | Settings settings -> process_settings_frame t stream settings
-  | Push_promise _ -> assert false
-  | Cancel_push _ -> ()
-  | Max_push_id _ -> ()
-  | GoAway id -> process_goaway_frame t id
-  | Ignored _ | Unknown _ -> ()
+  let is_peer_control_stream =
+    match t.critical_streams.peer_control with
+    | Some control_stream ->
+      Stream.id stream.stream = Stream.id control_stream.stream
+    | None -> false
+  in
+  if is_peer_control_stream
+  then
+    if not t.saw_control_settings
+    then (
+      match frame with
+      | Frame.Settings settings -> process_settings_frame t stream settings
+      | _ -> close_with_h3_error stream Error.Code.Missing_settings)
+    else
+      match frame with
+      | Frame.Settings _ | Data _ | Headers _ ->
+        close_with_h3_error stream Error.Code.Frame_unexpected
+      | Push_promise _ | Max_push_id _ ->
+        close_with_h3_error stream Error.Code.Frame_unexpected
+      | GoAway id -> process_goaway_frame t id
+      | Cancel_push _ | Ignored _ | Unknown _ -> ()
+  else
+    match frame with
+    | Headers header_block -> process_headers_frame t stream header_block
+    | Data bs -> process_data_frame stream bs
+    | Cancel_push _ | Frame.Settings _ | Push_promise _ | Max_push_id _ | GoAway _ ->
+      close_with_h3_error stream Error.Code.Frame_unexpected
+    | Ignored _ | Unknown _ -> ()
 
 let start_unidirectional_stream
     ~(start_stream : Quic.Transport.start_stream)
@@ -194,6 +278,7 @@ let start_unidirectional_stream ~start_stream typ =
   let control_stream =
     { stream = quic_stream
     ; direction = Unidirectional
+    ; saw_headers = false
     ; writer = Writer.create quic_stream
     ; reqd = None
     }
@@ -207,12 +292,28 @@ let unistream_frame_handler t (stream : stream) unitype =
   match unitype with
   | Unidirectional_stream.Qencoder ->
     t.critical_streams.peer_qencoder <- Some stream.stream;
-    skip_many (Qpack.Encoder.Instruction.parser t.qpack_encoder) >>| fun () ->
-    Ok ()
+    let f = Stream.unsafe_faraday stream.stream in
+    (Qdecoder.parse_instructions t.qpack_decoder f >>| function
+     | Ok () -> Ok ()
+     | Error qpack_error ->
+       close_with_qpack_error stream qpack_error;
+       Ok ())
   | Qdecoder ->
     t.critical_streams.peer_qdecoder <- Some stream.stream;
-    let f = Stream.unsafe_faraday stream.stream in
-    Qdecoder.parse_instructions t.qpack_decoder f >>| fun () -> Ok ()
+    let rec parse_qdecoder_stream () =
+      peek_char >>= function
+      | None -> return (Ok ())
+      | Some _ ->
+        Qpack.Encoder.Instruction.parser t.qpack_encoder >>= function
+        | Ok (Qpack.Encoder.Instruction.Insert_count_increment 0) ->
+          close_connection stream qpack_decoder_stream_error;
+          return (Ok ())
+        | Ok _ -> parse_qdecoder_stream ()
+        | Error _ ->
+          close_connection stream qpack_decoder_stream_error;
+          return (Ok ())
+    in
+    parse_qdecoder_stream ()
   | Control ->
     t.critical_streams.peer_control <- Some stream;
     Reader.http3_frames (frame_handler t stream)
@@ -269,6 +370,7 @@ let create
         | None ->
           { stream = quic_stream
           ; direction
+          ; saw_headers = false
           ; reqd = None
           ; writer = Writer.create quic_stream
           }
