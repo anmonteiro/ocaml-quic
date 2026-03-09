@@ -479,9 +479,11 @@ module Connection = struct
                       ; Initial_source_connection_id t.source_cid
                       ; Initial_max_data (Int64.to_int t.local_initial_max_data)
                       ; Initial_max_stream_data_bidi_local
-                          (Int64.to_int t.local_initial_max_stream_data_bidi_local)
+                          (Int64.to_int
+                             t.local_initial_max_stream_data_bidi_local)
                       ; Initial_max_stream_data_bidi_remote
-                          (Int64.to_int t.local_initial_max_stream_data_bidi_remote)
+                          (Int64.to_int
+                             t.local_initial_max_stream_data_bidi_remote)
                       ; Initial_max_stream_data_uni
                           (Int64.to_int t.local_initial_max_stream_data_uni)
                       ; Initial_max_streams_bidi
