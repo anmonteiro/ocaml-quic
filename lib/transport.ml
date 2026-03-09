@@ -424,40 +424,49 @@ module Connection = struct
       =
       match packets with
       | (`Change_enc _ :: _ | `Change_dec _ :: _)
-        when
-          cur_encryption_level = Encryption_level.Application_data
-          && not (Tls.Engine.handshake_in_progress t.tls_state) ->
+        when cur_encryption_level = Encryption_level.Application_data
+             && not (Tls.Engine.handshake_in_progress t.tls_state) ->
         report_unexpected_tls_message ();
         cur_encryption_level
       | `Change_enc enc :: `Change_dec dec :: xs
       | `Change_dec dec :: `Change_enc enc :: xs ->
-        let current_cipher = Qtls.current_cipher new_tls_state in
-        let next = Encryption_level.next cur_encryption_level in
-        t.encdec.current <- next;
-        Encryption_level.add
-          next
-          { Crypto.encrypter =
-              Crypto.AEAD.make ~ciphersuite:current_cipher enc.traffic_secret
-          ; decrypter =
-              Some
-                (Crypto.AEAD.make
-                   ~ciphersuite:current_cipher
-                   dec.traffic_secret)
-          }
-          t.encdec;
-        process_packets next xs
+        if cur_encryption_level = Encryption_level.Application_data
+        then (
+          report_unexpected_tls_message ();
+          cur_encryption_level)
+        else
+          let current_cipher = Qtls.current_cipher new_tls_state in
+          let next = Encryption_level.next cur_encryption_level in
+          t.encdec.current <- next;
+          Encryption_level.add
+            next
+            { Crypto.encrypter =
+                Crypto.AEAD.make ~ciphersuite:current_cipher enc.traffic_secret
+            ; decrypter =
+                Some
+                  (Crypto.AEAD.make
+                     ~ciphersuite:current_cipher
+                     dec.traffic_secret)
+            }
+            t.encdec;
+          process_packets next xs
       | `Change_enc enc :: xs ->
-        let current_cipher = Qtls.current_cipher new_tls_state in
-        let next = Encryption_level.next cur_encryption_level in
-        t.encdec.current <- next;
-        Encryption_level.add
-          next
-          { Crypto.encrypter =
-              Crypto.AEAD.make ~ciphersuite:current_cipher enc.traffic_secret
-          ; decrypter = None
-          }
-          t.encdec;
-        process_packets next xs
+        if cur_encryption_level = Encryption_level.Application_data
+        then (
+          report_unexpected_tls_message ();
+          cur_encryption_level)
+        else
+          let current_cipher = Qtls.current_cipher new_tls_state in
+          let next = Encryption_level.next cur_encryption_level in
+          t.encdec.current <- next;
+          Encryption_level.add
+            next
+            { Crypto.encrypter =
+                Crypto.AEAD.make ~ciphersuite:current_cipher enc.traffic_secret
+            ; decrypter = None
+            }
+            t.encdec;
+          process_packets next xs
       | `Change_dec dec :: xs ->
         let current_cipher = Qtls.current_cipher new_tls_state in
         Encryption_level.update_current
@@ -589,14 +598,12 @@ module Connection = struct
             (* TODO: send alerts as quic error *)
             process_tls_result t ~new_tls_state:tls_state' ~tls_packets)
       | Server13 Established13 ->
-        (match encryption_level with
-        | Initial | Handshake -> ()
-        | Application_data | Zero_RTT ->
-          report_error
-            t
-            ~frame_type:Crypto
-            Protocol_violation)
-      | Server Established -> ()
+        report_error
+          t
+          ~frame_type:Crypto
+          (Crypto_error
+             (Tls.Packet.alert_type_to_int Tls.Packet.UNEXPECTED_MESSAGE))
+      | Server Established -> report_error t ~frame_type:Crypto Internal_error
       | Client (AwaitServerHello (_, _, _)) ->
         if encryption_level <> Initial || t.encdec.current <> Initial
         then ()
@@ -780,8 +787,7 @@ module Connection = struct
             t
             ~frame_type:Frame.Type.Max_stream_data
             Stream_state_error
-        else
-          ()
+        else ()
       | Some _ -> ()
 
   (* TODO: closing/ draining states, section 10.2 *)
@@ -1487,7 +1493,14 @@ let packet_handler t ?error packet =
   | None -> ()
   | Some c ->
     (match error with
-    | Some error -> Connection.report_error c error
+    | Some error ->
+      let encryption_level =
+        match packet with
+        | Packet.Frames { header; _ } ->
+          Some (Encryption_level.of_header header)
+        | Packet.VersionNegotiation _ | Packet.Retry _ -> None
+      in
+      Connection.report_error c ?encryption_level error
     | None ->
       if CID.is_empty c.original_dest_cid
       then
@@ -1609,38 +1622,74 @@ let create ~mode ~now_ms ~config connection_handler =
     if CID.is_empty connection_id
     then None
     else
-      let decrypter_and_largest_pn =
-        match Connection.Table.find_opt t.connections connection_id with
-        | Some connection ->
-          let encryption_level = Encryption_level.of_header header in
-          let pn_space =
-            Spaces.of_encryption_level
-              connection.packet_number_spaces
-              encryption_level
-          in
-          (match Encryption_level.find encryption_level connection.encdec with
-          | Some { decrypter = Some decrypter; _ } ->
-            Some (decrypter, pn_space.received)
-          | Some { decrypter = None; _ } ->
-            (* Keys for this encryption level were dropped; ignore packet. *)
-            None
-          | None ->
-            (* No key material for this level on this connection yet. *)
-            None)
-        | None ->
-          if Encryption_level.of_header header = Initial
+      let encryption_level = Encryption_level.of_header header in
+      match Connection.Table.find_opt t.connections connection_id with
+      | Some connection ->
+        let pn_space =
+          Spaces.of_encryption_level
+            connection.packet_number_spaces
+            encryption_level
+        in
+        (match Encryption_level.find encryption_level connection.encdec with
+        | Some { decrypter = Some decrypter; _ } ->
+          Crypto.AEAD.decrypt_packet
+            decrypter
+            ~payload_length
+            ~largest_pn:pn_space.received
+            cs
+        | Some { decrypter = None; _ } | None ->
+          if encryption_level = Handshake && connection.encdec.current = Initial
           then
-            Some
-              ( Crypto.InitialAEAD.make
-                  ~mode:(Crypto.Mode.peer t.mode)
-                  connection_id
-              , -1L )
-          else None
-      in
-      match decrypter_and_largest_pn with
-      | Some (decrypter, largest_pn) ->
-        Crypto.AEAD.decrypt_packet decrypter ~payload_length ~largest_pn cs
-      | None -> None
+            (* A Handshake packet before Handshake keys are available is
+               invalid; close with PROTOCOL_VIOLATION. *)
+            Connection.report_error
+              connection
+              ~frame_type:Frame.Type.Padding
+              Protocol_violation;
+          None)
+      | None ->
+        if encryption_level = Initial
+        then
+          let decrypter =
+            Crypto.InitialAEAD.make
+              ~mode:(Crypto.Mode.peer t.mode)
+              connection_id
+          in
+          Crypto.AEAD.decrypt_packet
+            decrypter
+            ~payload_length
+            ~largest_pn:(-1L)
+            cs
+        else
+          let rec try_candidates = function
+            | Seq.Nil -> None
+            | Seq.Cons ((candidate : Connection.t), xs) ->
+              let pn_space =
+                Spaces.of_encryption_level
+                  candidate.packet_number_spaces
+                  encryption_level
+              in
+              (match
+                 Encryption_level.find encryption_level candidate.encdec
+               with
+              | Some { decrypter = Some decrypter; _ } ->
+                (match
+                   Crypto.AEAD.decrypt_packet
+                     decrypter
+                     ~payload_length
+                     ~largest_pn:pn_space.received
+                     cs
+                 with
+                | Some _ as decrypted ->
+                  register_connection_id
+                    t
+                    ~cid:connection_id
+                    ~connection:candidate;
+                  decrypted
+                | None -> try_candidates (xs ()))
+              | Some { decrypter = None; _ } | None -> try_candidates (xs ()))
+          in
+          try_candidates (Connection.Table.to_seq_values t.connections ())
   and t =
     lazy
       { reader = Reader.packets ~decrypt:(decrypt t) (reader_packet_handler t)
