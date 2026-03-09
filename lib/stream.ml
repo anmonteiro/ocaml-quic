@@ -345,6 +345,7 @@ type t =
   ; typ : Type.t
   ; id : int64
   ; mutable error_handler : int -> unit
+  ; mutable report_application_error : int -> unit
   }
 
 let default_error_handler _ = ()
@@ -355,6 +356,7 @@ let create ~typ ~id when_ready =
   ; typ
   ; id
   ; error_handler = default_error_handler
+  ; report_application_error = default_error_handler
   }
 
 (* These are not consumed by the application, so the `recv` consumer starts out
@@ -366,6 +368,7 @@ let create_crypto () =
   ; typ = Server Bidirectional
   ; id = -1L
   ; error_handler = default_error_handler
+  ; report_application_error = default_error_handler
   }
 
 let id { id; _ } = id
@@ -395,3 +398,6 @@ let close_reader t = Buffer.close_reader t.recv.consumer
 
 let is_closed t =
   Buffer.is_closed t.recv.consumer && Buffer.is_closed t.send.producer
+
+let set_report_application_error t f = t.report_application_error <- f
+let report_application_error t code = t.report_application_error code
