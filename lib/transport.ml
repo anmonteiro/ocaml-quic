@@ -667,8 +667,13 @@ module Connection = struct
     | None -> ()
 
   let create_stream (c : t) ~typ ~id =
-    let stream = Stream.create ~typ ~id c.wakeup_writer in
-    Stream.set_report_application_error stream (report_application_error c);
+    let stream =
+      Stream.create
+        ~typ
+        ~id
+        ~report_application_error:(report_application_error c)
+        c.wakeup_writer
+    in
     Hashtbl.add c.streams id stream;
     stream
 
