@@ -184,12 +184,13 @@ module Encoding = struct
    *   semantics, and may carry arbitrary values. *)
   let parser =
     let open Angstrom in
+    let is_known_transport_parameter type_ = type_ >= 0x00 && type_ <= 0x10 in
     let p =
       Parse.variable_length_integer >>= fun type_ ->
       Parse.variable_length_integer >>= fun length ->
-      parse_transport_parameter type_ length
-      >>| Option.some
-      <|> lift (fun () -> None) (advance length)
+      if is_known_transport_parameter type_
+      then parse_transport_parameter type_ length >>| Option.some
+      else lift (fun () -> None) (advance length)
     in
     many p >>| List.filter_map (fun x -> x)
 
