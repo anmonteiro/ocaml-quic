@@ -306,6 +306,13 @@ module Connection = struct
       shutdown t;
       wakeup_writer t)
 
+  let report_tls_failure t failure =
+    let _level, alert = Tls.Engine.alert_of_failure failure in
+    report_error
+      t
+      ~frame_type:Frame.Type.Crypto
+      (Crypto_error (Tls.Packet.alert_type_to_int alert))
+
   let process_reset_stream_frame
         t
         ~stream_id
@@ -400,11 +407,28 @@ module Connection = struct
         else ()
 
   let process_tls_result t ~new_tls_state ~tls_packets =
+    let drop_initial_and_handshake_keys t =
+      Encryption_level.remove Initial t.encdec;
+      Encryption_level.remove Handshake t.encdec
+    in
+    let report_unexpected_tls_message () =
+      report_error
+        t
+        ~frame_type:Frame.Type.Crypto
+        (Crypto_error
+           (Tls.Packet.alert_type_to_int Tls.Packet.UNEXPECTED_MESSAGE))
+    in
     let rec process_packets
               cur_encryption_level
               (packets : Qtls.State.rec_resp list)
       =
       match packets with
+      | (`Change_enc _ :: _ | `Change_dec _ :: _)
+        when
+          cur_encryption_level = Encryption_level.Application_data
+          && not (Tls.Engine.handshake_in_progress t.tls_state) ->
+        report_unexpected_tls_message ();
+        cur_encryption_level
       | `Change_enc enc :: `Change_dec dec :: xs
       | `Change_dec dec :: `Change_enc enc :: xs ->
         let current_cipher = Qtls.current_cipher new_tls_state in
@@ -482,7 +506,13 @@ module Connection = struct
        *   The server uses the HANDSHAKE_DONE frame (type=0x1e) to signal
        *   confirmation of the handshake to the client. *)
       assert (t.encdec.current = Application_data);
-      send_frames t [ Frame.Handshake_done ]);
+      send_frames t [ Frame.Handshake_done ];
+      (* From RFC9001§4.9.2:
+       *   "An endpoint MUST discard its Handshake keys when the TLS handshake
+       *   is confirmed" (and Initial keys at the same time). Per RFC9001§4.1.2,
+       *   servers confirm when the handshake completes.
+       *)
+      drop_initial_and_handshake_keys t);
     t.tls_state <- new_tls_state
 
   let rec exhaust_crypto_stream t ~packet_info ~(stream : Stream.t) =
@@ -527,7 +557,7 @@ module Connection = struct
               t.tls_state
               fragment_cstruct
           with
-          | Error _e -> report_error t ~frame_type:Crypto Internal_error
+          | Error e -> report_tls_failure t e
           | Ok (tls_state', tls_packets, (None | Some _)) ->
             (* TODO: send alerts as quic error *)
             (match tls_packets with
@@ -546,7 +576,7 @@ module Connection = struct
                     Int64.of_int transport_params.max_ack_delay;
                   process_tls_result t ~new_tls_state:tls_state' ~tls_packets
                 | Error e -> report_error t ~frame_type:Crypto e)
-              | None -> ())))
+              | None -> report_error t ~frame_type:Crypto (Crypto_error 0x6d))))
       | Server13
           ( AwaitClientCertificate13 _ | AwaitClientCertificateVerify13 _
           | AwaitClientFinished13 _ ) ->
@@ -554,20 +584,25 @@ module Connection = struct
         then ()
         else (
           match Qtls.handle_raw_record t.tls_state fragment_cstruct with
-          | Error _e -> report_error t ~frame_type:Crypto Internal_error
+          | Error e -> report_tls_failure t e
           | Ok (tls_state', tls_packets, (None | Some _)) ->
             (* TODO: send alerts as quic error *)
             process_tls_result t ~new_tls_state:tls_state' ~tls_packets)
       | Server13 Established13 ->
-        (* TODO: handle key updates *)
-        ()
-      | Server Established -> report_error t ~frame_type:Crypto Internal_error
+        (match encryption_level with
+        | Initial | Handshake -> ()
+        | Application_data | Zero_RTT ->
+          report_error
+            t
+            ~frame_type:Crypto
+            Protocol_violation)
+      | Server Established -> ()
       | Client (AwaitServerHello (_, _, _)) ->
         if encryption_level <> Initial || t.encdec.current <> Initial
         then ()
         else (
           match Qtls.handle_raw_record t.tls_state fragment_cstruct with
-          | Error _e -> report_error t ~frame_type:Crypto Internal_error
+          | Error e -> report_tls_failure t e
           | Ok (tls_state', tls_packets, (None | Some _)) ->
             (* TODO: send alerts as quic error *)
             process_tls_result t ~new_tls_state:tls_state' ~tls_packets)
@@ -580,7 +615,7 @@ module Connection = struct
         then ()
         else (
           match Qtls.handle_raw_record t.tls_state fragment_cstruct with
-          | Error _e -> report_error t ~frame_type:Crypto Internal_error
+          | Error e -> report_tls_failure t e
           | Ok (tls_state', tls_packets, (None | Some _)) ->
             (* TODO: send alerts as quic error *)
             process_tls_result t ~new_tls_state:tls_state' ~tls_packets)
@@ -589,7 +624,7 @@ module Connection = struct
         then ()
         else (
           match Qtls.handle_raw_record t.tls_state fragment_cstruct with
-          | Error _e -> report_error t ~frame_type:Crypto Internal_error
+          | Error e -> report_tls_failure t e
           | Ok (tls_state', tls_packets, (None | Some _)) ->
             process_tls_result t ~new_tls_state:tls_state' ~tls_packets)
       | Client _ | Client13 _ -> ()
@@ -791,7 +826,14 @@ module Connection = struct
         | Ok transport_params ->
           t.peer_transport_params <- transport_params;
           t.recovery.rtt.max_ack_delay_ms <-
-            Int64.of_int transport_params.max_ack_delay
+            Int64.of_int transport_params.max_ack_delay;
+          (* From RFC9001§4.9.2:
+           *   "An endpoint MUST discard its Handshake keys when the TLS
+           *   handshake is confirmed" (and Initial keys at the same time). Per
+           *   RFC9001§4.1.2, clients confirm on HANDSHAKE_DONE.
+           *)
+          Encryption_level.remove Initial t.encdec;
+          Encryption_level.remove Handshake t.encdec
         | Error err -> report_error t ~frame_type:Handshake_done err))
 
   let process_path_challenge_frame t buf =
@@ -802,6 +844,37 @@ module Connection = struct
      *
      *)
     send_frames t [ Frame.Path_response buf ]
+
+  let process_max_streams_frame t ~direction max_streams =
+    if max_streams > Stream_id.max
+    then
+      report_error
+        t
+        ~frame_type:(Frame.Type.Max_streams direction)
+        Frame_encoding_error
+
+  let process_streams_blocked_frame t ~direction max_streams =
+    if max_streams > Stream_id.max
+    then
+      report_error
+        t
+        ~frame_type:(Frame.Type.Streams_blocked direction)
+        Frame_encoding_error
+
+  let process_new_connection_id_frame t ~cid ~retire_prior_to ~sequence_no =
+    if CID.length cid = 0 || retire_prior_to > sequence_no
+    then
+      report_error
+        t
+        ~frame_type:Frame.Type.New_connection_id
+        Frame_encoding_error
+    else (
+      Format.eprintf
+        "new conn? %s@."
+        (let (`Hex x) = Hex.of_string (CID.to_string cid) in
+         x);
+      (* Track the latest peer-provided CID for outgoing packets. *)
+      t.dest_cid <- cid)
 
   let frame_handler ~packet_info t frame =
     (* TODO: validate that frame can appear at current encryption level. *)
@@ -848,17 +921,13 @@ module Connection = struct
     | Max_data _ -> ()
     | Max_stream_data { stream_id; _ } ->
       process_max_stream_data_frame t ~stream_id
-    | Max_streams (_, _)
-    | Data_blocked _ | Stream_data_blocked _
-    | Streams_blocked (_, _) ->
-      ()
-    | New_connection_id { cid; _ } ->
-      Format.eprintf
-        "new conn? %s@."
-        (let (`Hex x) = Hex.of_string (CID.to_string cid) in
-         x);
-      (* Track the latest peer-provided CID for outgoing packets. *)
-      t.dest_cid <- cid
+    | Max_streams (direction, max_streams) ->
+      process_max_streams_frame t ~direction max_streams
+    | Data_blocked _ | Stream_data_blocked _ -> ()
+    | Streams_blocked (direction, max_streams) ->
+      process_streams_blocked_frame t ~direction max_streams
+    | New_connection_id { cid; retire_prior_to; sequence_no; _ } ->
+      process_new_connection_id_frame t ~cid ~retire_prior_to ~sequence_no
     | Retire_connection_id _ -> ()
     | Path_challenge buf ->
       if packet_info.encryption_level <> Application_data
