@@ -30,9 +30,28 @@
  *  POSSIBILITY OF SUCH DAMAGE.
  *---------------------------------------------------------------------------*)
 
+type transport_parameters =
+  { initial_max_data : int
+  ; initial_max_stream_data_bidi_local : int
+  ; initial_max_stream_data_bidi_remote : int
+  ; initial_max_stream_data_uni : int
+  ; initial_max_streams_bidi : int
+  ; initial_max_streams_uni : int
+  }
+
+let default_transport_parameters =
+  { initial_max_data = 1 lsl 27
+  ; initial_max_stream_data_bidi_local = 1 lsl 27
+  ; initial_max_stream_data_bidi_remote = 1 lsl 27
+  ; initial_max_stream_data_uni = 1 lsl 27
+  ; initial_max_streams_bidi = 1 lsl 8
+  ; initial_max_streams_uni = 1 lsl 8
+  }
+
 type t =
   { certificates : Tls.Config.own_cert
   ; alpn_protocols : string list (* ; authenticator : X509.Authenticator.t *)
+  ; transport_parameters : transport_parameters
   }
 
 let null_auth ?ip:_ ~host:_ _certs = Ok None
