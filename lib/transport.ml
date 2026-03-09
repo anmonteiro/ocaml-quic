@@ -1377,9 +1377,9 @@ let packet_handler t ?error packet =
         (match Packet.source_cid packet with
         | Some src_cid ->
           (* From RFC9000§19.6:
-           *   Upon receiving a packet, each endpoint sets the Destination Connection
-           *   ID it sends to match the value of the Source Connection ID that it
-           *   receives. *)
+           *   Upon receiving a packet, each endpoint sets the Destination
+           *   Connection ID it sends to match the value of the Source
+           *   Connection ID that it receives. *)
           c.dest_cid <- src_cid
         | None ->
           (* TODO: short packets will fail here? *)
@@ -1397,55 +1397,58 @@ let packet_handler t ?error packet =
           }
         in
 
-        (match
-           Angstrom.parse_bigstring
-             ~consume:All
-             (Parse.Frame.parser (Connection.frame_handler c ~packet_info))
-             payload
-         with
-        | Ok _frames ->
-          (* process streams for packets that have been acknowledged. *)
-          let acked_frames =
-            Recovery.drain_acknowledged
-              c.recovery
-              ~encryption_level:packet_info.encryption_level
-          in
-          List.iter
-            (function
-              | Frame.Crypto { IOVec.off; _ } ->
-                let crypto_stream =
-                  Spaces.of_encryption_level
-                    c.crypto_streams
-                    packet_info.encryption_level
-                in
-                Stream.Send.remove off crypto_stream.send
-              | Stream { id; fragment = { IOVec.off; _ }; _ } ->
-                (match Hashtbl.find_opt c.streams id with
-                | Some stream -> Stream.Send.remove off stream.send
-                | None -> ())
-              | Ack { ranges = _; _ } ->
-                (* TODO: when we track packets that need acknowledgement, update
-                   the largest acknowledged here. *)
-                ()
-              | _other -> ())
-            acked_frames;
-          if c.did_send_connection_close
-          then ()
-          else
-            (* This packet has been processed, mark it for acknowledgement. *)
-            let pn_space =
-              Spaces.of_encryption_level
-                c.packet_number_spaces
-                packet_info.encryption_level
+        if Bigstringaf.length payload = 0
+        then Connection.report_error c Protocol_violation
+        else (
+          match
+            Angstrom.parse_bigstring
+              ~consume:All
+              (Parse.Frame.parser (Connection.frame_handler c ~packet_info))
+              payload
+          with
+          | Ok _frames ->
+            (* process streams for packets that have been acknowledged. *)
+            let acked_frames =
+              Recovery.drain_acknowledged
+                c.recovery
+                ~encryption_level:packet_info.encryption_level
             in
-            Packet_number.insert_for_acking pn_space packet_number;
-            (* packet_info should now contain frames we need to send in
-               response. *)
-            send_packets t ~packet_info;
-            (* Reset for the next packet. *)
-            pn_space.ack_elicited <- false
-        | Error e ->
-          Format.eprintf "discarding malformed packet payload: %s@." e)
+            List.iter
+              (function
+                | Frame.Crypto { IOVec.off; _ } ->
+                  let crypto_stream =
+                    Spaces.of_encryption_level
+                      c.crypto_streams
+                      packet_info.encryption_level
+                  in
+                  Stream.Send.remove off crypto_stream.send
+                | Stream { id; fragment = { IOVec.off; _ }; _ } ->
+                  (match Hashtbl.find_opt c.streams id with
+                  | Some stream -> Stream.Send.remove off stream.send
+                  | None -> ())
+                | Ack { ranges = _; _ } ->
+                  (* TODO: when we track packets that need acknowledgement,
+                     update the largest acknowledged here. *)
+                  ()
+                | _other -> ())
+              acked_frames;
+            if c.did_send_connection_close
+            then ()
+            else
+              (* This packet has been processed, mark it for acknowledgement. *)
+              let pn_space =
+                Spaces.of_encryption_level
+                  c.packet_number_spaces
+                  packet_info.encryption_level
+              in
+              Packet_number.insert_for_acking pn_space packet_number;
+              (* packet_info should now contain frames we need to send in
+                 response. *)
+              send_packets t ~packet_info;
+              (* Reset for the next packet. *)
+              pn_space.ack_elicited <- false
+          | Error e ->
+            Format.eprintf "discarding malformed packet payload: %s@." e)
       | Retry { header; token; pseudo; tag } ->
         process_retry_packet t c ~header ~token ~pseudo ~tag))
 
