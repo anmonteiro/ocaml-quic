@@ -1660,36 +1660,7 @@ let create ~mode ~now_ms ~config connection_handler =
             ~payload_length
             ~largest_pn:(-1L)
             cs
-        else
-          let rec try_candidates = function
-            | Seq.Nil -> None
-            | Seq.Cons ((candidate : Connection.t), xs) ->
-              let pn_space =
-                Spaces.of_encryption_level
-                  candidate.packet_number_spaces
-                  encryption_level
-              in
-              (match
-                 Encryption_level.find encryption_level candidate.encdec
-               with
-              | Some { decrypter = Some decrypter; _ } ->
-                (match
-                   Crypto.AEAD.decrypt_packet
-                     decrypter
-                     ~payload_length
-                     ~largest_pn:pn_space.received
-                     cs
-                 with
-                | Some _ as decrypted ->
-                  register_connection_id
-                    t
-                    ~cid:connection_id
-                    ~connection:candidate;
-                  decrypted
-                | None -> try_candidates (xs ()))
-              | Some { decrypter = None; _ } | None -> try_candidates (xs ()))
-          in
-          try_candidates (Connection.Table.to_seq_values t.connections ())
+        else None
   and t =
     lazy
       { reader = Reader.packets ~decrypt:(decrypt t) (reader_packet_handler t)
