@@ -628,6 +628,7 @@ module Connection = struct
       | Server -> Stream_id.is_server_initiated id
       | Client -> Stream_id.is_client_initiated id
     in
+    let stream_exists = Hashtbl.mem c.streams id in
     let is_peer_initiated = not is_locally_initiated in
     let stream_count = Int64.add (Int64.shift_right_logical id 2) 1L in
     let max_peer_streams =
@@ -649,7 +650,14 @@ module Connection = struct
     let stream_final_offset =
       Int64.add (Int64.of_int fragment.IOVec.off) (Int64.of_int fragment.len)
     in
-    if is_peer_initiated && Int64.compare stream_count max_peer_streams > 0
+    if is_locally_initiated && not stream_exists
+    then
+      report_error
+        c
+        ~frame_type:stream_frame_type
+        ~encryption_level
+        Stream_state_error
+    else if is_peer_initiated && Int64.compare stream_count max_peer_streams > 0
     then
       report_error
         c
@@ -715,6 +723,24 @@ module Connection = struct
             in
             Stream.Recv.push fragment ~is_fin stream.recv;
             process_stream_data c ~stream:stream.recv)
+
+  let process_max_stream_data_frame t ~stream_id =
+    let is_locally_initiated =
+      match t.mode with
+      | Server -> Stream_id.is_server_initiated stream_id
+      | Client -> Stream_id.is_client_initiated stream_id
+    in
+    let is_receive_only_stream =
+      Stream_id.is_uni stream_id && not is_locally_initiated
+    in
+    if is_receive_only_stream
+    then
+      report_error t ~frame_type:Frame.Type.Max_stream_data Stream_state_error
+    else
+      match Hashtbl.find_opt t.streams stream_id with
+      | None ->
+        report_error t ~frame_type:Frame.Type.Max_stream_data Stream_state_error
+      | Some _ -> ()
 
   (* TODO: closing/ draining states, section 10.2 *)
   let process_connection_close_quic_frame
@@ -812,7 +838,9 @@ module Connection = struct
         ~id
         ~fragment
         ~is_fin
-    | Max_data _ | Max_stream_data _
+    | Max_data _ -> ()
+    | Max_stream_data { stream_id; _ } ->
+      process_max_stream_data_frame t ~stream_id
     | Max_streams (_, _)
     | Data_blocked _ | Stream_data_blocked _
     | Streams_blocked (_, _) ->
