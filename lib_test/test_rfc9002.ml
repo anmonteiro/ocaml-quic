@@ -42,6 +42,10 @@ let drain_markers t ~encryption_level =
 
 let ranges_of_tuples ranges = List.map (fun (first, last) -> range first last) ranges
 
+let make_stream_frame ~id ~off ~len =
+  let buffer = Bigstringaf.create len in
+  Frame.Stream { id; fragment = { IOVec.off = off; len; buffer }; is_fin = false }
+
 let debug_send
       t
       ~encryption_level
@@ -330,6 +334,28 @@ let test_rfc9002_6_2_1_ack_only_without_in_flight_does_not_arm_pto () =
     None
     s.timer.loss_detection_timer_ms
 
+let test_rfc9002_6_2_1_pto_timer_uses_earliest_active_packet_number_space () =
+  let t = Recovery.create () in
+  debug_send
+    t
+    ~encryption_level:Initial
+    ~packet_number:1
+    ~time_sent_ms:100
+    ~bytes_sent:1200
+    [ Frame.Ping ];
+  debug_send
+    t
+    ~encryption_level:Application_data
+    ~packet_number:1
+    ~time_sent_ms:200
+    ~bytes_sent:1200
+    [ Frame.Ping ];
+  let s = debug_snapshot t in
+  Alcotest.(check (option int64))
+    "PTO timer tracks earliest active packet number space"
+    (Some 1122L)
+    s.timer.loss_detection_timer_ms
+
 let test_rfc9002_6_2_1_pto_backoff_increases_pto_count () =
   let t = Recovery.create () in
   debug_send
@@ -345,6 +371,41 @@ let test_rfc9002_6_2_1_pto_backoff_increases_pto_count () =
     "pto_count increments after timeout"
     1
     s.timer.pto_count
+
+let test_rfc9002_6_2_4_pto_probes_can_exceed_cwnd_temporarily () =
+  let t = Recovery.create () in
+  for pn = 0 to 9 do
+    debug_send
+      t
+      ~encryption_level:Application_data
+      ~packet_number:pn
+      ~time_sent_ms:pn
+      ~bytes_sent:1200
+      [ Frame.Ping ]
+  done;
+  Alcotest.(check bool)
+    "cwnd is full before PTO"
+    false
+    (Recovery.can_send t ~bytes:1200);
+  Recovery.Debug.on_loss_detection_timeout t ~now_ms:1022L;
+  Alcotest.(check bool)
+    "PTO allows probe transmission even when cwnd is full"
+    true
+    (Recovery.can_send t ~bytes:1200);
+  Recovery.on_packet_sent
+    t
+    ~encryption_level:Application_data
+    ~packet_number:10L
+    [ Frame.Ping ];
+  Recovery.on_packet_sent
+    t
+    ~encryption_level:Application_data
+    ~packet_number:11L
+    [ Frame.Ping ];
+  Alcotest.(check bool)
+    "probe budget is consumed after two probe packets"
+    false
+    (Recovery.can_send t ~bytes:1200)
 
 let test_rfc9002_6_1_2_time_threshold_loss_detection () =
   let t = Recovery.create () in
@@ -767,6 +828,98 @@ let test_rfc9002_6_1_1_no_newly_acked_means_no_threshold_loss () =
     ~sent:[ 1; 2; 3 ]
     ~ranges:[ 9, 9 ]
 
+let test_rfc9002_6_1_lost_packets_are_drained_for_retransmission () =
+  let t = Recovery.create () in
+  let ack_only_frame =
+    Frame.Ack
+      { delay = 0
+      ; ranges = [ { Frame.Range.first = 0L; last = 0L } ]
+      ; ecn_counts = None
+      }
+  in
+  debug_send
+    t
+    ~encryption_level:Application_data
+    ~packet_number:1
+    ~time_sent_ms:0
+    ~bytes_sent:1200
+    [ ack_only_frame; make_stream_frame ~id:0L ~off:0 ~len:5 ];
+  debug_send
+    t
+    ~encryption_level:Application_data
+    ~packet_number:2
+    ~time_sent_ms:1
+    ~bytes_sent:1200
+    [ Frame.Ping ];
+  debug_send
+    t
+    ~encryption_level:Application_data
+    ~packet_number:3
+    ~time_sent_ms:2
+    ~bytes_sent:1200
+    [ Frame.Ping ];
+  debug_send
+    t
+    ~encryption_level:Application_data
+    ~packet_number:4
+    ~time_sent_ms:3
+    ~bytes_sent:1200
+    [ Frame.Ping ];
+  debug_ack
+    t
+    ~encryption_level:Application_data
+    ~ranges:[ 4, 4 ]
+    ~ack_delay_ms:0
+    ~now_ms:100;
+  let lost = Recovery.drain_lost t ~encryption_level:Application_data in
+  Alcotest.(check int) "one packet worth of retransmissions" 1 (List.length lost);
+  match List.hd lost with
+  | [ Frame.Stream _ ] -> ()
+  | frames ->
+    Alcotest.failf
+      "expected only STREAM frame in retransmissions, got %d frames"
+      (List.length frames)
+
+let test_rfc9002_6_2_4_pto_probe_packets_select_outstanding_retransmittable_data ()
+  =
+  let t = Recovery.create () in
+  debug_send
+    t
+    ~encryption_level:Application_data
+    ~packet_number:1
+    ~time_sent_ms:0
+    ~bytes_sent:1200
+    [ make_stream_frame ~id:0L ~off:0 ~len:8 ];
+  debug_send
+    t
+    ~encryption_level:Application_data
+    ~packet_number:2
+    ~time_sent_ms:1
+    ~bytes_sent:0
+    [ Frame.Ack
+        { delay = 0
+        ; ranges = [ { Frame.Range.first = 0L; last = 0L } ]
+        ; ecn_counts = None
+        }
+    ];
+  debug_send
+    t
+    ~encryption_level:Application_data
+    ~packet_number:3
+    ~time_sent_ms:2
+    ~bytes_sent:1200
+    [ Frame.Ping ];
+  let probes =
+    Recovery.pto_probe_packets
+      t
+      ~encryption_level:Application_data
+      ~max_packets:2
+  in
+  Alcotest.(check int) "selects at most two probes" 2 (List.length probes);
+  match probes with
+  | [ [ Frame.Stream _ ]; [ Frame.Ping ] ] -> ()
+  | _ -> Alcotest.fail "expected stream data then ping as PTO probes"
+
 let make_client_connection_for_congestion_tests () =
   let source_cid = CID.generate () in
   let quic_transport_parameters =
@@ -963,6 +1116,8 @@ let loss_detection_suite =
     , test_rfc9002_6_1_1_packet_threshold_is_exactly_three
   ; "§6.1.1 no newly ACKed packet means no threshold loss", `Quick
     , test_rfc9002_6_1_1_no_newly_acked_means_no_threshold_loss
+  ; "§6.1 lost packets are drained for retransmission", `Quick
+    , test_rfc9002_6_1_lost_packets_are_drained_for_retransmission
   ]
 
 let rtt_estimation_suite =
@@ -981,8 +1136,14 @@ let timer_pto_suite =
     , test_rfc9002_6_2_1_pto_armed_after_ack_eliciting_send
   ; "§6.2.1 ACK-only without in-flight data does not arm PTO", `Quick
     , test_rfc9002_6_2_1_ack_only_without_in_flight_does_not_arm_pto
+  ; "§6.2.1 PTO timer uses earliest active PN space", `Quick
+    , test_rfc9002_6_2_1_pto_timer_uses_earliest_active_packet_number_space
   ; "§6.2.1 PTO timeout increases backoff counter", `Quick
     , test_rfc9002_6_2_1_pto_backoff_increases_pto_count
+  ; "§6.2.4 PTO probes can exceed cwnd temporarily", `Quick
+    , test_rfc9002_6_2_4_pto_probes_can_exceed_cwnd_temporarily
+  ; "§6.2.4 PTO probes select outstanding retransmittable data", `Quick
+    , test_rfc9002_6_2_4_pto_probe_packets_select_outstanding_retransmittable_data
   ]
 
 let time_threshold_suite =

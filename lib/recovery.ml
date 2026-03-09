@@ -68,6 +68,8 @@ module Q : Psq.S with type k = int64 and type p = sent =
 type info =
   { mutable sent : Q.t
   ; acked : Frame.t Queue.t
+  ; lost : Frame.t list Queue.t
+  ; mutable time_of_last_ack_eliciting_packet_ms : int64 option
   }
 
 type rtt =
@@ -81,7 +83,7 @@ type rtt =
 type timer =
   { mutable loss_detection_timer_ms : int64 option
   ; mutable pto_count : int
-  ; mutable time_of_last_ack_eliciting_packet_ms : int64 option
+  ; mutable pto_probe_count : int
   }
 
 type congestion =
@@ -117,6 +119,12 @@ let packet_is_in_flight frames =
   Frame.is_any_ack_eliciting frames
   || List.exists (function Frame.Padding _ -> true | _ -> false) frames
 
+let is_retransmittable_frame = function
+  | Frame.Ack _ | Padding _ -> false
+  | _ -> true
+
+let retransmittable_frames frames = List.filter is_retransmittable_frame frames
+
 let pto_base_ms t =
   Int64.add
     t.rtt.smoothed_rtt_ms
@@ -126,16 +134,35 @@ let pto_base_ms t =
           Constants.k_granularity_ms)
        t.rtt.max_ack_delay_ms)
 
+let has_ack_eliciting_in_flight info =
+  Q.fold
+    (fun _ packet acc -> acc || (packet.in_flight && packet.ack_eliciting))
+    false
+    info.sent
+
 let set_loss_detection_timer t =
   if t.congestion.bytes_in_flight <= 0
   then t.timer.loss_detection_timer_ms <- None
   else
-    match t.timer.time_of_last_ack_eliciting_packet_ms with
-    | None -> t.timer.loss_detection_timer_ms <- None
-    | Some last_ack_eliciting_time ->
-      let backoff = Int64.shift_left 1L t.timer.pto_count in
-      let timeout = Int64.mul (pto_base_ms t) backoff in
-      t.timer.loss_detection_timer_ms <- Some (Int64.add last_ack_eliciting_time timeout)
+    let backoff = Int64.shift_left 1L t.timer.pto_count in
+    let timeout = Int64.mul (pto_base_ms t) backoff in
+    let min_timeout =
+      Spaces.to_list t.spaces
+      |> List.fold_left
+           (fun acc (_level, info) ->
+              if has_ack_eliciting_in_flight info
+              then
+                match info.time_of_last_ack_eliciting_packet_ms with
+                | None -> acc
+                | Some last_ack_eliciting_time ->
+                  let space_timeout = Int64.add last_ack_eliciting_time timeout in
+                  (match acc with
+                  | None -> Some space_timeout
+                  | Some current -> Some (Int64.min current space_timeout))
+              else acc)
+           None
+    in
+    t.timer.loss_detection_timer_ms <- min_timeout
 
 let subtract_bytes_in_flight t n =
   t.congestion.bytes_in_flight <- max 0 (t.congestion.bytes_in_flight - n)
@@ -306,7 +333,13 @@ let detect_lost_packets t ~encryption_level ~now_ms ~largest_newly_acked =
     List.rev !lost_packets_rev
 
 let create () =
-  let new_info () = { sent = Q.empty; acked = Queue.create () } in
+  let new_info () =
+    { sent = Q.empty
+    ; acked = Queue.create ()
+    ; lost = Queue.create ()
+    ; time_of_last_ack_eliciting_packet_ms = None
+    }
+  in
   { spaces =
       Spaces.create
         ~initial:(new_info ())
@@ -322,7 +355,7 @@ let create () =
   ; timer =
       { loss_detection_timer_ms = None
       ; pto_count = 0
-      ; time_of_last_ack_eliciting_packet_ms = None
+      ; pto_probe_count = 0
       }
   ; congestion =
       { bytes_in_flight = 0
@@ -366,8 +399,10 @@ let record_packet_sent
   info.sent <- Q.add packet_number sent info.sent;
   if in_flight
   then t.congestion.bytes_in_flight <- t.congestion.bytes_in_flight + sent_bytes;
+  if in_flight && t.timer.pto_probe_count > 0
+  then t.timer.pto_probe_count <- t.timer.pto_probe_count - 1;
   if ack_eliciting
-  then t.timer.time_of_last_ack_eliciting_packet_ms <- Some time_sent_ms;
+  then info.time_of_last_ack_eliciting_packet_ms <- Some time_sent_ms;
   set_loss_detection_timer t
 
 let on_packet_sent t ~encryption_level ~packet_number frames =
@@ -450,11 +485,18 @@ let record_ack_received
   let lost_packets =
     detect_lost_packets t ~encryption_level ~now_ms ~largest_newly_acked
   in
+  List.iter
+    (fun packet ->
+       let retransmittable = retransmittable_frames packet.frames in
+       if retransmittable <> [] then Queue.add retransmittable info.lost)
+    lost_packets;
   if lost_packets <> []
   then on_congestion_event t ~now_ms ~lost_packets;
 
   if acked_packets <> []
-  then t.timer.pto_count <- 0;
+  then (
+    t.timer.pto_count <- 0;
+    t.timer.pto_probe_count <- 0);
   set_loss_detection_timer t
 
 let on_ack_received t ~encryption_level ~ranges =
@@ -479,11 +521,13 @@ let on_ack_received t ~encryption_level ~ranges =
 let can_send t ~bytes =
   bytes <= 0
   || t.congestion.bytes_in_flight + bytes <= t.congestion.congestion_window
+  || t.timer.pto_probe_count > 0
 
 let on_loss_detection_timeout t ~now_ms =
   if t.congestion.bytes_in_flight > 0
   then (
     t.timer.pto_count <- t.timer.pto_count + 1;
+    t.timer.pto_probe_count <- 2;
     if t.timer.pto_count >= Int64.to_int Constants.k_persistent_congestion_threshold
     then collapse_to_min_window t;
     t.congestion.recovery_start_time_ms <- Some now_ms);
@@ -519,6 +563,8 @@ let discard_space t ~encryption_level =
   subtract_bytes_in_flight t removed_in_flight;
   info.sent <- Q.empty;
   Queue.clear info.acked;
+  Queue.clear info.lost;
+  info.time_of_last_ack_eliciting_packet_ms <- None;
   set_loss_detection_timer t
 
 let drain_acknowledged t ~encryption_level =
@@ -529,6 +575,34 @@ let drain_acknowledged t ~encryption_level =
     let qseq = Queue.to_seq info.acked in
     Queue.clear info.acked;
     List.of_seq qseq
+
+let drain_lost t ~encryption_level =
+  let info = Spaces.of_encryption_level t.spaces encryption_level in
+  if Queue.is_empty info.lost
+  then []
+  else
+    let qseq = Queue.to_seq info.lost in
+    Queue.clear info.lost;
+    List.of_seq qseq
+
+let pto_probe_packets t ~encryption_level ~max_packets =
+  if max_packets <= 0
+  then []
+  else
+    let info = Spaces.of_encryption_level t.spaces encryption_level in
+    Q.to_list info.sent
+    |> List.sort (fun (pn1, _) (pn2, _) -> Int64.compare pn1 pn2)
+    |> List.fold_left
+         (fun acc (_packet_number, packet) ->
+            if List.length acc >= max_packets
+            then acc
+            else
+              let retransmittable = retransmittable_frames packet.frames in
+              if packet.ack_eliciting && retransmittable <> []
+              then retransmittable :: acc
+              else acc)
+         []
+    |> List.rev
 
 module Debug = struct
   type nonrec rtt = rtt
@@ -556,8 +630,7 @@ module Debug = struct
     ; timer =
         { loss_detection_timer_ms = t.timer.loss_detection_timer_ms
         ; pto_count = t.timer.pto_count
-        ; time_of_last_ack_eliciting_packet_ms =
-            t.timer.time_of_last_ack_eliciting_packet_ms
+        ; pto_probe_count = t.timer.pto_probe_count
         }
     ; congestion =
         { bytes_in_flight = t.congestion.bytes_in_flight

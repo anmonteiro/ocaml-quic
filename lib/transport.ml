@@ -252,11 +252,23 @@ module Connection = struct
 
   let process_ack_frame t ~packet_info ~delay ~ranges =
     let { header; encryption_level; _ } = packet_info in
+    let ack_delay_ms =
+      if encryption_level <> Application_data
+      then 0L
+      else
+        let ack_delay_multiplier_us =
+          Int64.of_int (max 1 t.peer_transport_params.ack_delay_exponent)
+        in
+        let ack_delay_us =
+          Int64.mul (Int64.of_int delay) ack_delay_multiplier_us
+        in
+        Int64.div ack_delay_us 1000L
+    in
     Recovery.Debug.record_ack_received
       t.recovery
       ~encryption_level
       ~ranges
-      ~ack_delay_ms:(Int64.of_int delay)
+      ~ack_delay_ms
       ~now_ms:(next_recovery_time_ms t);
     Format.eprintf
       "got ack %a %Ld %Ld %d@."
@@ -265,6 +277,8 @@ module Connection = struct
       (List.hd ranges).Frame.Range.last
       (List.hd ranges).Frame.Range.first
       (List.length ranges);
+    Recovery.drain_lost t.recovery ~encryption_level
+    |> List.iter (fun frames -> send_frames t ~encryption_level frames);
     ()
 
   let report_error ?frame_type t error =
@@ -479,6 +493,8 @@ module Connection = struct
                  with
                 | Ok transport_params ->
                   t.peer_transport_params <- transport_params;
+                  t.recovery.rtt.max_ack_delay_ms <-
+                    Int64.of_int transport_params.max_ack_delay;
                   process_tls_result t ~new_tls_state:tls_state' ~tls_packets
                 | Error e -> report_error t ~frame_type:Crypto e)
               | None -> ())))
@@ -624,7 +640,10 @@ module Connection = struct
              ~perspective:t.mode
              transport_params
          with
-        | Ok transport_params -> t.peer_transport_params <- transport_params
+        | Ok transport_params ->
+          t.peer_transport_params <- transport_params;
+          t.recovery.rtt.max_ack_delay_ms <-
+            Int64.of_int transport_params.max_ack_delay
         | Error err -> report_error t ~frame_type:Handshake_done err))
 
   let process_path_challenge_frame t buf =
@@ -993,11 +1012,42 @@ let on_timeout t =
            connection.recovery
            ~now_ms:(connection.now_ms ());
          if Encryption_level.mem connection.encdec.current connection.encdec
-         then
-           Connection.send_frames
-             connection
-             ~encryption_level:connection.encdec.current
-             [ Frame.Ping ];
+         then (
+           let remaining_probes = ref 2 in
+           let retransmissions_rev = ref [] in
+           List.iter
+             (fun encryption_level ->
+                if
+                  !remaining_probes > 0
+                  && Encryption_level.mem encryption_level connection.encdec
+                then (
+                  let candidates =
+                    Recovery.drain_lost connection.recovery ~encryption_level
+                    @ Recovery.pto_probe_packets
+                        connection.recovery
+                        ~encryption_level
+                        ~max_packets:!remaining_probes
+                  in
+                  List.iter
+                    (fun frames ->
+                       if !remaining_probes > 0 && frames <> []
+                       then (
+                         decr remaining_probes;
+                         retransmissions_rev :=
+                           (encryption_level, frames) :: !retransmissions_rev))
+                    candidates))
+             [ Initial; Handshake; Application_data ];
+           match List.rev !retransmissions_rev with
+           | [] ->
+             Connection.send_frames
+               connection
+               ~encryption_level:connection.encdec.current
+               [ Frame.Ping ]
+           | frames_list ->
+             List.iter
+               (fun (encryption_level, frames) ->
+                  Connection.send_frames connection ~encryption_level frames)
+               frames_list);
          Connection.wakeup_writer connection
        | Some _ | None -> ())
     t.connections;
@@ -1277,7 +1327,10 @@ let packet_handler t ?error packet =
                   packet_info.encryption_level
               in
               Stream.Send.remove off crypto_stream.send
-            | Stream { id = _; fragment = _; _ } -> ()
+            | Stream { id; fragment = { IOVec.off; _ }; _ } ->
+              (match Hashtbl.find_opt c.streams id with
+              | Some stream -> Stream.Send.remove off stream.send
+              | None -> ())
             | Ack { ranges = _; _ } ->
               (* TODO: when we track packets that need acknowledgement, update
                  the largest acknowledged here. *)
