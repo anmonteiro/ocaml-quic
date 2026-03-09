@@ -807,8 +807,11 @@ module Connection = struct
     | Connection_close_app { reason_phrase; error_code } ->
       process_connection_close_app_frame t ~error_code reason_phrase
     | Handshake_done -> process_handshake_done_frame t
-    | Unknown _ ->
-      ()
+    | Unknown x ->
+      report_error
+        t
+        ~frame_type:(Frame.Type.Unknown x)
+        Frame_encoding_error
 
   let next_unidirectional_stream_id t ~typ =
     let id = Stream.Type.gen_id ~typ t.next_unidirectional_stream_id in
