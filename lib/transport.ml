@@ -1382,6 +1382,7 @@ let packet_handler t ?error packet =
            *   Connection ID that it receives. *)
           c.dest_cid <- src_cid
         | None ->
+          (* TODO: short packets will fail here? *)
           assert (
             match packet with
             | Frames { header = Packet.Header.Short _; _ } -> true
@@ -1395,6 +1396,7 @@ let packet_handler t ?error packet =
           ; connection = c
           }
         in
+
         if Bigstringaf.length payload = 0
         then Connection.report_error c Protocol_violation
         else (
@@ -1405,6 +1407,7 @@ let packet_handler t ?error packet =
               payload
           with
           | Ok _frames ->
+            (* process streams for packets that have been acknowledged. *)
             let acked_frames =
               Recovery.drain_acknowledged
                 c.recovery
@@ -1423,19 +1426,26 @@ let packet_handler t ?error packet =
                   (match Hashtbl.find_opt c.streams id with
                   | Some stream -> Stream.Send.remove off stream.send
                   | None -> ())
-                | Ack { ranges = _; _ } -> ()
+                | Ack { ranges = _; _ } ->
+                  (* TODO: when we track packets that need acknowledgement,
+                     update the largest acknowledged here. *)
+                  ()
                 | _other -> ())
               acked_frames;
             if c.did_send_connection_close
             then ()
             else
+              (* This packet has been processed, mark it for acknowledgement. *)
               let pn_space =
                 Spaces.of_encryption_level
                   c.packet_number_spaces
                   packet_info.encryption_level
               in
               Packet_number.insert_for_acking pn_space packet_number;
+              (* packet_info should now contain frames we need to send in
+                 response. *)
               send_packets t ~packet_info;
+              (* Reset for the next packet. *)
               pn_space.ack_elicited <- false
           | Error e ->
             Format.eprintf "discarding malformed packet payload: %s@." e)
