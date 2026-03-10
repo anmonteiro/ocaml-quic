@@ -237,15 +237,17 @@ module Retry = struct
             "ff000000010008f067a5502a4262b5746f6b656e04a265ba2eff4d829058fb3f0f2496ba")
     in
     match
-      Angstrom.parse_string ~consume:All Quic__.Parse.Packet.Payload.retry data
+      Quic.Fast_parse.Packet_parser.parse_unprotected
+        (Bigstringaf.of_string ~off:0 ~len:(String.length data) data)
+        ~off:0
+        ~len:(String.length data)
     with
-    | Ok
-        (Retry
-           { header : Quic.Packet.Header.t = _
-           ; token : string = _
-           ; pseudo : Bigstringaf.t
-           ; tag : Bigstringaf.t = _
-           }) ->
+    | Retry
+        { header : Quic.Packet.Header.t = _
+        ; token : string = _
+        ; pseudo : Bigstringaf.t
+        ; tag : Bigstringaf.t = _
+        } ->
       Alcotest.check
         hex
         "pseudo"

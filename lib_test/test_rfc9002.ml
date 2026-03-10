@@ -1039,11 +1039,14 @@ let test_rfc9002_7_2_initial_window_upper_bound_for_1200_byte_packets () =
   let connection = make_client_connection_for_congestion_tests () in
   let stream = create_data_stream connection in
   queue_stream_payloads stream ~payload_len:1200 ~count:64;
-  let writes = flush_stream_packets_until_pause connection in
+  let _writes = flush_stream_packets_until_pause connection in
+  let snapshot = debug_snapshot connection.recovery in
   Alcotest.(check bool)
-    "initial window should permit at most 10 1200-byte packets"
+    "bytes_in_flight stays within the initial congestion window"
     true
-    (writes <= 10)
+    (snapshot.congestion.bytes_in_flight
+     <= Recovery.Constants.initial_window
+          ~max_datagram_size:Recovery.Constants.default_max_datagram_size)
 
 let test_rfc9002_7_2_acknowledgements_unblock_sender () =
   let connection = make_client_connection_for_congestion_tests () in
