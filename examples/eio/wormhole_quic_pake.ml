@@ -18,6 +18,107 @@ let split_words s =
 let parse_int64 s =
   try Int64.of_string s with _ -> failwith ("invalid int64: " ^ s)
 
+module Transfer_stats = struct
+  type t =
+    { label : string
+    ; total : int64 option
+    ; started_at : float
+    ; mutable first_byte_at : float option
+    ; mutable bytes : int64
+    ; mutable reported : bool
+    }
+
+  let now_s () = Unix.gettimeofday ()
+
+  let create ?total ~label () =
+    { label
+    ; total
+    ; started_at = now_s ()
+    ; first_byte_at = None
+    ; bytes = 0L
+    ; reported = false
+    }
+
+  let on_bytes t n =
+    if n > 0
+    then (
+      if Option.is_none t.first_byte_at then t.first_byte_at <- Some (now_s ());
+      t.bytes <- Int64.add t.bytes (Int64.of_int n))
+
+  let report t ~status =
+    if not t.reported
+    then (
+      t.reported <- true;
+      let ended_at = now_s () in
+      let duration_s = max 1e-6 (ended_at -. t.started_at) in
+      let mib_per_s = (Int64.to_float t.bytes /. (1024. *. 1024.)) /. duration_s in
+      let mbps = (Int64.to_float t.bytes *. 8. /. 1_000_000.) /. duration_s in
+      let first_byte_latency_ms =
+        match t.first_byte_at with
+        | None -> "n/a"
+        | Some ts -> Printf.sprintf "%.1f ms" ((ts -. t.started_at) *. 1000.)
+      in
+      let size =
+        match t.total with
+        | None -> Printf.sprintf "%Ld bytes" t.bytes
+        | Some total -> Printf.sprintf "%Ld/%Ld bytes" t.bytes total
+      in
+      Printf.printf
+        "\n%s stats: status=%s, size=%s, first-byte-latency=%s, duration=%.3fs, \
+         throughput=%.2f MiB/s (%.2f Mbit/s)\n%!"
+        t.label
+        status
+        size
+        first_byte_latency_ms
+        duration_s
+        mib_per_s
+        mbps)
+end
+
+type progress =
+  { label : string
+  ; total : int64
+  ; width : int
+  ; mutable last_percent : int
+  }
+
+let create_progress ~label ~total =
+  { label; total; width = 30; last_percent = -1 }
+
+let progress_percent ~current ~total =
+  if total <= 0L
+  then 100
+  else
+    int_of_float
+      (max
+         0.
+         (min 100. ((Int64.to_float current *. 100.) /. Int64.to_float total)))
+
+let render_progress t ~current ~percent =
+  let filled = (percent * t.width) / 100 in
+  let bar = Bytes.make t.width '-' in
+  for i = 0 to filled - 1 do
+    Bytes.set bar i '#'
+  done;
+  Printf.printf
+    "\r%s [%s] %3d%% (%Ld/%Ld bytes)%!"
+    t.label
+    (Bytes.unsafe_to_string bar)
+    percent
+    current
+    t.total
+
+let update_progress t current =
+  let percent = progress_percent ~current ~total:t.total in
+  if percent <> t.last_percent || current = t.total
+  then (
+    t.last_percent <- percent;
+    render_progress t ~current ~percent)
+
+let finish_progress t current =
+  update_progress t current;
+  Printf.printf "\n%!"
+
 (* Keep hex-encoded DATA control lines under typical QUIC packet size.
    Ciphertext is sent as hex (2x expansion), so large plaintext chunks can
    exceed the current packetization limit in this example transport path. *)
@@ -98,15 +199,15 @@ module Line_channel = struct
     ; lines : string option Eio.Stream.t
     }
 
-  let write_line t line =
-    Quic.Stream.write_string t.stream line;
-    Quic.Stream.write_char t.stream '\n';
-    Quic.Stream.flush t.stream ignore
-
   let write_line_raw stream line =
-    Quic.Stream.write_string stream line;
-    Quic.Stream.write_char stream '\n';
+    let payload = line ^ "\n" in
+    let bs =
+      Bigstringaf.of_string ~off:0 ~len:(String.length payload) payload
+    in
+    Quic.Stream.schedule_bigstring stream bs;
     Quic.Stream.flush stream ignore
+
+  let write_line t line = write_line_raw t.stream line
 
   let drain_lines buf push =
     let data = Buffer.contents buf in
@@ -510,156 +611,209 @@ module Client = struct
 
   let do_send env ~sw ~opts ~file =
     let t, stream = connect env ~sw ~opts in
+    let transfer_stats : Transfer_stats.t option ref = ref None in
+    let report_stats status =
+      match !transfer_stats with
+      | None -> ()
+      | Some s -> Transfer_stats.report s ~status
+    in
     Fun.protect
       ~finally:(fun () ->
         Quic.Stream.close_writer stream;
         Quic_eio.shutdown t)
       (fun () ->
-         let ch = Line_channel.of_stream stream in
-         Line_channel.write_line
-           ch
-           (Printf.sprintf "JOIN %s %s" opts.code (role_to_string Sender));
-         wait_for_ready ch;
-         let session = perform_pake ~opts ~role:Sender ch in
-         let stat = Unix.stat file in
-         let total_size = Int64.of_int stat.Unix.st_size in
-         let filename = Filename.basename file in
-         Line_channel.write_line
-           ch
-           (Printf.sprintf "META %s %Ld" (hex_of_string filename) total_size);
-         let rec wait_meta_ok () =
-           match wait_for_line_or_fail ch with
-           | "META-OK" -> ()
-           | "PEER_LEFT" ->
-             failwith "peer disconnected before receiving metadata"
-           | _ -> wait_meta_ok ()
-         in
-         wait_meta_ok ();
-         let ic = open_in_bin file in
-         Fun.protect
-           ~finally:(fun () -> close_in_noerr ic)
-           (fun () ->
-              let digest = ref Digestif.SHA256.empty in
-              let buf = Bytes.create data_chunk_size in
-              let rec loop seq sent_bytes =
-                let n = input ic buf 0 (Bytes.length buf) in
-                if n = 0
-                then (
-                  let digest_hex = Digestif.SHA256.(to_hex (get !digest)) in
-                  Line_channel.write_line
-                    ch
-                    (Printf.sprintf "DONE %Ld %s" sent_bytes digest_hex);
-                  let rec wait_ack () =
-                    match wait_for_line_or_fail ch with
-                    | "RECV-OK" ->
-                      Format.printf
-                        "sent %Ld bytes from %s successfully@."
-                        sent_bytes
-                        file
-                    | line when String.starts_with ~prefix:"RECV-BAD" line ->
-                      failwith ("receiver reported integrity failure: " ^ line)
-                    | "PEER_LEFT" ->
-                      failwith "peer disconnected before final ack"
-                    | _ -> wait_ack ()
-                  in
-                  wait_ack ())
-                else
-                  let plain = Bytes.sub_string buf 0 n in
-                  digest := Digestif.SHA256.feed_string !digest plain;
-                  let ciphertext, tag = Pake.encrypt_chunk session ~seq plain in
-                  Line_channel.write_line
-                    ch
-                    (Printf.sprintf
-                       "DATA %Ld %s %s"
-                       seq
-                       (hex_of_string ciphertext)
-                       (hex_of_string tag));
-                  let sent = Int64.add sent_bytes (Int64.of_int n) in
-                  if Int64.rem sent 0x100000L = 0L
-                  then Format.printf "sent %Ld/%Ld bytes@." sent total_size;
-                  loop (Int64.succ seq) sent
-              in
-              loop 0L 0L))
-
-  let do_recv env ~sw ~opts ~output =
-    let t, stream = connect env ~sw ~opts in
-    Fun.protect
-      ~finally:(fun () ->
-        Quic.Stream.close_writer stream;
-        Quic_eio.shutdown t)
-      (fun () ->
-         let ch = Line_channel.of_stream stream in
-         Line_channel.write_line
-           ch
-           (Printf.sprintf "JOIN %s %s" opts.code (role_to_string Receiver));
-         wait_for_ready ch;
-         let session = perform_pake ~opts ~role:Receiver ch in
-         let rec wait_meta () =
-           match split_words (wait_for_line_or_fail ch) with
-           | [ "META"; name_hex; size_s ] ->
-             string_of_hex name_hex, parse_int64 size_s
-           | [ "PEER_LEFT" ] -> failwith "peer disconnected before metadata"
-           | _ -> wait_meta ()
-         in
-         let sender_name, expected_size = wait_meta () in
-         let out_path = Option.value output ~default:("recv-" ^ sender_name) in
-         let oc = open_out_bin out_path in
-         Fun.protect
-           ~finally:(fun () -> close_out_noerr oc)
-           (fun () ->
-              Format.printf
-                "receiving %s (%Ld bytes) into %s@."
-                sender_name
-                expected_size
-                out_path;
-              Line_channel.write_line ch "META-OK";
-              let digest = ref Digestif.SHA256.empty in
-              let rec loop next_seq written =
-                match split_words (wait_for_line_or_fail ch) with
-                | [ "DATA"; seq_s; ciphertext_hex; tag_hex ] ->
-                  let seq = parse_int64 seq_s in
-                  if seq <> next_seq then failwith "out-of-order DATA chunk";
-                  let ciphertext = string_of_hex ciphertext_hex in
-                  let tag = string_of_hex tag_hex in
-                  let plain =
-                    match Pake.decrypt_chunk session ~seq ~ciphertext ~tag with
-                    | Ok x -> x
-                    | Error e -> failwith ("decrypt/auth failure: " ^ e)
-                  in
-                  output_string oc plain;
-                  digest := Digestif.SHA256.feed_string !digest plain;
-                  let written =
-                    Int64.add written (Int64.of_int (String.length plain))
-                  in
-                  if Int64.rem written 0x100000L = 0L
-                  then
-                    Format.printf
-                      "received %Ld/%Ld bytes@."
-                      written
-                      expected_size;
-                  loop (Int64.succ next_seq) written
-                | [ "DONE"; total_s; digest_hex ] ->
-                  let total = parse_int64 total_s in
-                  let got_digest = Digestif.SHA256.(to_hex (get !digest)) in
-                  if
-                    total <> written || not (String.equal digest_hex got_digest)
+         try
+           let ch = Line_channel.of_stream stream in
+           Line_channel.write_line
+             ch
+             (Printf.sprintf "JOIN %s %s" opts.code (role_to_string Sender));
+           wait_for_ready ch;
+           let session = perform_pake ~opts ~role:Sender ch in
+           let stat = Unix.stat file in
+           let total_size = Int64.of_int stat.Unix.st_size in
+           let filename = Filename.basename file in
+           Line_channel.write_line
+             ch
+             (Printf.sprintf "META %s %Ld" (hex_of_string filename) total_size);
+           let rec wait_meta_ok () =
+             match wait_for_line_or_fail ch with
+             | "META-OK" -> ()
+             | "PEER_LEFT" ->
+               failwith "peer disconnected before receiving metadata"
+             | _ -> wait_meta_ok ()
+           in
+           wait_meta_ok ();
+           let stats = Transfer_stats.create ~label:"send" ~total:total_size () in
+           transfer_stats := Some stats;
+           let ic = open_in_bin file in
+           Fun.protect
+             ~finally:(fun () -> close_in_noerr ic)
+             (fun () ->
+                let digest = ref Digestif.SHA256.empty in
+                let buf = Bytes.create data_chunk_size in
+                let progress =
+                  create_progress ~label:"sending  " ~total:total_size
+                in
+                update_progress progress 0L;
+                let rec loop seq sent_bytes =
+                  let n = input ic buf 0 (Bytes.length buf) in
+                  if n = 0
                   then (
+                    finish_progress progress sent_bytes;
+                    let digest_hex = Digestif.SHA256.(to_hex (get !digest)) in
+                    Line_channel.write_line
+                      ch
+                      (Printf.sprintf "DONE %Ld %s" sent_bytes digest_hex);
+                    let rec wait_ack () =
+                      match wait_for_line_or_fail ch with
+                      | "RECV-OK" ->
+                        Format.printf
+                          "sent %Ld bytes from %s successfully@."
+                          sent_bytes
+                          file
+                      | line when String.starts_with ~prefix:"RECV-BAD" line ->
+                        failwith ("receiver reported integrity failure: " ^ line)
+                      | "PEER_LEFT" ->
+                        failwith "peer disconnected before final ack"
+                      | _ -> wait_ack ()
+                    in
+                    wait_ack ();
+                    report_stats "completed")
+                  else
+                    let plain = Bytes.sub_string buf 0 n in
+                    digest := Digestif.SHA256.feed_string !digest plain;
+                    let ciphertext, tag = Pake.encrypt_chunk session ~seq plain in
                     Line_channel.write_line
                       ch
                       (Printf.sprintf
-                         "RECV-BAD total=%Ld digest=%s"
-                         total
-                         got_digest);
-                    failwith "integrity check failed")
-                  else (
-                    Line_channel.write_line ch "RECV-OK";
-                    Eio.Time.sleep (Eio.Stdenv.clock env) 0.1;
-                    Format.printf "received %Ld bytes successfully@." written)
-                | [ "PEER_LEFT" ] ->
-                  failwith "peer disconnected during transfer"
-                | _ -> loop next_seq written
-              in
-              loop 0L 0L))
+                         "DATA %Ld %s %s"
+                         seq
+                         (hex_of_string ciphertext)
+                         (hex_of_string tag));
+                    Transfer_stats.on_bytes stats n;
+                    let sent = Int64.add sent_bytes (Int64.of_int n) in
+                    update_progress progress sent;
+                    loop (Int64.succ seq) sent
+                in
+                loop 0L 0L)
+         with
+         | Sys.Break ->
+           report_stats "interrupted";
+           raise Sys.Break
+         | exn ->
+           report_stats "failed";
+           raise exn)
+
+  let do_recv env ~sw ~opts ~output =
+    let t, stream = connect env ~sw ~opts in
+    let transfer_stats : Transfer_stats.t option ref = ref None in
+    let report_stats status =
+      match !transfer_stats with
+      | None -> ()
+      | Some s -> Transfer_stats.report s ~status
+    in
+    Fun.protect
+      ~finally:(fun () ->
+        Quic.Stream.close_writer stream;
+        Quic_eio.shutdown t)
+      (fun () ->
+         try
+           let ch = Line_channel.of_stream stream in
+           Line_channel.write_line
+             ch
+             (Printf.sprintf "JOIN %s %s" opts.code (role_to_string Receiver));
+           wait_for_ready ch;
+           let session = perform_pake ~opts ~role:Receiver ch in
+           let rec wait_meta () =
+             match split_words (wait_for_line_or_fail ch) with
+             | [ "META"; name_hex; size_s ] ->
+               string_of_hex name_hex, parse_int64 size_s
+             | [ "PEER_LEFT" ] -> failwith "peer disconnected before metadata"
+             | _ -> wait_meta ()
+           in
+           let sender_name, expected_size = wait_meta () in
+           let out_path = Option.value output ~default:("recv-" ^ sender_name) in
+           let stats =
+             Transfer_stats.create ~label:"recv" ~total:expected_size ()
+           in
+           transfer_stats := Some stats;
+           let oc = open_out_bin out_path in
+           Fun.protect
+             ~finally:(fun () -> close_out_noerr oc)
+             (fun () ->
+                Format.printf
+                  "receiving %s (%Ld bytes) into %s@."
+                  sender_name
+                  expected_size
+                  out_path;
+                Line_channel.write_line ch "META-OK";
+                let digest = ref Digestif.SHA256.empty in
+                let progress =
+                  create_progress ~label:"receiving" ~total:expected_size
+                in
+                update_progress progress 0L;
+                let rec loop next_seq written =
+                  match split_words (wait_for_line_or_fail ch) with
+                  | [ "DATA"; seq_s; ciphertext_hex; tag_hex ] ->
+                    let seq = parse_int64 seq_s in
+                    if seq < next_seq
+                    then
+                      (* Duplicate DATA chunk (e.g. due retransmission) *)
+                      loop next_seq written
+                    else if seq > next_seq
+                    then
+                      failwith
+                        (Printf.sprintf
+                           "out-of-order DATA chunk: expected=%Ld got=%Ld"
+                           next_seq
+                           seq)
+                    else
+                      let ciphertext = string_of_hex ciphertext_hex in
+                      let tag = string_of_hex tag_hex in
+                      let plain =
+                        match Pake.decrypt_chunk session ~seq ~ciphertext ~tag with
+                        | Ok x -> x
+                        | Error e -> failwith ("decrypt/auth failure: " ^ e)
+                      in
+                      output_string oc plain;
+                      digest := Digestif.SHA256.feed_string !digest plain;
+                      let n = String.length plain in
+                      Transfer_stats.on_bytes stats n;
+                      let written = Int64.add written (Int64.of_int n) in
+                      update_progress progress written;
+                      loop (Int64.succ next_seq) written
+                  | [ "DONE"; total_s; digest_hex ] ->
+                    let total = parse_int64 total_s in
+                    let got_digest = Digestif.SHA256.(to_hex (get !digest)) in
+                    if
+                      total <> written || not (String.equal digest_hex got_digest)
+                    then (
+                      finish_progress progress written;
+                      Line_channel.write_line
+                        ch
+                        (Printf.sprintf
+                           "RECV-BAD total=%Ld digest=%s"
+                           total
+                           got_digest);
+                      failwith "integrity check failed")
+                    else (
+                      finish_progress progress written;
+                      Line_channel.write_line ch "RECV-OK";
+                      Eio.Time.sleep (Eio.Stdenv.clock env) 0.1;
+                      Format.printf "received %Ld bytes successfully@." written;
+                      report_stats "completed")
+                  | [ "PEER_LEFT" ] ->
+                    failwith "peer disconnected during transfer"
+                  | _ -> loop next_seq written
+                in
+                loop 0L 0L)
+         with
+         | Sys.Break ->
+           report_stats "interrupted";
+           raise Sys.Break
+         | exn ->
+           report_stats "failed";
+           raise exn)
 end
 
 type relay_opts = { relay_port : int }
@@ -775,6 +929,7 @@ let usage () =
 let () =
   Mirage_crypto_rng_unix.use_default ();
   Sys.(set_signal sigpipe Signal_ignore);
+  Sys.catch_break true;
   let run () =
     if Array.length Sys.argv < 2 then usage ();
     match Sys.argv.(1) with
@@ -818,3 +973,6 @@ let () =
   | Failure msg ->
     prerr_endline ("error: " ^ msg);
     exit 1
+  | Sys.Break ->
+    prerr_endline "interrupted";
+    exit 130
