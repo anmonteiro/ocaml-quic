@@ -957,6 +957,17 @@ let make_client_connection_for_congestion_tests () =
       ~connection_handler
       source_cid
   in
+  connection.peer_transport_params <-
+    Transport_parameters.
+      { default with
+        initial_max_data = 1 lsl 27
+      ; initial_max_stream_data_bidi_local = 1 lsl 27
+      ; initial_max_stream_data_bidi_remote = 1 lsl 27
+      ; initial_max_stream_data_uni = 1 lsl 27
+      ; initial_max_streams_bidi = 1 lsl 8
+      ; initial_max_streams_uni = 1 lsl 8
+      };
+  connection.peer_max_data <- Int64.of_int (1 lsl 27);
   let dest_cid = CID.generate () in
   connection.dest_cid <- dest_cid;
   Encryption_level.add

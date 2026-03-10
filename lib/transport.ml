@@ -36,6 +36,9 @@ module Writer = Serialize.Writer
 module Packet_number = struct
   module PSet = Set.Make (Int64)
 
+  let max_ack_ranges = 32
+  let ack_history_window = 4096L
+
   type t =
     { mutable sent : int64
     ; mutable received : int64
@@ -56,24 +59,36 @@ module Packet_number = struct
     next
 
   let insert_for_acking t packet_number =
-    t.received_need_ack <- PSet.add packet_number t.received_need_ack
+    let cutoff = Int64.sub packet_number ack_history_window in
+    let pruned =
+      PSet.filter (fun pn -> Int64.compare pn cutoff >= 0) t.received_need_ack
+    in
+    t.received_need_ack <- PSet.add packet_number pruned
+
+  let rec take n acc = function
+    | _ when n <= 0 -> List.rev acc
+    | [] -> List.rev acc
+    | x :: xs -> take (n - 1) (x :: acc) xs
 
   let compose_ranges t =
     (* list is sorted *)
     let packets = PSet.elements t.received_need_ack in
-    (* don't empty the set, the packet containg the ACK frame could be lost. *)
-    assert (List.length packets > 0);
-    let first = List.hd packets in
-    List.fold_left
-      (fun acc pn ->
-         let cur_range = List.hd acc in
-         if Int64.compare (Int64.add cur_range.Frame.Range.last 1L) pn = 0
-         then { cur_range with last = pn } :: List.tl acc
-         else
-           (* start a new range, ther's a gap. *)
-           { Frame.Range.first = pn; last = pn } :: acc)
-      [ { Frame.Range.first; last = first } ]
-      (List.tl packets)
+    match packets with
+    | [] -> []
+    | first :: rest ->
+      let ranges_desc =
+        List.fold_left
+          (fun acc pn ->
+             let cur_range = List.hd acc in
+             if Int64.compare (Int64.add cur_range.Frame.Range.last 1L) pn = 0
+             then { cur_range with last = pn } :: List.tl acc
+             else
+               (* start a new range, there's a gap. *)
+               { Frame.Range.first = pn; last = pn } :: acc)
+          [ { Frame.Range.first; last = first } ]
+          rest
+      in
+      take max_ack_ranges [] ranges_desc
 
   let compose_ack_frame t =
     let ranges = compose_ranges t in
@@ -113,8 +128,16 @@ module Connection = struct
     ; local_initial_max_stream_data_uni : int64
     ; local_initial_max_streams_bidi : int64
     ; local_initial_max_streams_uni : int64
+    ; mutable max_recv_data : int64
+    ; recv_stream_max_data : (Stream_id.t, int64) Hashtbl.t
     ; mutable recv_data_bytes : int64
     ; recv_stream_highest_offsets : (Stream_id.t, int64) Hashtbl.t
+    ; mutable consumed_data_bytes : int64
+    ; recv_stream_consumed_offsets : (Stream_id.t, int64) Hashtbl.t
+    ; mutable peer_max_data : int64
+    ; peer_stream_max_data : (Stream_id.t, int64) Hashtbl.t
+    ; mutable sent_data_bytes : int64
+    ; sent_stream_highest_offsets : (Stream_id.t, int64) Hashtbl.t
     ; recovery : Recovery.t
     ; queued_packets : (Writer.header_info * Frame.t list) Queue.t
     ; writer : Writer.t
@@ -206,12 +229,12 @@ module Connection = struct
         else (
           ignore
             (Queue.take t.queued_packets : Writer.header_info * Frame.t list);
-          Format.eprintf
-            "Sending %d frames at encryption level: %a %Ld@."
-            (List.length frames)
-            Encryption_level.pp_hum
-            encryption_level
-            packet_number;
+          (* Format.eprintf *)
+          (* "Sending %d frames at encryption level: %a %Ld@." *)
+          (* (List.length frames) *)
+          (* Encryption_level.pp_hum *)
+          (* encryption_level *)
+          (* packet_number; *)
           Writer.write_frames_packet t.writer ~header_info frames;
           on_packet_sent t ~encryption_level ~packet_number ~bytes_sent frames;
           let can_be_followed_by_other_packets =
@@ -324,6 +347,24 @@ module Connection = struct
       ~frame_type:Frame.Type.Crypto
       (Crypto_error (Tls.Packet.alert_type_to_int alert))
 
+  let apply_peer_transport_params t transport_params =
+    t.peer_transport_params <- transport_params;
+    t.peer_max_data <-
+      (if transport_params.initial_max_data < 0
+       then 0L
+       else Int64.of_int transport_params.initial_max_data);
+    Format.eprintf
+      "[flowctl] peer params configured cid=%s max_data=%d bidi_local=%d \
+       bidi_remote=%d uni=%d streams_bidi=%d streams_uni=%d@."
+      (let (`Hex x) = Hex.of_string (CID.to_string t.source_cid) in
+       x)
+      transport_params.initial_max_data
+      transport_params.initial_max_stream_data_bidi_local
+      transport_params.initial_max_stream_data_bidi_remote
+      transport_params.initial_max_stream_data_uni
+      transport_params.initial_max_streams_bidi
+      transport_params.initial_max_streams_uni
+
   let process_reset_stream_frame
         t
         ~stream_id
@@ -420,7 +461,9 @@ module Connection = struct
   let process_tls_result t ~new_tls_state ~tls_packets =
     let drop_initial_and_handshake_keys t =
       Encryption_level.remove Initial t.encdec;
-      Encryption_level.remove Handshake t.encdec
+      Encryption_level.remove Handshake t.encdec;
+      Recovery.discard_space t.recovery ~encryption_level:Initial;
+      Recovery.discard_space t.recovery ~encryption_level:Handshake
     in
     let report_unexpected_tls_message () =
       report_error
@@ -591,7 +634,7 @@ module Connection = struct
                      quic_transport_params
                  with
                 | Ok transport_params ->
-                  t.peer_transport_params <- transport_params;
+                  apply_peer_transport_params t transport_params;
                   t.recovery.rtt.max_ack_delay_ms <-
                     Int64.of_int transport_params.max_ack_delay;
                   process_tls_result t ~new_tls_state:tls_state' ~tls_packets
@@ -666,12 +709,147 @@ module Connection = struct
     | Some _ -> process_stream_data t ~stream
     | None -> ()
 
+  let int64_of_nonnegative n = if n < 0 then 0L else Int64.of_int n
+
+  let int_of_int64_clamped n =
+    if Int64.compare n 0L <= 0
+    then 0
+    else if Int64.compare n (Int64.of_int max_int) >= 0
+    then max_int
+    else Int64.to_int n
+
+  let is_locally_initiated t stream_id =
+    match t.mode with
+    | Server -> Stream_id.is_server_initiated stream_id
+    | Client -> Stream_id.is_client_initiated stream_id
+
+  let local_stream_recv_window t stream_id =
+    let direction = Direction.classify stream_id in
+    let locally_initiated = is_locally_initiated t stream_id in
+    match direction with
+    | Unidirectional ->
+      if locally_initiated then None else Some t.local_initial_max_stream_data_uni
+    | Bidirectional ->
+      if locally_initiated
+      then Some t.local_initial_max_stream_data_bidi_local
+      else Some t.local_initial_max_stream_data_bidi_remote
+
+  let current_recv_stream_max_data t stream_id =
+    match local_stream_recv_window t stream_id with
+    | None -> None
+    | Some initial ->
+      Some
+        (Hashtbl.find_opt t.recv_stream_max_data stream_id
+         |> Option.value ~default:initial)
+
+  let peer_stream_send_window t stream_id =
+    let direction = Direction.classify stream_id in
+    let locally_initiated = is_locally_initiated t stream_id in
+    match direction with
+    | Unidirectional ->
+      if locally_initiated
+      then Some (int64_of_nonnegative t.peer_transport_params.initial_max_stream_data_uni)
+      else None
+    | Bidirectional ->
+      if locally_initiated
+      then
+        Some
+          (int64_of_nonnegative
+             t.peer_transport_params.initial_max_stream_data_bidi_remote)
+      else
+        Some
+          (int64_of_nonnegative
+             t.peer_transport_params.initial_max_stream_data_bidi_local)
+
+  let current_peer_stream_max_data t stream_id =
+    match peer_stream_send_window t stream_id with
+    | None -> None
+    | Some initial ->
+      Some
+        (Hashtbl.find_opt t.peer_stream_max_data stream_id
+         |> Option.value ~default:initial)
+
+  let should_grow_window ~advertised ~consumed ~window =
+    let threshold = Int64.max 1L (Int64.div window 2L) in
+    Int64.compare (Int64.sub advertised consumed) threshold <= 0
+
+  let maybe_replenish_recv_credit t ~stream_id ~bytes_read =
+    if bytes_read <= 0
+    then ()
+    else (
+      let bytes_read = Int64.of_int bytes_read in
+      let prev_stream_consumed =
+        Hashtbl.find_opt t.recv_stream_consumed_offsets stream_id
+        |> Option.value ~default:0L
+      in
+      let new_stream_consumed = Int64.add prev_stream_consumed bytes_read in
+      Hashtbl.replace
+        t.recv_stream_consumed_offsets
+        stream_id
+        new_stream_consumed;
+      t.consumed_data_bytes <- Int64.add t.consumed_data_bytes bytes_read;
+
+      (match local_stream_recv_window t stream_id with
+      | Some stream_window when Int64.compare stream_window 0L > 0 ->
+        let advertised =
+          Hashtbl.find_opt t.recv_stream_max_data stream_id
+          |> Option.value ~default:stream_window
+        in
+        if
+          should_grow_window
+            ~advertised
+            ~consumed:new_stream_consumed
+            ~window:stream_window
+        then
+          let new_limit = Int64.add new_stream_consumed stream_window in
+          if Int64.compare new_limit advertised > 0
+          then (
+            Hashtbl.replace t.recv_stream_max_data stream_id new_limit;
+            Format.eprintf
+              "[flowctl] return stream credit stream=%Ld consumed=%Ld old=%Ld \
+               new=%Ld window=%Ld@."
+              stream_id
+              new_stream_consumed
+              advertised
+              new_limit
+              stream_window;
+            send_frames
+              t
+              [ Frame.Max_stream_data
+                  { stream_id; max_data = int_of_int64_clamped new_limit }
+              ])
+      | Some _ | None -> ());
+
+      if
+        Int64.compare t.local_initial_max_data 0L > 0
+        && should_grow_window
+             ~advertised:t.max_recv_data
+             ~consumed:t.consumed_data_bytes
+             ~window:t.local_initial_max_data
+      then
+        let new_limit =
+          Int64.add t.consumed_data_bytes t.local_initial_max_data
+        in
+        if Int64.compare new_limit t.max_recv_data > 0
+        then (
+          Format.eprintf
+            "[flowctl] return connection credit consumed=%Ld old=%Ld new=%Ld \
+             window=%Ld@."
+            t.consumed_data_bytes
+            t.max_recv_data
+            new_limit
+            t.local_initial_max_data;
+          t.max_recv_data <- new_limit;
+          send_frames t [ Frame.Max_data (int_of_int64_clamped new_limit) ]))
+
   let create_stream (c : t) ~typ ~id =
     let stream =
       Stream.create
         ~typ
         ~id
         ~report_application_error:(report_application_error c)
+        ~on_bytes_read:(fun bytes_read ->
+          maybe_replenish_recv_credit c ~stream_id:id ~bytes_read)
         c.wakeup_writer
     in
     Hashtbl.add c.streams id stream;
@@ -695,17 +873,7 @@ module Connection = struct
       | Bidirectional -> c.local_initial_max_streams_bidi
       | Unidirectional -> c.local_initial_max_streams_uni
     in
-    let recv_window =
-      match direction with
-      | Unidirectional ->
-        if is_locally_initiated
-        then None
-        else Some c.local_initial_max_stream_data_uni
-      | Bidirectional ->
-        if is_locally_initiated
-        then Some c.local_initial_max_stream_data_bidi_local
-        else Some c.local_initial_max_stream_data_bidi_remote
-    in
+    let recv_window = current_recv_stream_max_data c id in
     let stream_final_offset =
       Int64.add (Int64.of_int fragment.IOVec.off) (Int64.of_int fragment.len)
     in
@@ -753,7 +921,7 @@ module Connection = struct
           let next_recv_data_bytes =
             Int64.add c.recv_data_bytes connection_bytes_delta
           in
-          if Int64.compare next_recv_data_bytes c.local_initial_max_data > 0
+          if Int64.compare next_recv_data_bytes c.max_recv_data > 0
           then
             report_error
               c
@@ -783,7 +951,15 @@ module Connection = struct
             Stream.Recv.push fragment ~is_fin stream.recv;
             process_stream_data c ~stream:stream.recv)
 
-  let process_max_stream_data_frame t ~stream_id =
+  let process_max_data_frame t max_data =
+    let max_data = int64_of_nonnegative max_data in
+    if Int64.compare max_data t.peer_max_data > 0
+    then (
+      t.peer_max_data <- max_data;
+      wakeup_writer t)
+
+  let process_max_stream_data_frame t ~stream_id ~max_data =
+    let max_data = int64_of_nonnegative max_data in
     let is_locally_initiated =
       match t.mode with
       | Server -> Stream_id.is_server_initiated stream_id
@@ -805,7 +981,12 @@ module Connection = struct
             ~frame_type:Frame.Type.Max_stream_data
             Stream_state_error
         else ()
-      | Some _ -> ()
+      | Some _ ->
+        (match current_peer_stream_max_data t stream_id with
+        | Some current when Int64.compare max_data current > 0 ->
+          Hashtbl.replace t.peer_stream_max_data stream_id max_data;
+          wakeup_writer t
+        | Some _ | None -> ())
 
   (* TODO: closing/ draining states, section 10.2 *)
   let process_connection_close_quic_frame
@@ -847,7 +1028,7 @@ module Connection = struct
              transport_params
          with
         | Ok transport_params ->
-          t.peer_transport_params <- transport_params;
+          apply_peer_transport_params t transport_params;
           t.recovery.rtt.max_ack_delay_ms <-
             Int64.of_int transport_params.max_ack_delay;
           (* From RFC9001§4.9.2:
@@ -856,7 +1037,9 @@ module Connection = struct
            *   RFC9001§4.1.2, clients confirm on HANDSHAKE_DONE.
            *)
           Encryption_level.remove Initial t.encdec;
-          Encryption_level.remove Handshake t.encdec
+          Encryption_level.remove Handshake t.encdec;
+          Recovery.discard_space t.recovery ~encryption_level:Initial;
+          Recovery.discard_space t.recovery ~encryption_level:Handshake
         | Error err -> report_error t ~frame_type:Handshake_done err))
 
   let process_path_challenge_frame t buf =
@@ -941,9 +1124,9 @@ module Connection = struct
         ~id
         ~fragment
         ~is_fin
-    | Max_data _ -> ()
-    | Max_stream_data { stream_id; _ } ->
-      process_max_stream_data_frame t ~stream_id
+    | Max_data max_data -> process_max_data_frame t max_data
+    | Max_stream_data { stream_id; max_data } ->
+      process_max_stream_data_frame t ~stream_id ~max_data
     | Max_streams (direction, max_streams) ->
       process_max_streams_frame t ~direction max_streams
     | Data_blocked _ | Stream_data_blocked _ -> ()
@@ -1032,8 +1215,17 @@ module Connection = struct
           Int64.of_int transport_parameters.Config.initial_max_streams_bidi
       ; local_initial_max_streams_uni =
           Int64.of_int transport_parameters.Config.initial_max_streams_uni
+      ; max_recv_data =
+          Int64.of_int transport_parameters.Config.initial_max_data
+      ; recv_stream_max_data = Hashtbl.create ~random:true 1024
       ; recv_data_bytes = 0L
       ; recv_stream_highest_offsets = Hashtbl.create ~random:true 1024
+      ; consumed_data_bytes = 0L
+      ; recv_stream_consumed_offsets = Hashtbl.create ~random:true 1024
+      ; peer_max_data = 0L
+      ; peer_stream_max_data = Hashtbl.create ~random:true 1024
+      ; sent_data_bytes = 0L
+      ; sent_stream_highest_offsets = Hashtbl.create ~random:true 1024
       ; recovery = Recovery.create ()
       ; queued_packets = Queue.create ()
       ; writer = Writer.create 0x1000
@@ -1061,6 +1253,17 @@ module Connection = struct
       ; now_ms
       }
     in
+    Format.eprintf
+      "[flowctl] local params configured cid=%s max_data=%Ld bidi_local=%Ld \
+       bidi_remote=%Ld uni=%Ld streams_bidi=%Ld streams_uni=%Ld@."
+      (let (`Hex x) = Hex.of_string (CID.to_string t.source_cid) in
+       x)
+      t.local_initial_max_data
+      t.local_initial_max_stream_data_bidi_local
+      t.local_initial_max_stream_data_bidi_remote
+      t.local_initial_max_stream_data_uni
+      t.local_initial_max_streams_bidi
+      t.local_initial_max_streams_uni;
     t
 
   let send_handshake_bytes t =
@@ -1105,6 +1308,52 @@ module Connection = struct
     send_handshake_bytes t;
     wakeup_writer t
 
+  let can_send_stream_fragment t ~stream_id ~fragment =
+    let fragment_end =
+      Int64.add (Int64.of_int fragment.IOVec.off) (Int64.of_int fragment.len)
+    in
+    match current_peer_stream_max_data t stream_id with
+    | None -> `Blocked
+    | Some max_stream_data when Int64.compare fragment_end max_stream_data > 0 ->
+      `Blocked
+    | Some _ ->
+      let prev_stream_highest =
+        Hashtbl.find_opt t.sent_stream_highest_offsets stream_id
+        |> Option.value ~default:0L
+      in
+      let new_stream_highest = Int64.max prev_stream_highest fragment_end in
+      let connection_delta = Int64.sub new_stream_highest prev_stream_highest in
+      let next_sent_data_bytes = Int64.add t.sent_data_bytes connection_delta in
+      if Int64.compare next_sent_data_bytes t.peer_max_data > 0
+      then `Blocked
+      else `Allowed (new_stream_highest, next_sent_data_bytes)
+
+  let available_send_budget t ~stream_id =
+    let connection_remaining = Int64.sub t.peer_max_data t.sent_data_bytes in
+    if Int64.compare connection_remaining 0L <= 0
+    then 0
+    else
+      match current_peer_stream_max_data t stream_id with
+      | None -> 0
+      | Some stream_max ->
+        let stream_sent =
+          Hashtbl.find_opt t.sent_stream_highest_offsets stream_id
+          |> Option.value ~default:0L
+        in
+        let stream_remaining = Int64.sub stream_max stream_sent in
+        if Int64.compare stream_remaining 0L <= 0
+        then 0
+        else int_of_int64_clamped (Int64.min connection_remaining stream_remaining)
+
+  let on_stream_fragment_sent
+        t
+        ~stream_id
+        ~new_stream_highest
+        ~new_sent_data_bytes
+    =
+    Hashtbl.replace t.sent_stream_highest_offsets stream_id new_stream_highest;
+    t.sent_data_bytes <- new_sent_data_bytes
+
   module Streams = struct
     type t =
       [ `Crypto
@@ -1119,7 +1368,14 @@ module Connection = struct
           | Client, Client Unidirectional
           | _, Stream.Type.Server Bidirectional
           | _, Client Bidirectional ->
-            let _flushed = Stream.Send.flush stream.Stream.send in
+            let max_flush_bytes =
+              match stream_type with
+              | `Crypto -> Int.max_int
+              | `Data -> available_send_budget t ~stream_id:stream.id
+            in
+            let _flushed =
+              Stream.Send.flush ~max_bytes:max_flush_bytes stream.Stream.send
+            in
             if
               Stream.Send.has_pending_output stream.send
               && Encryption_level.mem encryption_level t.encdec
@@ -1147,25 +1403,49 @@ module Connection = struct
                     t.dest_cid
                 in
                 let fragment, is_fin = Stream.Send.pop_exn stream.send in
-                let frames =
-                  match stream_type with
-                  | `Data ->
-                    [ Frame.Stream { id = stream.id; fragment; is_fin } ]
-                  | `Crypto -> [ Frame.Crypto fragment ]
-                in
-                Writer.write_frames_packet t.writer ~header_info frames;
-                on_packet_sent
-                  t
-                  ~encryption_level
-                  ~packet_number
-                  ~bytes_sent
-                  frames;
-                let can_be_followed_by_other_packets =
-                  encryption_level <> Application_data
-                in
-                if can_be_followed_by_other_packets
-                then inner Wrote (xs ())
-                else Wrote_app_data)
+                match stream_type with
+                | `Crypto ->
+                  let frames = [ Frame.Crypto fragment ] in
+                  Writer.write_frames_packet t.writer ~header_info frames;
+                  on_packet_sent
+                    t
+                    ~encryption_level
+                    ~packet_number
+                    ~bytes_sent
+                    frames;
+                  let can_be_followed_by_other_packets =
+                    encryption_level <> Application_data
+                  in
+                  if can_be_followed_by_other_packets
+                  then inner Wrote (xs ())
+                  else Wrote_app_data
+                | `Data ->
+                  (match can_send_stream_fragment t ~stream_id:stream.id ~fragment with
+                  | `Blocked ->
+                    Stream.Send.requeue fragment stream.send;
+                    inner acc (xs ())
+                  | `Allowed (new_stream_highest, new_sent_data_bytes) ->
+                    let frames =
+                      [ Frame.Stream { id = stream.id; fragment; is_fin } ]
+                    in
+                    Writer.write_frames_packet t.writer ~header_info frames;
+                    on_packet_sent
+                      t
+                      ~encryption_level
+                      ~packet_number
+                      ~bytes_sent
+                      frames;
+                    on_stream_fragment_sent
+                      t
+                      ~stream_id:stream.id
+                      ~new_stream_highest
+                      ~new_sent_data_bytes;
+                    let can_be_followed_by_other_packets =
+                      encryption_level <> Application_data
+                    in
+                    if can_be_followed_by_other_packets
+                    then inner Wrote (xs ())
+                    else Wrote_app_data))
             else inner acc (xs ())
           | Client, Server Unidirectional | Server, Client Unidirectional ->
             (* Server can't send on unidirectional streams created by the client *)

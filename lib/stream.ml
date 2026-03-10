@@ -66,22 +66,25 @@ module Buffer = struct
     ; mutable read_scheduled : bool
     ; mutable on_eof : unit -> unit
     ; mutable on_read : Bigstringaf.t -> off:int -> len:int -> unit
+    ; done_reading : int -> unit
     ; when_ready : unit -> unit
     }
 
   let default_on_eof = Sys.opaque_identity (fun () -> ())
   let default_on_read = Sys.opaque_identity (fun _ ~off:_ ~len:_ -> ())
+  let default_done_reading = Sys.opaque_identity (fun _ -> ())
 
-  let of_faraday faraday when_ready =
+  let of_faraday ?(done_reading = default_done_reading) faraday when_ready =
     { faraday
     ; read_scheduled = false
     ; on_eof = default_on_eof
     ; on_read = default_on_read
+    ; done_reading
     ; when_ready
     }
 
-  let create buffer when_ready =
-    of_faraday (Faraday.of_bigstring buffer) when_ready
+  let create ?done_reading buffer when_ready =
+    of_faraday ?done_reading (Faraday.of_bigstring buffer) when_ready
 
   let create_empty () =
     let t = create Bigstringaf.empty ignore in
@@ -129,6 +132,7 @@ module Buffer = struct
       let { IOVec.buffer; off; len } = iovec in
       Faraday.shift t.faraday len;
       on_read buffer ~off ~len;
+      t.done_reading len;
       execute_read t
 
   and execute_read t =
@@ -188,10 +192,10 @@ module Recv = struct
       | Reset_read
   end
 
-  let create () =
+  let create ?(done_reading = fun _ -> ()) () =
     { q = Q.empty
     ; offset = 0
-    ; consumer = Buffer.create Bigstringaf.empty ignore
+    ; consumer = Buffer.create ~done_reading Bigstringaf.empty ignore
     ; fin_offset = None
     }
 
@@ -205,7 +209,34 @@ module Recv = struct
      *   multiple times. Data that has already been received can be discarded. *)
     if t.offset < off + len || (is_fin && len = 0)
     then
-      let q' = Q.add off fragment t.q in
+      let fragment =
+        if off >= t.offset || len = 0
+        then fragment
+        else
+          let drop_prefix = t.offset - off in
+          let len = len - drop_prefix in
+          { IOVec.off = t.offset
+          ; len
+          ; buffer = Bigstringaf.sub fragment.buffer ~off:drop_prefix ~len
+          }
+      in
+      let fragment =
+        if fragment.len = 0
+        then fragment
+        else
+          (* Keep an owned copy of incoming stream data. Network parsers can
+             hand us slices into transient read buffers; queueing those directly
+             can corrupt stream reassembly when buffers are reused. *)
+          let buffer = Bigstringaf.create fragment.len in
+          Bigstringaf.blit
+            fragment.buffer
+            ~src_off:0
+            buffer
+            ~dst_off:0
+            ~len:fragment.len;
+          { fragment with buffer }
+      in
+      let q' = Q.add fragment.off fragment t.q in
       t.q <- q'
 
   let flush t =
@@ -217,23 +248,37 @@ module Recv = struct
         Format.eprintf "REAL EXN: %s@." (Printexc.to_string exn);
         failwith "NYI: Streamd.flush_recv / report_exn")
 
-  let pop t =
+  let rec pop t =
     match Q.pop t.q with
     | Some ((off, fragment), q') ->
-      if off = t.offset
-      then (
-        t.offset <- t.offset + fragment.len;
+      if off > t.offset
+      then None
+      else (
         t.q <- q';
-        if not (Buffer.is_closed t.consumer)
-        then (
-          Buffer.schedule_bigstring t.consumer fragment.buffer;
-          flush t;
-          match t.fin_offset with
-          | Some fin_offset ->
-            if fin_offset = t.offset then Buffer.close_reader t.consumer
-          | None -> ());
-        Some fragment)
-      else None
+        let fragment =
+          if off = t.offset || fragment.len = 0
+          then fragment
+          else
+            let drop_prefix = t.offset - off in
+            let len = fragment.len - drop_prefix in
+            { IOVec.off = t.offset
+            ; len
+            ; buffer = Bigstringaf.sub fragment.buffer ~off:drop_prefix ~len
+            }
+        in
+        if fragment.len = 0
+        then pop t
+        else (
+          t.offset <- t.offset + fragment.len;
+          if not (Buffer.is_closed t.consumer)
+          then (
+            Buffer.schedule_bigstring t.consumer fragment.buffer;
+            flush t;
+            match t.fin_offset with
+            | Some fin_offset ->
+              if fin_offset = t.offset then Buffer.close_reader t.consumer
+            | None -> ());
+          Some fragment))
     | None -> None
 
   let remove off t =
@@ -290,6 +335,10 @@ module Send = struct
     let q' = Q.remove off t.q in
     t.q <- q'
 
+  let requeue fragment t =
+    let q' = Q.add fragment.IOVec.off fragment t.q in
+    t.q <- q'
+
   let create when_ready =
     { q = Q.empty
     ; offset = 0
@@ -321,12 +370,25 @@ module Send = struct
     | `Writev iovecs ->
       let lengthv = IOVec.lengthv iovecs in
       let writev_len = if max_bytes < lengthv then max_bytes else lengthv in
+      let remaining = ref writev_len in
       List.iter
         (fun { IOVec.buffer; off; len } ->
-           (* XXX(anmonteiro): we might have to copy here since we're shifting
-              below. *)
-           let fragment = Bigstringaf.sub buffer ~off ~len in
-           ignore (push fragment t : Frame.fragment))
+           if !remaining > 0
+           then
+             let take = min len !remaining in
+             if take > 0
+             then (
+               (* Copy before shifting Faraday's internal buffer; otherwise
+                  queued fragments can alias mutable storage and get corrupted. *)
+               let fragment = Bigstringaf.create take in
+               Bigstringaf.blit
+                 buffer
+                 ~src_off:off
+                 fragment
+                 ~dst_off:0
+                 ~len:take;
+               ignore (push fragment t : Frame.fragment);
+               remaining := !remaining - take))
         iovecs;
       Faraday.shift faraday writev_len;
       writev_len
@@ -350,9 +412,9 @@ type t =
 
 let default_error_handler _ = ()
 
-let create ~typ ~id ~report_application_error when_ready =
+let create ~typ ~id ~report_application_error ?(on_bytes_read = ignore) when_ready =
   { send = Send.create when_ready
-  ; recv = Recv.create ()
+  ; recv = Recv.create ~done_reading:on_bytes_read ()
   ; typ
   ; id
   ; error_handler = default_error_handler
