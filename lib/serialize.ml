@@ -306,7 +306,7 @@ module Pkt = struct
         write_connection_ids t ~source_cid ~dest_cid
       | Short _ -> assert false
 
-    let write_short_header t ~pn_length ~dest_cid =
+    let write_short_header t ~pn_length ~dest_cid ~key_phase =
       (* From RFC9000§17.3:
        *   Header Form: The most significant bit (0x80) of byte 0 is set to 0
        *   for the short header.
@@ -314,8 +314,10 @@ module Pkt = struct
        *              containing a zero value for this bit are not valid
        *              packets in this version and MUST be discarded. *)
       let form_and_fixed_bits = 0b01000000 in
-      (* TODO: spin bit, key phase *)
-      let first_byte = form_and_fixed_bits lor ((pn_length - 1) land 0b11) in
+      let key_phase_bit = if key_phase then 0b00000100 else 0 in
+      let first_byte =
+        form_and_fixed_bits lor key_phase_bit lor ((pn_length - 1) land 0b11)
+      in
       (* From RFC9000§17.2:
        *   Reserved Bits: The next two bits (those with a mask of 0x18) of byte
        *                  0 are reserved. These bits are protected using header
@@ -330,7 +332,8 @@ module Pkt = struct
       match header with
       | Packet.Header.Initial _ | Long _ ->
         write_long_header t ~pn_length ~header
-      | Short { dest_cid } -> write_short_header t ~pn_length ~dest_cid
+      | Short { dest_cid; key_phase } ->
+        write_short_header t ~pn_length ~dest_cid ~key_phase
   end
 
   let write_version_negotiation_packet t ~versions ~source_cid ~dest_cid =
@@ -389,6 +392,7 @@ module Writer = struct
     ; dest_cid : CID.t
     ; token : string
     ; encryption_level : Encryption_level.level
+    ; key_phase : bool
     ; packet_number : int64
     ; encrypter : Crypto.AEAD.t
     }
@@ -423,6 +427,7 @@ module Writer = struct
         ~encrypter
         ~packet_number
         ~encryption_level
+        ?(key_phase = false)
         ?(source_cid = CID.empty)
         ?(version = 0x1l)
         ~token
@@ -435,6 +440,7 @@ module Writer = struct
     ; token
     ; packet_number
     ; encryption_level
+    ; key_phase
     }
 
   (* From RFC<QUIC-TLS-RFC>§4:
@@ -458,7 +464,7 @@ module Writer = struct
    *               Table 1: Encryption Keys by Packet Type
    *)
   let header_of_encryption_level
-        { version; source_cid; dest_cid; token; encryption_level; _ }
+        { version; source_cid; dest_cid; token; encryption_level; key_phase; _ }
     =
     match encryption_level with
     | Encryption_level.Initial ->
@@ -466,7 +472,7 @@ module Writer = struct
     | Zero_RTT -> Long { version; source_cid; dest_cid; packet_type = Zero_RTT }
     | Handshake ->
       Long { version; source_cid; dest_cid; packet_type = Handshake }
-    | Application_data -> Short { dest_cid }
+    | Application_data -> Short { dest_cid; key_phase }
 
   let write_frames_packet t ~header_info frames =
     assert (frames <> []);

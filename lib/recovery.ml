@@ -134,6 +134,8 @@ let pto_base_ms t =
           Constants.k_granularity_ms)
        t.rtt.max_ack_delay_ms)
 
+let key_update_old_key_discard_interval_ms t = Int64.mul 3L (pto_base_ms t)
+
 let has_ack_eliciting_in_flight info =
   Q.fold
     (fun _ packet acc -> acc || (packet.in_flight && packet.ack_eliciting))

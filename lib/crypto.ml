@@ -465,7 +465,9 @@ module AEAD = struct
 
   (* Ciphertext includes header + payload *)
   let decrypt_packet t ~payload_length ~largest_pn ciphertext =
-    let ciphertext = Bytes.unsafe_of_string ciphertext in
+    (* We mutate header bytes in-place while removing header protection, so
+       each decrypt attempt needs an isolated mutable copy. *)
+    let ciphertext = Bytes.of_string ciphertext in
     let offset = sample_offset ~conn_id_len:t.conn_id_len ciphertext in
     let sample = Bytes.sub_string ciphertext offset 16 in
     let header = decrypt_header_in_place t ~sample ciphertext in

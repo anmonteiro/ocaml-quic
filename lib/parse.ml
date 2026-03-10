@@ -464,7 +464,9 @@ module Packet = struct
    *  }
    *)
   let short_header =
-    lift (fun dest_cid -> Packet.Header.Short { dest_cid }) Header.Short.parse
+    lift
+      (fun dest_cid -> Packet.Header.Short { dest_cid; key_phase = false })
+      Header.Short.parse
 
   let protected_header =
     any_uint8 >>= fun first_byte ->
@@ -583,14 +585,26 @@ module Packet = struct
          *   variable-length integer (Section 16). *)
         payload_length - pn_length
       in
+      let first_byte_unprotected = String.get_uint8 header_cs 0 in
+      let header =
+        match header with
+        | Packet.Header.Short { dest_cid; _ } ->
+          let key_phase = Bits.test first_byte_unprotected 2 in
+          Packet.Header.Short { dest_cid; key_phase }
+        | _ -> header
+      in
       Payload.parser ~header ~packet_number ~payload_length plaintext
       >>| fun packet ->
       (* From RFC9000§17.2:
        *   An endpoint MUST treat receipt of a packet that has a non-zero value
        *   for these bits after removing both packet and header protection as a
        *   connection error of type PROTOCOL_VIOLATION. *)
-      let first_byte_unprotected = String.get_uint8 header_cs 0 in
-      if first_byte_unprotected land 0b00001100 != 0
+      let reserved_bits_mask =
+        match header with
+        | Packet.Header.Short _ -> 0b00011000
+        | Packet.Header.Initial _ | Packet.Header.Long _ -> 0b00001100
+      in
+      if first_byte_unprotected land reserved_bits_mask != 0
       then Error (packet, Protocol_violation)
       else Packet packet
     | Unprotected -> unprotected >>| fun packet -> Packet packet

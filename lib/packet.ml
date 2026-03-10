@@ -84,7 +84,10 @@ module Header = struct
         ; dest_cid : CID.t
         ; packet_type : Type.t
         }
-    | Short of { dest_cid : CID.t }
+    | Short of
+        { dest_cid : CID.t
+        ; key_phase : bool
+        }
 
   let long_packet_type = function
     | Initial _ -> Type.Initial

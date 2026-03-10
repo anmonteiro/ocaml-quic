@@ -83,19 +83,35 @@ let test_quic_transport_parameters () =
 
 let test_short_header () =
   let dest_cid = Quic.CID.(of_string (String.make src_length 'a')) in
-  let f = Faraday.create 20 in
-  Quic.Serialize.Pkt.Header.write_short_header f ~pn_length:4 ~dest_cid;
-  (* Asserts that we don't write it for short headers *)
-  Quic.Serialize.Pkt.Header.write_payload_length
-    f
-    ~pn_length:4
-    ~header:(Quic.Packet.Header.Short { dest_cid })
-    0;
-  Quic.Serialize.Pkt.Header.write_packet_number
-    f
-    ~pn_length:4
-    ~packet_number:12L;
-  let hdr = Faraday.serialize_to_string f in
+  let mk_header ~key_phase =
+    let f = Faraday.create 20 in
+    Quic.Serialize.Pkt.Header.write_short_header
+      f
+      ~pn_length:4
+      ~dest_cid
+      ~key_phase;
+    (* Asserts that we don't write it for short headers *)
+    Quic.Serialize.Pkt.Header.write_payload_length
+      f
+      ~pn_length:4
+      ~header:(Quic.Packet.Header.Short { dest_cid; key_phase })
+      0;
+    Quic.Serialize.Pkt.Header.write_packet_number
+      f
+      ~pn_length:4
+      ~packet_number:12L;
+    Faraday.serialize_to_string f
+  in
+  let hdr = mk_header ~key_phase:false in
+  let hdr_with_kp = mk_header ~key_phase:true in
+  Alcotest.(check bool)
+    "key phase cleared"
+    false
+    (String.get_uint8 hdr 0 land 0b00000100 <> 0);
+  Alcotest.(check bool)
+    "key phase set"
+    true
+    (String.get_uint8 hdr_with_kp 0 land 0b00000100 <> 0);
   match
     Angstrom.parse_string ~consume:Prefix Quic.Parse.Packet.protected_header hdr
   with

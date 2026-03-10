@@ -80,6 +80,11 @@ module Packet_number = struct
     Frame.Ack { delay = 0; ranges; ecn_counts = None }
 end
 
+let derive_next_application_secret ~ciphersuite secret =
+  let hash = Tls.Ciphersuite.hash13 ciphersuite in
+  let module H = (val Digestif.module_of_hash' hash) in
+  Crypto.Kdf.get_ku ~hash ~kn:H.digest_size secret
+
 type error_handler = int -> unit
 type on_error_handler = { on_error : error_handler }
 type start_stream = ?error_handler:error_handler -> Direction.t -> Stream.t
@@ -95,6 +100,18 @@ module Connection = struct
     { encdec : Crypto.encdec Encryption_level.t
     ; mode : Crypto.Mode.t
     ; mutable tls_state : Qtls.t
+    ; mutable application_tx_secret : string option
+    ; mutable application_rx_secret : string option
+    ; mutable application_ciphersuite : Tls.Ciphersuite.ciphersuite13 option
+    ; mutable application_key_phase : bool
+    ; mutable peer_application_key_phase : bool
+    ; mutable previous_application_decrypter : (bool * Crypto.AEAD.t) option
+    ; mutable previous_application_decrypter_discard_at_ms : int64 option
+    ; mutable first_received_pn_current_key_phase : int64 option
+    ; mutable handshake_confirmed : bool
+    ; mutable local_key_update_waiting_for_ack : bool
+    ; mutable lowest_pn_sent_current_key_phase : int64 option
+    ; mutable largest_acked_application_data : int64
     ; packet_number_spaces : Packet_number.t Spaces.t
     ; source_cid : CID.t
     ; mutable original_dest_cid : CID.t
@@ -122,6 +139,54 @@ module Connection = struct
     ; mutable token_value : string
     ; now_ms : unit -> int64
     }
+
+  type initiate_key_update_error =
+    [ `Handshake_not_confirmed
+    | `Awaiting_current_phase_ack
+    | `Current_phase_not_acknowledged
+    | `Missing_application_keys
+    ]
+
+  let promote_peer_key_update
+        t
+        ~current_decrypter
+        ~next_decrypter
+        ~next_rx_secret
+        ~next_tx_secret
+        ~next_encrypter
+        ~key_phase
+        ~packet_number
+    =
+    let discard_after_ms =
+      Int64.add
+        (t.now_ms ())
+        (Recovery.key_update_old_key_discard_interval_ms t.recovery)
+    in
+    t.previous_application_decrypter <-
+      Some (t.peer_application_key_phase, current_decrypter);
+    t.previous_application_decrypter_discard_at_ms <- Some discard_after_ms;
+    t.application_rx_secret <- Some next_rx_secret;
+    t.application_tx_secret <- Some next_tx_secret;
+    t.application_key_phase <- key_phase;
+    t.peer_application_key_phase <- key_phase;
+    t.first_received_pn_current_key_phase <- Some packet_number;
+    t.local_key_update_waiting_for_ack <- true;
+    t.lowest_pn_sent_current_key_phase <- None;
+    Encryption_level.update_exn
+      Application_data
+      (fun _encdec ->
+         Some
+           { Crypto.encrypter = next_encrypter
+           ; decrypter = Some next_decrypter
+           })
+      t.encdec
+
+  let maybe_discard_previous_application_decrypter t =
+    match t.previous_application_decrypter_discard_at_ms with
+    | Some deadline when Int64.compare (t.now_ms ()) deadline >= 0 ->
+      t.previous_application_decrypter <- None;
+      t.previous_application_decrypter_discard_at_ms <- None
+    | Some _ | None -> ()
 
   let invoke_handler t ~cid ~start_stream stream =
     let stream_handler =
@@ -240,14 +305,22 @@ module Connection = struct
       Encryption_level.find_exn encryption_level t.encdec
     in
     let header_info =
+      let key_phase =
+        encryption_level = Application_data && t.application_key_phase
+      in
       Writer.make_header_info
         ~encrypter
         ~packet_number
         ~encryption_level
+        ~key_phase
         ~source_cid:t.source_cid
         ~token:t.token_value
         t.dest_cid
     in
+    if
+      encryption_level = Application_data
+      && Option.is_none t.lowest_pn_sent_current_key_phase
+    then t.lowest_pn_sent_current_key_phase <- Some packet_number;
     Queue.add (header_info, frames) t.queued_packets
 
   let process_ack_frame t ~packet_info ~delay ~ranges =
@@ -279,7 +352,51 @@ module Connection = struct
       (List.length ranges);
     Recovery.drain_lost t.recovery ~encryption_level
     |> List.iter (fun frames -> send_frames t ~encryption_level frames);
+    if encryption_level = Application_data
+    then (
+      let largest_acked_in_frame =
+        List.fold_left
+          (fun acc (range : Frame.Range.t) -> Int64.max acc range.last)
+          (-1L)
+          ranges
+      in
+      t.largest_acked_application_data <-
+        Int64.max t.largest_acked_application_data largest_acked_in_frame;
+      if t.local_key_update_waiting_for_ack
+      then
+        match t.lowest_pn_sent_current_key_phase with
+        | Some low
+          when Int64.compare t.largest_acked_application_data low >= 0 ->
+          t.local_key_update_waiting_for_ack <- false
+        | Some _ | None -> ());
     ()
+
+  let initiate_key_update t =
+    if not t.handshake_confirmed
+    then Error `Handshake_not_confirmed
+    else if t.local_key_update_waiting_for_ack
+    then Error `Awaiting_current_phase_ack
+    else
+      match t.lowest_pn_sent_current_key_phase with
+      | Some low when Int64.compare t.largest_acked_application_data low >= 0 ->
+        (match t.application_ciphersuite, t.application_tx_secret with
+        | Some ciphersuite, Some tx_secret ->
+          let next_tx_secret =
+            derive_next_application_secret ~ciphersuite tx_secret
+          in
+          let next_encrypter = Crypto.AEAD.make ~ciphersuite next_tx_secret in
+          t.application_tx_secret <- Some next_tx_secret;
+          t.application_key_phase <- not t.application_key_phase;
+          t.local_key_update_waiting_for_ack <- true;
+          t.lowest_pn_sent_current_key_phase <- None;
+          Encryption_level.update_exn
+            Application_data
+            (fun encdec ->
+               Some { encdec with Crypto.encrypter = next_encrypter })
+            t.encdec;
+          Ok ()
+        | _ -> Error `Missing_application_keys)
+      | Some _ | None -> Error `Current_phase_not_acknowledged
 
   let report_error ?frame_type t error =
     if not t.did_send_connection_close
@@ -366,6 +483,11 @@ module Connection = struct
         let current_cipher = Qtls.current_cipher new_tls_state in
         let next = Encryption_level.next cur_encryption_level in
         t.encdec.current <- next;
+        if next = Application_data
+        then (
+          t.application_tx_secret <- Some enc.traffic_secret;
+          t.application_rx_secret <- Some dec.traffic_secret;
+          t.application_ciphersuite <- Some current_cipher);
         Encryption_level.add
           next
           { Crypto.encrypter =
@@ -382,6 +504,10 @@ module Connection = struct
         let current_cipher = Qtls.current_cipher new_tls_state in
         let next = Encryption_level.next cur_encryption_level in
         t.encdec.current <- next;
+        if next = Application_data
+        then (
+          t.application_tx_secret <- Some enc.traffic_secret;
+          t.application_ciphersuite <- Some current_cipher);
         Encryption_level.add
           next
           { Crypto.encrypter =
@@ -392,6 +518,10 @@ module Connection = struct
         process_packets next xs
       | `Change_dec dec :: xs ->
         let current_cipher = Qtls.current_cipher new_tls_state in
+        if cur_encryption_level = Application_data
+        then (
+          t.application_rx_secret <- Some dec.traffic_secret;
+          t.application_ciphersuite <- Some current_cipher);
         Encryption_level.update_current
           (function
             | None -> assert false
@@ -438,6 +568,7 @@ module Connection = struct
        *   The server uses the HANDSHAKE_DONE frame (type=0x1e) to signal
        *   confirmation of the handshake to the client. *)
       assert (t.encdec.current = Application_data);
+      t.handshake_confirmed <- true;
       send_frames t [ Frame.Handshake_done ]);
     t.tls_state <- new_tls_state
 
@@ -446,39 +577,55 @@ module Connection = struct
     match Stream.Recv.pop stream.recv with
     | Some { buffer; _ } ->
       let fragment_cstruct = Bigstringaf.to_string buffer in
+      let handle_post_handshake_crypto () =
+        match Qtls.handle_raw_record t.tls_state fragment_cstruct with
+        | Error _e -> report_error t ~frame_type:Crypto Internal_error
+        | Ok (tls_state', tls_packets, (None | Some _)) ->
+          let has_forbidden_key_update =
+            List.exists
+              (function
+                | `Change_enc _ | `Change_dec _ -> true
+                | `Record _ -> false)
+              tls_packets
+          in
+          (* RFC9001§4.6: QUIC endpoints MUST treat receipt of TLS KeyUpdate as
+             PROTOCOL_VIOLATION. In ocaml-tls this surfaces as Change_* items. *)
+          if has_forbidden_key_update
+          then report_error t ~frame_type:Crypto Protocol_violation
+          else t.tls_state <- tls_state'
+      in
       (match t.tls_state.handshake.machina with
       | Server Tls.State.AwaitClientHello | Server13 AwaitClientHelloHRR13 ->
         if encryption_level <> Initial || t.encdec.current <> Initial
         then ()
-        else
-          (match
-             Qtls.handle_raw_record
-               ~embed_quic_transport_params:(fun _raw_transport_params ->
-                 (* From RFC9000§7.3:
-                  *   When the handshake does not include a Retry (Figure 6), the
-                  *   server sets original_destination_connection_id to S1 and
-                  *   initial_source_connection_id to S3. In this case, the server
-                  *   does not include a retry_source_connection_id transport
-                  *   parameter. *)
-                 Some
-                   Transport_parameters.(
-                     encode
-                       [ Encoding.Original_destination_connection_id
-                           t.original_dest_cid
-                       ; Initial_source_connection_id t.source_cid
-                       ; (* TODO: get these from configuration *)
-                         Initial_max_data (1 lsl 27)
-                       ; Initial_max_stream_data_bidi_local (1 lsl 27)
-                       ; Initial_max_stream_data_bidi_remote (1 lsl 27)
-                       ; Initial_max_stream_data_uni (1 lsl 27)
-                       ; Initial_max_streams_bidi (1 lsl 8)
-                       ; Initial_max_streams_uni (1 lsl 8)
-                       ]))
-               t.tls_state
-               fragment_cstruct
-           with
-          | Error _e ->
-            report_error t ~frame_type:Crypto Internal_error
+        else (
+          match
+            Qtls.handle_raw_record
+              ~embed_quic_transport_params:(fun _raw_transport_params ->
+                (* From RFC9000§7.3:
+                 *   When the handshake does not include a Retry (Figure 6), the
+                 *   server sets original_destination_connection_id to S1 and
+                 *   initial_source_connection_id to S3. In this case, the server
+                 *   does not include a retry_source_connection_id transport
+                 *   parameter. *)
+                Some
+                  Transport_parameters.(
+                    encode
+                      [ Encoding.Original_destination_connection_id
+                          t.original_dest_cid
+                      ; Initial_source_connection_id t.source_cid
+                      ; (* TODO: get these from configuration *)
+                        Initial_max_data (1 lsl 27)
+                      ; Initial_max_stream_data_bidi_local (1 lsl 27)
+                      ; Initial_max_stream_data_bidi_remote (1 lsl 27)
+                      ; Initial_max_stream_data_uni (1 lsl 27)
+                      ; Initial_max_streams_bidi (1 lsl 8)
+                      ; Initial_max_streams_uni (1 lsl 8)
+                      ]))
+              t.tls_state
+              fragment_cstruct
+          with
+          | Error _e -> report_error t ~frame_type:Crypto Internal_error
           | Ok (tls_state', tls_packets, (None | Some _)) ->
             (* TODO: send alerts as quic error *)
             (match tls_packets with
@@ -503,24 +650,23 @@ module Connection = struct
           | AwaitClientFinished13 _ ) ->
         if encryption_level <> Handshake
         then ()
-        else
-          (match Qtls.handle_raw_record t.tls_state fragment_cstruct with
-          | Error _e ->
-            report_error t ~frame_type:Crypto Internal_error
+        else (
+          match Qtls.handle_raw_record t.tls_state fragment_cstruct with
+          | Error _e -> report_error t ~frame_type:Crypto Internal_error
           | Ok (tls_state', tls_packets, (None | Some _)) ->
             (* TODO: send alerts as quic error *)
             process_tls_result t ~new_tls_state:tls_state' ~tls_packets)
       | Server13 Established13 ->
-        (* TODO: handle key updates *)
-        ()
+        if encryption_level <> Application_data || t.encdec.current <> Application_data
+        then ()
+        else handle_post_handshake_crypto ()
       | Server Established -> report_error t ~frame_type:Crypto Internal_error
       | Client (AwaitServerHello (_, _, _)) ->
         if encryption_level <> Initial || t.encdec.current <> Initial
         then ()
-        else
-          (match Qtls.handle_raw_record t.tls_state fragment_cstruct with
-          | Error _e ->
-            report_error t ~frame_type:Crypto Internal_error
+        else (
+          match Qtls.handle_raw_record t.tls_state fragment_cstruct with
+          | Error _e -> report_error t ~frame_type:Crypto Internal_error
           | Ok (tls_state', tls_packets, (None | Some _)) ->
             (* TODO: send alerts as quic error *)
             process_tls_result t ~new_tls_state:tls_state' ~tls_packets)
@@ -531,23 +677,25 @@ module Connection = struct
           | AwaitServerFinished13 _ ) ->
         if encryption_level <> Handshake || t.encdec.current <> Handshake
         then ()
-        else
-          (match Qtls.handle_raw_record t.tls_state fragment_cstruct with
-          | Error _e ->
-            report_error t ~frame_type:Crypto Internal_error
+        else (
+          match Qtls.handle_raw_record t.tls_state fragment_cstruct with
+          | Error _e -> report_error t ~frame_type:Crypto Internal_error
           | Ok (tls_state', tls_packets, (None | Some _)) ->
             (* TODO: send alerts as quic error *)
             process_tls_result t ~new_tls_state:tls_state' ~tls_packets)
       | Client13 (AwaitServerHello13 _) ->
         if encryption_level <> Initial || t.encdec.current <> Initial
         then ()
-        else
-          (match Qtls.handle_raw_record t.tls_state fragment_cstruct with
-          | Error _e ->
-            report_error t ~frame_type:Crypto Internal_error
+        else (
+          match Qtls.handle_raw_record t.tls_state fragment_cstruct with
+          | Error _e -> report_error t ~frame_type:Crypto Internal_error
           | Ok (tls_state', tls_packets, (None | Some _)) ->
             process_tls_result t ~new_tls_state:tls_state' ~tls_packets)
-      | Client _ | Client13 _ -> ()
+      | Client13 Established13 ->
+        if encryption_level <> Application_data || t.encdec.current <> Application_data
+        then ()
+        else handle_post_handshake_crypto ()
+      | Client _ -> ()
       | Server _ | Server13 _ -> ());
       exhaust_crypto_stream t ~packet_info ~stream
     | None -> ()
@@ -643,7 +791,8 @@ module Connection = struct
         | Ok transport_params ->
           t.peer_transport_params <- transport_params;
           t.recovery.rtt.max_ack_delay_ms <-
-            Int64.of_int transport_params.max_ack_delay
+            Int64.of_int transport_params.max_ack_delay;
+          t.handshake_confirmed <- true
         | Error err -> report_error t ~frame_type:Handshake_done err))
 
   let process_path_challenge_frame t buf =
@@ -771,6 +920,18 @@ module Connection = struct
             ~application_data:(Packet_number.create ())
       ; crypto_streams
       ; tls_state
+      ; application_tx_secret = None
+      ; application_rx_secret = None
+      ; application_ciphersuite = None
+      ; application_key_phase = false
+      ; peer_application_key_phase = false
+      ; previous_application_decrypter = None
+      ; previous_application_decrypter_discard_at_ms = None
+      ; first_received_pn_current_key_phase = None
+      ; handshake_confirmed = false
+      ; local_key_update_waiting_for_ack = false
+      ; lowest_pn_sent_current_key_phase = None
+      ; largest_acked_application_data = -1L
       ; source_cid = connection_id
       ; original_dest_cid = CID.empty
       ; dest_cid = CID.empty
@@ -880,10 +1041,15 @@ module Connection = struct
                   Encryption_level.find_exn encryption_level t.encdec
                 in
                 let header_info =
+                  let key_phase =
+                    encryption_level = Application_data
+                    && t.application_key_phase
+                  in
                   Writer.make_header_info
                     ~encrypter
                     ~packet_number
                     ~encryption_level
+                    ~key_phase
                     ~source_cid:t.source_cid
                     ~token:t.token_value
                     t.dest_cid
@@ -1020,7 +1186,7 @@ let on_timeout t =
                 if
                   !remaining_probes > 0
                   && Encryption_level.mem encryption_level connection.encdec
-                then (
+                then
                   let candidates =
                     Recovery.drain_lost connection.recovery ~encryption_level
                     @ Recovery.pto_probe_packets
@@ -1035,7 +1201,7 @@ let on_timeout t =
                          decr remaining_probes;
                          retransmissions_rev :=
                            (encryption_level, frames) :: !retransmissions_rev))
-                    candidates))
+                    candidates)
              [ Initial; Handshake; Application_data ];
            match List.rev !retransmissions_rev with
            | [] ->
@@ -1090,6 +1256,8 @@ let create_outgoing_frames ~current =
   let r = Encryption_level.create ~current in
   List.iter (fun lvl -> Encryption_level.add lvl [] r) Encryption_level.all;
   r
+
+let short_header_key_phase first_byte = Bits.test first_byte 2
 
 let on_close t (connection : Connection.t) =
   deregister_connection_ids t ~connection
@@ -1239,119 +1407,119 @@ let packet_handler t ?error packet =
             ~connection_handler:t.connection_handler
             ~encdec
         in
-        (* Keep routing the client's original DCID until it switches to our SCID. *)
+        (* Keep routing the client's original DCID until it switches to our
+           SCID. *)
         register_connection_id t ~cid:connection_id ~connection;
         Some connection)
   in
   match c_opt with
-  | None ->
-    ()
+  | None -> ()
   | Some c ->
     (match error with
     | Some error -> Connection.report_error c error
     | None ->
-    if CID.is_empty c.original_dest_cid
-    then
-      (* From RFC9000§7.3:
-       *   Each endpoint includes the value of the Source Connection ID field
-       *   from the first Initial packet it sent in the
-       *   initial_source_connection_id transport parameter; see Section 18.2. A
-       *   server includes the Destination Connection ID field from the first
-       *   Initial packet it received from the client in the
-       *   original_destination_connection_id transport parameter [...]. *)
-      c.original_dest_cid <- Packet.destination_cid packet;
+      if CID.is_empty c.original_dest_cid
+      then
+        (* From RFC9000§7.3:
+         *   Each endpoint includes the value of the Source Connection ID field
+         *   from the first Initial packet it sent in the
+         *   initial_source_connection_id transport parameter; see Section 18.2. A
+         *   server includes the Destination Connection ID field from the first
+         *   Initial packet it received from the client in the
+         *   original_destination_connection_id transport parameter [...]. *)
+        c.original_dest_cid <- Packet.destination_cid packet;
 
-    (match packet with
-    | Packet.VersionNegotiation _ -> ()
-    | Frames { header; payload; packet_number; _ } ->
-      let encryption_level = Encryption_level.of_header header in
-
-      (* (match encryption_level with *)
-      (* | Initial -> *)
-      (* c.packet_number_spaces.initial.received <- *)
-      (* Int64.max c.packet_number_spaces.initial.received packet_number *)
-      (* | Handshake -> *)
-      (* c.packet_number_spaces.handshake.received <- *)
-      (* Int64.max c.packet_number_spaces.handshake.received packet_number *)
-      (* | Application_data | Zero_RTT -> *)
-      (* c.packet_number_spaces.application_data.received <- *)
-      (* Int64.max c.packet_number_spaces.application_data.received
-         packet_number); *)
-      let pn_space =
-        Spaces.of_encryption_level c.packet_number_spaces encryption_level
-      in
-      pn_space.received <- Int64.max pn_space.received packet_number;
-
-      (match Packet.source_cid packet with
-      | Some src_cid ->
-        (* From RFC9000§19.6:
-         *   Upon receiving a packet, each endpoint sets the Destination Connection
-         *   ID it sends to match the value of the Source Connection ID that it
-         *   receives. *)
-        c.dest_cid <- src_cid
-      | None ->
-        (* TODO: short packets will fail here? *)
-        assert (
-          match packet with
-          | Frames { header = Packet.Header.Short _; _ } -> true
-          | _ -> false));
-
-      let packet_info =
-        { header
-        ; encryption_level
-        ; packet_number
-        ; outgoing_frames = create_outgoing_frames ~current:c.encdec.current
-        ; connection = c
-        }
-      in
-
-      (match
-         Angstrom.parse_bigstring
-           ~consume:All
-           (Parse.Frame.parser (Connection.frame_handler c ~packet_info))
-           payload
-       with
-      | Ok _frames ->
-        (* process streams for packets that have been acknowledged. *)
-        let acked_frames =
-          Recovery.drain_acknowledged
-            c.recovery
-            ~encryption_level:packet_info.encryption_level
-        in
-        List.iter
-          (function
-            | Frame.Crypto { IOVec.off; _ } ->
-              let crypto_stream =
-                Spaces.of_encryption_level
-                  c.crypto_streams
-                  packet_info.encryption_level
-              in
-              Stream.Send.remove off crypto_stream.send
-            | Stream { id; fragment = { IOVec.off; _ }; _ } ->
-              (match Hashtbl.find_opt c.streams id with
-              | Some stream -> Stream.Send.remove off stream.send
-              | None -> ())
-            | Ack { ranges = _; _ } ->
-              (* TODO: when we track packets that need acknowledgement, update
-                 the largest acknowledged here. *)
-              ()
-            | _other -> ())
-          acked_frames;
-        (* This packet has been processed, mark it for acknowledgement. *)
+      (match packet with
+      | Packet.VersionNegotiation _ -> ()
+      | Frames { header; payload; packet_number; _ } ->
+        let encryption_level = Encryption_level.of_header header in
+        (* (match encryption_level with *)
+        (* | Initial -> *)
+        (* c.packet_number_spaces.initial.received <- *)
+        (* Int64.max c.packet_number_spaces.initial.received packet_number *)
+        (* | Handshake -> *)
+        (* c.packet_number_spaces.handshake.received <- *)
+        (* Int64.max c.packet_number_spaces.handshake.received packet_number *)
+        (* | Application_data | Zero_RTT -> *)
+        (* c.packet_number_spaces.application_data.received <- *)
+        (* Int64.max c.packet_number_spaces.application_data.received
+       packet_number); *)
         let pn_space =
-          Spaces.of_encryption_level
-            c.packet_number_spaces
-            packet_info.encryption_level
+          Spaces.of_encryption_level c.packet_number_spaces encryption_level
         in
-        Packet_number.insert_for_acking pn_space packet_number;
-        (* packet_info should now contain frames we need to send in response. *)
-        send_packets t ~packet_info;
-        (* Reset for the next packet. *)
-        pn_space.ack_elicited <- false
-      | Error e ->
-        Format.eprintf "discarding malformed packet payload: %s@." e)
-    | Retry { header; token; pseudo; tag } ->
-      process_retry_packet t c ~header ~token ~pseudo ~tag))
+        pn_space.received <- Int64.max pn_space.received packet_number;
+
+        (match Packet.source_cid packet with
+        | Some src_cid ->
+          (* From RFC9000§19.6:
+           *   Upon receiving a packet, each endpoint sets the Destination Connection
+           *   ID it sends to match the value of the Source Connection ID that it
+           *   receives. *)
+          c.dest_cid <- src_cid
+        | None ->
+          (* TODO: short packets will fail here? *)
+          assert (
+            match packet with
+            | Frames { header = Packet.Header.Short _; _ } -> true
+            | _ -> false));
+
+        let packet_info =
+          { header
+          ; encryption_level
+          ; packet_number
+          ; outgoing_frames = create_outgoing_frames ~current:c.encdec.current
+          ; connection = c
+          }
+        in
+
+        (match
+           Angstrom.parse_bigstring
+             ~consume:All
+             (Parse.Frame.parser (Connection.frame_handler c ~packet_info))
+             payload
+         with
+        | Ok _frames ->
+          (* process streams for packets that have been acknowledged. *)
+          let acked_frames =
+            Recovery.drain_acknowledged
+              c.recovery
+              ~encryption_level:packet_info.encryption_level
+          in
+          List.iter
+            (function
+              | Frame.Crypto { IOVec.off; _ } ->
+                let crypto_stream =
+                  Spaces.of_encryption_level
+                    c.crypto_streams
+                    packet_info.encryption_level
+                in
+                Stream.Send.remove off crypto_stream.send
+              | Stream { id; fragment = { IOVec.off; _ }; _ } ->
+                (match Hashtbl.find_opt c.streams id with
+                | Some stream -> Stream.Send.remove off stream.send
+                | None -> ())
+              | Ack { ranges = _; _ } ->
+                (* TODO: when we track packets that need acknowledgement,
+                   update the largest acknowledged here. *)
+                ()
+              | _other -> ())
+            acked_frames;
+          (* This packet has been processed, mark it for acknowledgement. *)
+          let pn_space =
+            Spaces.of_encryption_level
+              c.packet_number_spaces
+              packet_info.encryption_level
+          in
+          Packet_number.insert_for_acking pn_space packet_number;
+          (* packet_info should now contain frames we need to send in
+             response. *)
+          send_packets t ~packet_info;
+          (* Reset for the next packet. *)
+          pn_space.ack_elicited <- false
+        | Error e ->
+          Format.eprintf "discarding malformed packet payload: %s@." e)
+      | Retry { header; token; pseudo; tag } ->
+        process_retry_packet t c ~header ~token ~pseudo ~tag))
 
 let create ~mode ~now_ms ~config connection_handler =
   let rec reader_packet_handler t ?error packet =
@@ -1361,10 +1529,9 @@ let create ~mode ~now_ms ~config connection_handler =
     let cs = Bigstringaf.substring ~off ~len bs in
     let connection_id = Packet.Header.destination_cid header in
     if CID.is_empty connection_id
-    then
-      None
+    then None
     else
-      let decrypter_and_largest_pn =
+      let decrypted =
         match Connection.Table.find_opt t.connections connection_id with
         | Some connection ->
           let encryption_level = Encryption_level.of_header header in
@@ -1373,9 +1540,104 @@ let create ~mode ~now_ms ~config connection_handler =
               connection.packet_number_spaces
               encryption_level
           in
+          if encryption_level = Application_data
+          then Connection.maybe_discard_previous_application_decrypter connection;
           (match Encryption_level.find encryption_level connection.encdec with
           | Some { decrypter = Some decrypter; _ } ->
-            Some (decrypter, pn_space.received)
+            let decrypt_with decrypter =
+              Crypto.AEAD.decrypt_packet
+                decrypter
+                ~payload_length
+                ~largest_pn:pn_space.received
+                cs
+            in
+            (match encryption_level, header with
+            | Application_data, Packet.Header.Short _ ->
+              let current_decrypted =
+                match decrypt_with decrypter with
+                | Some ({ Crypto.AEAD.header; _ } as decrypted) ->
+                  let key_phase =
+                    short_header_key_phase (String.get_uint8 header 0)
+                  in
+                  if key_phase = connection.peer_application_key_phase
+                  then Some decrypted
+                  else None
+                | None -> None
+              in
+              (match current_decrypted with
+              | Some _ as decrypted -> decrypted
+              | None ->
+                let try_previous_phase () =
+                  match
+                    ( connection.previous_application_decrypter
+                    , connection.first_received_pn_current_key_phase )
+                  with
+                  | Some (previous_phase, previous_decrypter), Some first_pn ->
+                    (match decrypt_with previous_decrypter with
+                    | Some ({ Crypto.AEAD.header; packet_number; _ } as decrypted) ->
+                      let key_phase =
+                        short_header_key_phase (String.get_uint8 header 0)
+                      in
+                      if key_phase <> previous_phase
+                      then None
+                      else if Int64.compare packet_number first_pn < 0
+                      then Some decrypted
+                      else (
+                        Connection.report_error connection Key_update_error;
+                        None)
+                    | None -> None)
+                  | Some _, None ->
+                    Connection.report_error connection Key_update_error;
+                    None
+                  | None, _ -> None
+                in
+                match try_previous_phase () with
+                | Some decrypted -> Some decrypted
+                | None ->
+                  (match
+                     ( connection.application_ciphersuite
+                     , connection.application_rx_secret
+                     , connection.application_tx_secret )
+                   with
+                  | Some ciphersuite, Some rx_secret, Some tx_secret ->
+                    let next_secret =
+                      derive_next_application_secret ~ciphersuite rx_secret
+                    in
+                    let next_decrypter =
+                      Crypto.AEAD.make ~ciphersuite next_secret
+                    in
+                    (match decrypt_with next_decrypter with
+                    | Some ({ Crypto.AEAD.header; packet_number; _ } as decrypted) ->
+                      let key_phase =
+                        short_header_key_phase (String.get_uint8 header 0)
+                      in
+                      if key_phase = connection.peer_application_key_phase
+                      then None
+                      else if Int64.compare packet_number pn_space.received <= 0
+                      then (
+                        Connection.report_error connection Key_update_error;
+                        None)
+                      else
+                        let next_tx_secret =
+                          derive_next_application_secret ~ciphersuite tx_secret
+                        in
+                        let next_encrypter =
+                          Crypto.AEAD.make ~ciphersuite next_tx_secret
+                        in
+                        Connection.promote_peer_key_update
+                          connection
+                          ~current_decrypter:decrypter
+                          ~next_decrypter
+                          ~next_rx_secret:next_secret
+                          ~next_tx_secret
+                          ~next_encrypter
+                          ~key_phase
+                          ~packet_number;
+                        Some decrypted
+                    | None -> None)
+                  | _ -> None))
+            | _ ->
+              decrypt_with decrypter)
           | Some { decrypter = None; _ } ->
             (* Keys for this encryption level were dropped; ignore packet. *)
             None
@@ -1385,18 +1647,19 @@ let create ~mode ~now_ms ~config connection_handler =
         | None ->
           if Encryption_level.of_header header = Initial
           then
-            Some
-              ( Crypto.InitialAEAD.make
-                  ~mode:(Crypto.Mode.peer t.mode)
-                  connection_id
-              , -1L )
-          else
-            None
+            let decrypter =
+              Crypto.InitialAEAD.make
+                ~mode:(Crypto.Mode.peer t.mode)
+                connection_id
+            in
+            Crypto.AEAD.decrypt_packet
+              decrypter
+              ~payload_length
+              ~largest_pn:(-1L)
+              cs
+          else None
       in
-      match decrypter_and_largest_pn with
-      | Some (decrypter, largest_pn) ->
-        Crypto.AEAD.decrypt_packet decrypter ~payload_length ~largest_pn cs
-      | None -> None
+      decrypted
   and t =
     lazy
       { reader = Reader.packets ~decrypt:(decrypt t) (reader_packet_handler t)
@@ -1488,13 +1751,11 @@ let report_exn _t exn =
   if String.length bt_s = 0
   then
     Format.eprintf
-      "transport exception: %s (no backtrace captured; run with OCAMLRUNPARAM=b)@."
+      "transport exception: %s (no backtrace captured; run with \
+       OCAMLRUNPARAM=b)@."
       (Printexc.to_string exn)
   else
-    Format.eprintf
-      "transport exception: %s@.%s@."
-      (Printexc.to_string exn)
-      bt_s
+    Format.eprintf "transport exception: %s@.%s@." (Printexc.to_string exn) bt_s
 
 let flush_pending_packets t =
   let rec inner t = function
