@@ -396,11 +396,7 @@ module Packet = struct
       Packet.Frames
         { header
         ; payload_length
-        ; payload =
-            Bigstringaf.of_string
-              ~off:0
-              ~len:(String.length plaintext)
-              plaintext
+        ; payload = Packet.Payload.String plaintext
         ; packet_number
         }
   end

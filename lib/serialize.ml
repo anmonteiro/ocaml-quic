@@ -356,7 +356,9 @@ module Pkt = struct
      *   to 4 bytes. The number of bits required to represent the packet
      *   number is reduced by including the least significant bits of the
      *   packet number. *)
-    Faraday.schedule_bigstring t payload
+    match payload with
+    | Packet.Payload.Bigstring payload -> Faraday.schedule_bigstring t payload
+    | Packet.Payload.String payload -> Faraday.write_string t payload
 
   let write_retry_payload t ~token ~tag =
     Faraday.write_string t token;
@@ -476,7 +478,7 @@ module Writer = struct
     List.iter (Frame.write_frame tmpf) frames;
     let frames = Faraday.serialize_to_bigstring tmpf in
     let tmpf = Faraday.create 0x400 in
-    Pkt.write_packet_payload tmpf frames;
+    Pkt.write_packet_payload tmpf (Packet.Payload.Bigstring frames);
     let pn_offset = 4 - pn_length in
     let cur_size = Bigstringaf.length frames + tag_len in
     (if

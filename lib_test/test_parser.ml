@@ -9,26 +9,24 @@ let plaintext =
     (`Hex
         "c0ff00001d14cb6241dbbc172d3ebf33a83a2271cd0c559293c910c78d00d671c14508476004fd071c92270040670000000102000000000600405a02000056030333e471d0747f6665b0791a6501070a4b2a30ab44453508ccab8d19211223570200130100002e002b0002030400330024001d002063817bf561dc6ec856426c806af204605fb1e8bb843ae7317c27356f9b222e0b")
 
+let decrypt_stub ~payload_length:_ ~header:_ buf ~off ~len =
+  let cs = Cstruct.of_bigarray ~off ~len buf in
+  let header, plaintext = Cstruct.split cs 50 in
+  Some
+    { Crypto.AEAD.packet_number = 1L
+    ; header = Cstruct.to_string header
+    ; plaintext = Cstruct.to_string plaintext
+    ; pn_length = 4
+    }
+
+let decrypt_stub_fast ~payload_length ~header ~header_prefix_len:_ buf ~off ~len =
+  decrypt_stub ~payload_length ~header buf ~off ~len
+
 let test_parser () =
   let packet =
     Angstrom.parse_string
       ~consume:All
-      (Parse.Packet.parser
-         ~decrypt:(fun ~payload_length:_ ~header:_ buf ~off ~len ->
-           let cs = Cstruct.of_bigarray ~off ~len buf in
-           let header, plaintext = Cstruct.split cs 50 in
-           Format.eprintf
-             "gah %a %a@."
-             Hex.pp
-             (Hex.of_cstruct header)
-             Hex.pp
-             (Hex.of_cstruct plaintext);
-           Some
-             { Crypto.AEAD.packet_number = 1L
-             ; header = Cstruct.to_string header
-             ; plaintext = Cstruct.to_string plaintext
-             ; pn_length = 4
-             }))
+      (Parse.Packet.parser ~decrypt:decrypt_stub)
       plaintext
   in
 
@@ -57,6 +55,154 @@ let test_parser () =
   | Ok (Error (_packet, _error)) ->
     Alcotest.failf "pkt err: %d@." (Error.serialize _error)
   | Error e -> Alcotest.fail e
+
+let test_fast_packet_parser_matches_legacy () =
+  let buffer = Bigstringaf.of_string ~off:0 ~len:(String.length plaintext) plaintext in
+  let legacy =
+    Angstrom.parse_string
+      ~consume:All
+      (Parse.Packet.parser ~decrypt:decrypt_stub)
+      plaintext
+  in
+  let fast =
+    Quic.Fast_parse.Packet_parser.parse
+      ~decrypt:decrypt_stub_fast
+      buffer
+      ~off:0
+      ~len:(Bigstringaf.length buffer)
+  in
+  match legacy, fast with
+  | Ok (Packet legacy_packet), Packet (fast_packet, consumed) ->
+    Alcotest.(check int) "fast parser consumes the datagram" (String.length plaintext) consumed;
+    (match legacy_packet, fast_packet with
+    | Packet.Frames
+        { header = Initial { version = lv; source_cid = lsrc; dest_cid = ldst; token = ltok }
+        ; packet_number = lpn
+        ; payload = lpayload
+        ; _
+        }
+      , Packet.Frames
+          { header = Initial { version = fv; source_cid = fsrc; dest_cid = fdst; token = ftok }
+          ; packet_number = fpn
+          ; payload = fpayload
+          ; _
+          } ->
+      Alcotest.(check int32) "same version" lv fv;
+      Alcotest.(check string) "same source cid" (CID.to_string lsrc) (CID.to_string fsrc);
+      Alcotest.(check string) "same dest cid" (CID.to_string ldst) (CID.to_string fdst);
+      Alcotest.(check string) "same token" ltok ftok;
+      Alcotest.(check int64) "same packet number" lpn fpn;
+      Alcotest.check
+        hex
+        "same payload"
+        (Hex.of_string (Packet.Payload.to_string lpayload))
+        (Hex.of_string (Packet.Payload.to_string fpayload))
+    | _ -> Alcotest.fail "expected both parsers to produce an Initial packet")
+  | Ok Skip, _ -> Alcotest.fail "legacy parser unexpectedly skipped packet"
+  | Ok (Error (_packet, _error)), _ ->
+    Alcotest.failf "legacy parser returned packet error: %d" (Error.serialize _error)
+  | Error e, _ -> Alcotest.failf "legacy parser failed: %s" e
+  | _, Skip _ -> Alcotest.fail "fast parser unexpectedly skipped packet"
+  | _, Error (_packet, _error, _) ->
+    Alcotest.failf "fast parser returned packet error: %d" (Error.serialize _error)
+
+let serialize_frame frame =
+  let f = Faraday.create 128 in
+  Quic.Serialize.Frame.write_frame f frame;
+  Faraday.serialize_to_string f
+
+let test_fast_frame_parser_matches_legacy () =
+  let payload =
+    let frames =
+      [ Frame.Ping
+      ; Frame.Max_data 42
+      ; Frame.Stream_data_blocked { id = 4L; max_data = 64 }
+      ; Frame.Stream
+          { id = 0L
+          ; fragment =
+              { IOVec.off = 3
+              ; len = 4
+              ; buffer = Bigstringaf.of_string ~off:0 ~len:4 "abcd"
+              }
+          ; is_fin = true
+          }
+      ; Frame.Connection_close_app { error_code = 7; reason_phrase = "bye" }
+      ; Frame.Padding 2
+      ]
+    in
+    let f = Faraday.create 256 in
+    List.iter (Quic.Serialize.Frame.write_frame f) frames;
+    let s = Faraday.serialize_to_string f in
+    Bigstringaf.of_string ~off:0 ~len:(String.length s) s
+  in
+  let legacy_frames = ref [] in
+  (match
+     Angstrom.parse_bigstring
+       ~consume:All
+       (Parse.Frame.parser (fun frame -> legacy_frames := frame :: !legacy_frames))
+       payload
+   with
+  | Ok () -> ()
+  | Error e -> Alcotest.failf "legacy frame parser failed: %s" e);
+  let fast_frames = ref [] in
+  (match
+     Quic.Fast_parse.Frame.parse_bigstring
+       payload
+       ~handler:(fun frame -> fast_frames := frame :: !fast_frames)
+   with
+  | Ok () -> ()
+  | Error e -> Alcotest.failf "fast frame parser failed: %s" e);
+  let legacy_frames = List.rev !legacy_frames in
+  let fast_frames = List.rev !fast_frames in
+  Alcotest.(check int) "same frame count" (List.length legacy_frames) (List.length fast_frames);
+  Alcotest.(check (list string))
+    "same serialized frames"
+    (List.map serialize_frame legacy_frames)
+    (List.map serialize_frame fast_frames)
+
+let test_fast_frame_string_parser_matches_bigstring () =
+  let payload =
+    let frames =
+      [ Frame.Ping
+      ; Frame.Max_data 42
+      ; Frame.Stream_data_blocked { id = 4L; max_data = 64 }
+      ; Frame.Stream
+          { id = 0L
+          ; fragment =
+              { IOVec.off = 3
+              ; len = 4
+              ; buffer = Bigstringaf.of_string ~off:0 ~len:4 "abcd"
+              }
+          ; is_fin = true
+          }
+      ; Frame.Connection_close_app { error_code = 7; reason_phrase = "bye" }
+      ; Frame.Padding 2
+      ]
+    in
+    let f = Faraday.create 256 in
+    List.iter (Quic.Serialize.Frame.write_frame f) frames;
+    Faraday.serialize_to_string f
+  in
+  let bigstring_frames = ref [] in
+  (match
+     Quic.Fast_parse.Frame.parse_bigstring
+       (Bigstringaf.of_string ~off:0 ~len:(String.length payload) payload)
+       ~handler:(fun frame -> bigstring_frames := frame :: !bigstring_frames)
+   with
+  | Ok () -> ()
+  | Error e -> Alcotest.failf "fast bigstring frame parser failed: %s" e);
+  let string_frames = ref [] in
+  (match
+     Quic.Fast_parse.Frame.parse_string
+       payload
+       ~handler:(fun frame -> string_frames := frame :: !string_frames)
+   with
+  | Ok () -> ()
+  | Error e -> Alcotest.failf "fast string frame parser failed: %s" e);
+  Alcotest.(check (list string))
+    "string parser matches bigstring parser"
+    (List.rev_map serialize_frame !bigstring_frames)
+    (List.rev_map serialize_frame !string_frames)
 
 let test_quic_transport_parameters () =
   let encoded_params =
@@ -102,10 +248,73 @@ let test_short_header () =
   | Ok _ -> ()
   | Error e -> Alcotest.fail e
 
+let ack_ranges_to_tuples ranges =
+  List.map
+    (fun { Quic.Frame.Range.first; last } -> Int64.to_int first, Int64.to_int last)
+    ranges
+
+let test_packet_number_ack_ranges_are_incremental () =
+  let pn = Quic.Transport.Packet_number.create () in
+  List.iter
+    (Quic.Transport.Packet_number.insert_for_acking pn)
+    [ 1L; 2L; 4L; 3L; 7L; 6L; 5L; 20L ];
+  match Quic.Transport.Packet_number.compose_ack_frame pn with
+  | Frame.Ack { ranges; _ } ->
+    Alcotest.(check (list (pair int int)))
+      "ack ranges stay merged and sorted"
+      [ 20, 20; 1, 7 ]
+      (ack_ranges_to_tuples ranges)
+  | _ -> Alcotest.fail "expected ACK frame"
+
+let test_packet_number_ack_ranges_prune_old_packets () =
+  let pn = Quic.Transport.Packet_number.create () in
+  Quic.Transport.Packet_number.insert_for_acking pn 1L;
+  Quic.Transport.Packet_number.insert_for_acking pn 5000L;
+  match Quic.Transport.Packet_number.compose_ack_frame pn with
+  | Frame.Ack { ranges; _ } ->
+    Alcotest.(check (list (pair int int)))
+      "old packet numbers are pruned from ack history"
+      [ 5000, 5000 ]
+      (ack_ranges_to_tuples ranges)
+  | _ -> Alcotest.fail "expected ACK frame"
+
+let test_packet_number_ack_ranges_merge_bridged_gap () =
+  let pn = Quic.Transport.Packet_number.create () in
+  List.iter
+    (Quic.Transport.Packet_number.insert_for_acking pn)
+    [ 10L; 11L; 13L; 12L ];
+  match Quic.Transport.Packet_number.compose_ack_frame pn with
+  | Frame.Ack { ranges; _ } ->
+    Alcotest.(check (list (pair int int)))
+      "bridging packet merges adjacent ranges"
+      [ 10, 13 ]
+      (ack_ranges_to_tuples ranges)
+  | _ -> Alcotest.fail "expected ACK frame"
+
+let test_packet_number_ack_ranges_trim_cutoff () =
+  let pn = Quic.Transport.Packet_number.create () in
+  List.iter
+    (Quic.Transport.Packet_number.insert_for_acking pn)
+    [ 1L; 2L; 3L; 4099L ];
+  match Quic.Transport.Packet_number.compose_ack_frame pn with
+  | Frame.Ack { ranges; _ } ->
+    Alcotest.(check (list (pair int int)))
+      "ranges crossing the cutoff are trimmed in place"
+      [ 4099, 4099; 3, 3 ]
+      (ack_ranges_to_tuples ranges)
+  | _ -> Alcotest.fail "expected ACK frame"
+
 let suite =
   [ "parser", `Quick, test_parser
+  ; "fast packet parity", `Quick, test_fast_packet_parser_matches_legacy
+  ; "fast frame parity", `Quick, test_fast_frame_parser_matches_legacy
+  ; "fast frame string parity", `Quick, test_fast_frame_string_parser_matches_bigstring
   ; "quic transport parameters", `Quick, test_quic_transport_parameters
   ; "short header", `Quick, test_short_header
+  ; "packet number ack ranges", `Quick, test_packet_number_ack_ranges_are_incremental
+  ; "packet number ack pruning", `Quick, test_packet_number_ack_ranges_prune_old_packets
+  ; "packet number ack bridging", `Quick, test_packet_number_ack_ranges_merge_bridged_gap
+  ; "packet number ack cutoff trim", `Quick, test_packet_number_ack_ranges_trim_cutoff
   ]
 
 let () = Alcotest.run "parsing" [ "parser", suite ]

@@ -562,6 +562,22 @@ module AEAD = struct
       Some { pn_length; packet_number = pn; header; plaintext }
     | None -> None
 
+  let decrypt_packet_bigstring
+        t
+        ~payload_length
+        ~header_prefix_len
+        ~largest_pn
+        (ciphertext : Bigstringaf.t)
+        ~off
+        ~len
+    =
+    let packet_len = min len (header_prefix_len + payload_length) in
+    decrypt_packet
+      t
+      ~payload_length
+      ~largest_pn
+      (Bigstringaf.substring ciphertext ~off ~len:packet_len)
+
   let get_legacy_cipher_st :
     Tls.Ciphersuite.aead_cipher -> string -> legacy_cipher_st
     =
