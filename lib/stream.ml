@@ -267,7 +267,12 @@ module Recv = struct
             }
         in
         if fragment.len = 0
-        then pop t
+        then (
+          (match t.fin_offset with
+          | Some fin_offset when fin_offset = t.offset ->
+            if not (Buffer.is_closed t.consumer) then Buffer.close_reader t.consumer
+          | Some _ | None -> ());
+          pop t)
         else (
           t.offset <- t.offset + fragment.len;
           if not (Buffer.is_closed t.consumer)

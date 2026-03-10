@@ -202,15 +202,24 @@ module IO_loop = struct
 
   module Runtime = Quic.Transport
 
-  let start ~sw:_ ~clock ~read_buffer_size ~cancel:_ ~should_drop t socket =
+  exception Cancelled
+
+  let start ~sw:_ ~clock ~read_buffer_size ~cancel ~should_drop t socket =
     let read_buffer = Buffer.create read_buffer_size in
     let recv_seq_no = ref 0 in
     let send_seq_no = ref 0 in
+    let read_with_cancel () =
+      Fiber.first
+        (fun () -> Io.read socket read_buffer)
+        (fun () ->
+           Promise.await cancel;
+           raise Cancelled)
+    in
     let rec read_loop () =
       let rec read_loop_step () =
         match Runtime.next_read_operation t with
         | `Read ->
-          (match Io.read socket read_buffer with
+          (match read_with_cancel () with
           | _n, addr ->
             let (_ : int) =
               Buffer.get read_buffer ~f:(fun buf ~off ~len ->
@@ -224,23 +233,29 @@ module IO_loop = struct
                   Runtime.read ~client_address t buf ~off ~len)
             in
             ()
+          | exception Cancelled -> ()
           | exception End_of_file ->
             let (_ : int) =
               Buffer.get read_buffer ~f:(fun buf ~off ~len ->
                 Runtime.read_eof t buf ~off ~len)
-            in
+              in
             ());
           read_loop_step ()
         | `Yield ->
           let p, u = Promise.create () in
           Runtime.yield_reader t (Promise.resolve u);
-          Promise.await p;
+          Fiber.first
+            (fun () -> Promise.await p)
+            (fun () ->
+               Promise.await cancel;
+               raise Cancelled);
           `Continue
         | `Close -> `Stop
       in
       match read_loop_step () with
       | `Continue -> read_loop ()
       | `Stop -> ()
+      | exception Cancelled -> ()
       | exception exn ->
         Runtime.report_exn t exn;
         Fiber.yield ();
@@ -274,24 +289,35 @@ module IO_loop = struct
           let wake_p, wake_u = Promise.create () in
           Runtime.yield_writer t (Promise.resolve wake_u);
           (match timeout_ms with
-          | None -> Promise.await wake_p
+          | None ->
+            Fiber.first
+              (fun () -> Promise.await wake_p)
+              (fun () ->
+                 Promise.await cancel;
+                 raise Cancelled)
           | Some timeout_ms ->
             Fiber.first
               (fun () -> Promise.await wake_p)
               (fun () ->
-                 let now = now_ms clock in
-                 if Int64.compare now timeout_ms < 0
-                 then
-                   Eio.Time.sleep
-                     clock
-                     (Int64.to_float (Int64.sub timeout_ms now) /. 1000.);
-                 Runtime.on_timeout t));
+                 Fiber.first
+                   (fun () ->
+                      let now = now_ms clock in
+                      if Int64.compare now timeout_ms < 0
+                      then
+                        Eio.Time.sleep
+                          clock
+                          (Int64.to_float (Int64.sub timeout_ms now) /. 1000.);
+                      Runtime.on_timeout t)
+                   (fun () ->
+                      Promise.await cancel;
+                      raise Cancelled)));
           `Continue
         | `Close _ -> `Stop
       in
       match write_loop_step () with
       | `Continue -> write_loop ()
       | `Stop -> ()
+      | exception Cancelled -> ()
       | exception exn ->
         Runtime.report_exn t exn;
         Fiber.yield ();
@@ -335,7 +361,10 @@ module Server = struct
       server_fd
 end
 
-type t = Quic.Transport.t
+type t =
+  { transport : Quic.Transport.t
+  ; cancel_reader : unit Promise.t * unit Promise.u
+  }
 
 module Client = struct
   let create env ~sw ?(should_drop = IO_loop.never_drop) ~config handler =
@@ -348,7 +377,8 @@ module Client = struct
         `UdpV4
     in
     let _shutdown_p, shutdown_u = Promise.create () in
-    let cancel_reader, _resolve_cancel_reader = Promise.create () in
+    let cancel_reader = Promise.create () in
+    let cancel_reader_p, _ = cancel_reader in
     let clock = Eio.Stdenv.clock env in
     let connection =
       Quic.Transport.Client.create
@@ -363,16 +393,20 @@ module Client = struct
             IO_loop.start
               ~sw
               ~clock
-              ~cancel:cancel_reader
+              ~cancel:cancel_reader_p
               ~read_buffer_size:0x1000
               ~should_drop
               connection
               fd))));
-    connection
+    { transport = connection; cancel_reader }
 end
 
 let connect t ~address ~host f =
   let address = Addr.serialize address in
-  Quic.Transport.connect t ~address ~host f
+  Quic.Transport.connect t.transport ~address ~host f
 
-let shutdown t = Quic.Transport.shutdown t
+let shutdown t =
+  let cancel_reader, resolve_cancel_reader = t.cancel_reader in
+  if not (Promise.is_resolved cancel_reader)
+  then Promise.resolve resolve_cancel_reader ();
+  Quic.Transport.shutdown t.transport
