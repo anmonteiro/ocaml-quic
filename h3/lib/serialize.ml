@@ -79,6 +79,7 @@ let write_data_frame_bigstring t ?off ?len data =
   let len =
     match len with None -> Bigstringaf.length data | Some len -> len
   in
+  write_data_frame_header t len;
   Quic.Stream.write_bigstring t ?off ~len data
 
 let schedule_data_frame t ?off ?len data =

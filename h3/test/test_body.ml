@@ -244,6 +244,61 @@ let test_buffered_response_body_delivery () =
     response_payload
     (Buffer.contents client_received)
 
+let test_bigstring_response_body_write () =
+  let response_payload = "bigstring-body-payload" in
+  let payload_bs = Bigstringaf.of_string ~off:0 ~len:(String.length response_payload) response_payload in
+  let pending_response_body = ref None in
+  let client_received = Buffer.create (String.length response_payload) in
+  let client_done = ref false in
+  let server_request_handler reqd =
+    let body = Reqd.respond_with_streaming reqd (Response.create `OK) in
+    Body.Writer.write_bigstring body payload_bs;
+    Body.Writer.close body
+  in
+  let client_response_handler response response_body =
+    let { Response.status; _ } = response in
+    Alcotest.(check int) "response status" 200 (Status.to_code status);
+    pending_response_body := Some response_body
+  in
+  let now, client, server, client_conn = create_stack ~server_request_handler in
+  let got_conn =
+    run_until ~now ~client ~server ~max_steps:20_000 (fun () -> Option.is_some !client_conn)
+  in
+  Alcotest.(check bool) "client connection established" true got_conn;
+  let conn = Option.get !client_conn in
+  let request =
+    Request.create
+      ~scheme:"https"
+      ~headers:(Headers.of_list [ ":authority", "localhost" ])
+      `GET
+      "/file"
+  in
+  let request_body =
+    Client_connection.request
+      conn
+      request
+      ~error_handler:(fun _ -> Alcotest.fail "unexpected request error")
+      ~response_handler:client_response_handler
+  in
+  Body.Writer.close request_body;
+  let got_response_headers =
+    run_until ~now ~client ~server ~max_steps:50_000 (fun () -> Option.is_some !pending_response_body)
+  in
+  Alcotest.(check bool) "client received response headers" true got_response_headers;
+  let response_body = Option.get !pending_response_body in
+  schedule_read_all
+    response_body
+    (fun bs ~off ~len -> Buffer.add_string client_received (Bigstringaf.substring bs ~off ~len))
+    (fun () -> client_done := true);
+  let completed =
+    run_until ~now ~client ~server ~max_steps:50_000 (fun () -> !client_done)
+  in
+  Alcotest.(check bool) "response body completed" true completed;
+  Alcotest.(check string)
+    "client received full bigstring response body"
+    response_payload
+    (Buffer.contents client_received)
+
 let () =
   Mirage_crypto_rng_unix.use_default ();
   Alcotest.run
@@ -251,4 +306,5 @@ let () =
     [ ( "body"
       , [ "buffered request body delivery", `Quick, test_buffered_request_body_delivery
         ; "buffered response body delivery", `Quick, test_buffered_response_body_delivery
+        ; "bigstring response body write", `Quick, test_bigstring_response_body_write
         ] ) ]
