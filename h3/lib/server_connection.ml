@@ -376,7 +376,6 @@ let create
         | Quic.Direction.Unidirectional ->
           Reader.unirectional_frames (unistream_frame_handler t stream)
         | Bidirectional ->
-          Format.eprintf "bidi: %Ld@." id;
           Reader.bidirectional_frames (frame_handler t stream)
       in
       Stream.schedule_read

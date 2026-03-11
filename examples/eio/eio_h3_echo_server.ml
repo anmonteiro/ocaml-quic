@@ -1,7 +1,18 @@
 open H3
 
 let now_s () = Unix.gettimeofday ()
-let max_data_chunk_size = 1024
+let max_data_chunk_size = 16384
+
+let set_crypto_backend_from_env () =
+  match Sys.getenv_opt "QUIC_CRYPTO_BACKEND" with
+  | None -> ()
+  | Some "openssl" | Some "OpenSSL" -> Quic.Crypto.backend := `OpenSSL
+  | Some "legacy" | Some "Legacy" -> Quic.Crypto.backend := `Legacy
+  | Some value ->
+    invalid_arg
+      (Printf.sprintf
+         "QUIC_CRYPTO_BACKEND must be one of: openssl, legacy (got %S)"
+         value)
 
 let print_transfer_stats ~label ~bytes ~started_at =
   let duration_s = max 1e-6 (now_s () -. started_at) in
@@ -18,6 +29,36 @@ let print_transfer_stats ~label ~bytes ~started_at =
 let set_interval ~clock ~f s =
   Eio.Time.sleep clock s;
   f ()
+
+let stream_in_channel_to_body ~label ~chunk_size ~ic body =
+  let started_at = now_s () in
+  let transferred = ref 0L in
+  let buf = Bytes.create chunk_size in
+  let finished = ref false in
+  let finalize () =
+    if not !finished
+    then (
+      finished := true;
+      close_in_noerr ic;
+      Body.Writer.close body;
+      print_transfer_stats ~label ~bytes:!transferred ~started_at)
+  in
+  let rec pump () =
+    match input ic buf 0 (Bytes.length buf) with
+    | 0 -> finalize ()
+    | n ->
+      Body.Writer.write_string
+        body
+        ~off:0
+        ~len:n
+        (Bytes.unsafe_to_string buf);
+      transferred := Int64.add !transferred (Int64.of_int n);
+      Body.Writer.flush body pump
+    | exception exn ->
+      finalize ();
+      raise exn
+  in
+  pump ()
 
 let connection_handler clock ~serve_file ~upload_out ~chunk_size =
   let request_handler reqd =
@@ -42,39 +83,12 @@ let connection_handler clock ~serve_file ~upload_out ~chunk_size =
         in
         let response = Response.create ~headers `OK in
         let response_body = Reqd.respond_with_streaming reqd response in
-        let started_at = now_s () in
-        let sent_bytes = ref 0L in
         let ic = open_in_bin path in
-        Fun.protect
-          ~finally:(fun () ->
-            close_in_noerr ic;
-            Body.Writer.close response_body;
-            print_transfer_stats
-              ~label:("server send " ^ Filename.basename path)
-              ~bytes:!sent_bytes
-              ~started_at)
-          (fun () ->
-            let buf = Bytes.create chunk_size in
-            let chunks_since_flush = ref 0 in
-            let rec loop () =
-              let n = input ic buf 0 (Bytes.length buf) in
-              if n > 0
-              then (
-                Body.Writer.write_string
-                  response_body
-                  ~off:0
-                  ~len:n
-                  (Bytes.unsafe_to_string buf);
-                incr chunks_since_flush;
-                if !chunks_since_flush >= 32
-                then (
-                  Body.Writer.flush response_body ignore;
-                  chunks_since_flush := 0);
-                sent_bytes := Int64.add !sent_bytes (Int64.of_int n);
-                loop ())
-            in
-            loop ();
-            if !chunks_since_flush > 0 then Body.Writer.flush response_body ignore))
+        stream_in_channel_to_body
+          ~label:("server send " ^ Filename.basename path)
+          ~chunk_size
+          ~ic
+          response_body)
     | `POST, "/upload" ->
       let request_body = Reqd.request_body reqd in
       let expected_len =
@@ -156,6 +170,7 @@ let connection_handler clock ~serve_file ~upload_out ~chunk_size =
 let () =
   Printexc.record_backtrace true;
   Mirage_crypto_rng_unix.use_default ();
+  set_crypto_backend_from_env ();
   Sys.(set_signal sigpipe Signal_ignore);
   let port = ref 4433 in
   let serve_file = ref None in

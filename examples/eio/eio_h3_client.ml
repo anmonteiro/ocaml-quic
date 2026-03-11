@@ -2,7 +2,7 @@ open Eio.Std
 open H3
 
 let now_s () = Unix.gettimeofday ()
-let max_data_chunk_size = 1024
+let max_data_chunk_size = 16384
 
 let print_transfer_stats ~label ~bytes ~started_at =
   let duration_s = max 1e-6 (now_s () -. started_at) in
@@ -15,6 +15,36 @@ let print_transfer_stats ~label ~bytes ~started_at =
     duration_s
     mib_per_s
     mbps
+
+let stream_in_channel_to_body ~label ~chunk_size ~ic body =
+  let started_at = now_s () in
+  let transferred = ref 0L in
+  let buf = Bytes.create chunk_size in
+  let finished = ref false in
+  let finalize () =
+    if not !finished
+    then (
+      finished := true;
+      close_in_noerr ic;
+      Body.Writer.close body;
+      print_transfer_stats ~label ~bytes:!transferred ~started_at)
+  in
+  let rec pump () =
+    match input ic buf 0 (Bytes.length buf) with
+    | 0 -> finalize ()
+    | n ->
+      Body.Writer.write_string
+        body
+        ~off:0
+        ~len:n
+        (Bytes.unsafe_to_string buf);
+      transferred := Int64.add !transferred (Int64.of_int n);
+      Body.Writer.flush body pump
+    | exception exn ->
+      finalize ();
+      raise exn
+  in
+  pump ()
 
 type mode =
   | Print
@@ -237,38 +267,11 @@ let () =
       | Upload input_path ->
         upload_started_at := Some (now_s ());
         upload_size := Int64.of_int (Unix.stat input_path).Unix.st_size;
-        let started_at = now_s () in
-        let sent = ref 0L in
         let ic = open_in_bin input_path in
-        Fun.protect
-          ~finally:(fun () ->
-            close_in_noerr ic;
-            Body.Writer.close request_body;
-            print_transfer_stats
-              ~label:("client queued upload " ^ Filename.basename input_path)
-              ~bytes:!sent
-              ~started_at)
-          (fun () ->
-            let buf = Bytes.create !chunk_size in
-            let chunks_since_flush = ref 0 in
-            let rec loop () =
-              let n = input ic buf 0 (Bytes.length buf) in
-              if n > 0
-              then (
-                Body.Writer.write_string
-                  request_body
-                  ~off:0
-                  ~len:n
-                  (Bytes.unsafe_to_string buf);
-                incr chunks_since_flush;
-                if !chunks_since_flush >= 32
-                then (
-                  Body.Writer.flush request_body ignore;
-                  chunks_since_flush := 0);
-                sent := Int64.add !sent (Int64.of_int n);
-                loop ())
-            in
-            loop ();
-            if !chunks_since_flush > 0 then Body.Writer.flush request_body ignore)
+        stream_in_channel_to_body
+          ~label:("client queued upload " ^ Filename.basename input_path)
+          ~chunk_size:!chunk_size
+          ~ic
+          request_body
       | Print | Download _ -> Body.Writer.close request_body);
       Eio.Promise.await done_p))

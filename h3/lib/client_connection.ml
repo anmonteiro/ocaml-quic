@@ -194,7 +194,6 @@ let rec read_unidirectional t stream ~reader bs ~off ~len =
  *   7.2.4) MUST be sent by each endpoint as the initial frame of their
  *   respective HTTP control stream; see Section 6.2.1. *)
 let frame_handler t (stream : stream) frame =
-  Format.eprintf "FR: %d@." (Frame.to_frame_type frame |> Frame.Type.serialize);
   match frame with
   | Frame.Headers header_block -> process_headers_frame t stream header_block
   | Data bs -> process_data_frame t stream bs
@@ -257,7 +256,6 @@ let unistream_frame_handler t (stream : stream) unitype =
 
 let bidirectional_frames t stream =
   let reader = Reader.bidirectional_frames (frame_handler t stream) in
-  Format.eprintf "bidi: %Ld@." (Stream.id stream.stream);
   reader
 
 (* ?(config = Config.default) *)
