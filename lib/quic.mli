@@ -49,6 +49,15 @@ module Config : sig
     }
 end
 
+module Crypto : sig
+  type backend =
+    [ `Legacy
+    | `OpenSSL
+    ]
+
+  val backend : backend ref
+end
+
 module IOVec : sig
   type 'a t = 'a Faraday.iovec =
     { buffer : 'a
