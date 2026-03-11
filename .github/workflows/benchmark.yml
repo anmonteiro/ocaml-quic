@@ -2,6 +2,19 @@ name: Benchmark
 
 on:
   workflow_dispatch:
+    inputs:
+      benchmark_profile:
+        description: Benchmark profile label to publish
+        required: true
+        default: large-1536mib
+      file_size_mib:
+        description: Payload size in MiB
+        required: true
+        default: "1536"
+      runs:
+        description: Number of repetitions per scenario
+        required: true
+        default: "1"
   push:
     branches:
       - master
@@ -30,13 +43,23 @@ jobs:
             extra-substituters = https://anmonteiro.nix-cache.workers.dev
             extra-trusted-public-keys = ocaml.nix-cache.com-1:/xI2h2+56rwFfKyyFVbkJSeGqSIYMC/Je+7XXqGKDIY=
 
+      - name: Configure benchmark parameters
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "RUNS=${{ github.event.inputs.runs }}" >> "$GITHUB_ENV"
+            echo "BENCH_FILE_SIZE_MIB=${{ github.event.inputs.file_size_mib }}" >> "$GITHUB_ENV"
+            echo "BENCH_PROFILE=${{ github.event.inputs.benchmark_profile }}" >> "$GITHUB_ENV"
+          else
+            echo "RUNS=3" >> "$GITHUB_ENV"
+            echo "BENCH_FILE_SIZE_MIB=64" >> "$GITHUB_ENV"
+            echo "BENCH_PROFILE=ci-64mib" >> "$GITHUB_ENV"
+          fi
+
       - name: Run loopback benchmarks
         run: |
           mkdir -p benchmark-output
           nix develop .#release -c bash ./scripts/bench/run_h3_loopback_benchmarks.sh > benchmark-output/results.jsonl
         env:
-          RUNS: 3
-          BENCH_FILE_SIZE_MIB: 64
           BENCH_CHUNK_SIZE: 16384
           BENCH_OUTPUT_DIR: benchmark-output/raw
 

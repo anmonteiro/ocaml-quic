@@ -28,6 +28,10 @@ function parseJsonLines(text) {
     .map((line) => JSON.parse(line));
 }
 
+function profileOf(record) {
+  return record.benchmark_profile || `size-${Math.round((record.file_size_bytes || 0) / 1048576)}mib`;
+}
+
 function groupByCommit(records) {
   const map = new Map();
   records.forEach((record) => {
@@ -54,10 +58,14 @@ function groupByCommit(records) {
   return Array.from(map.values()).sort((a, b) => new Date(a.timestamp_utc) - new Date(b.timestamp_utc));
 }
 
-function renderSummary(commits, rawRecords) {
+function availableProfiles(records) {
+  return Array.from(new Set(records.map(profileOf))).sort();
+}
+
+function renderSummary(commits, rawRecords, profile) {
   const latest = commits.at(-1);
   document.getElementById('dataset-commits').textContent = `${commits.length}`;
-  document.getElementById('dataset-runs').textContent = `${rawRecords.length} scenario runs`;
+  document.getElementById('dataset-runs').textContent = `${rawRecords.length} scenario runs in ${profile}`;
   if (!latest) return;
 
   const latestUpload = latest.scenarios.h3_upload_curl;
@@ -78,6 +86,8 @@ function renderSummary(commits, rawRecords) {
     : '-';
 }
 
+let throughputChart = null;
+
 function renderChart(commits) {
   const labels = commits.map((entry) => entry.commit_short);
   const datasets = Object.entries(SCENARIOS).map(([scenario, meta]) => ({
@@ -89,7 +99,8 @@ function renderChart(commits) {
     spanGaps: true,
   }));
 
-  new Chart(document.getElementById('throughput-chart'), {
+  if (throughputChart) throughputChart.destroy();
+  throughputChart = new Chart(document.getElementById('throughput-chart'), {
     type: 'line',
     data: { labels, datasets },
     options: {
@@ -154,10 +165,33 @@ async function main() {
   if (!response.ok) throw new Error(`Failed to fetch ${RESULTS_PATH}: ${response.status}`);
   const text = await response.text();
   const records = parseJsonLines(text);
-  const commits = groupByCommit(records);
-  renderSummary(commits, records);
-  renderChart(commits);
-  renderTable(commits);
+  const profiles = availableProfiles(records);
+  const select = document.getElementById('profile-select');
+
+  if (profiles.length === 0) {
+    renderSummary([], [], '-');
+    renderTable([]);
+    return;
+  }
+
+  profiles.forEach((profile) => {
+    const option = document.createElement('option');
+    option.value = profile;
+    option.textContent = profile;
+    select.appendChild(option);
+  });
+
+  const renderProfile = (profile) => {
+    const filtered = records.filter((record) => profileOf(record) === profile);
+    const commits = groupByCommit(filtered);
+    renderSummary(commits, filtered, profile);
+    renderChart(commits);
+    renderTable(commits);
+  };
+
+  select.value = profiles.at(-1);
+  renderProfile(select.value);
+  select.addEventListener('change', () => renderProfile(select.value));
 }
 
 main().catch((error) => {

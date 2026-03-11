@@ -89,6 +89,15 @@ code {
 .panel-header {
   margin-bottom: 16px;
 }
+#profile-select {
+  margin: 0 0 14px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: white;
+  color: var(--ink);
+  font: inherit;
+}
 .table-wrap {
   overflow-x: auto;
 }

@@ -7,6 +7,7 @@ ROOT_DIR=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$ROOT_DIR"
 
 RUNS=${RUNS:-3}
+BENCH_PROFILE=${BENCH_PROFILE:-size-${BENCH_FILE_SIZE_MIB:-64}mib}
 BENCH_FILE_SIZE_MIB=${BENCH_FILE_SIZE_MIB:-64}
 BENCH_CHUNK_SIZE=${BENCH_CHUNK_SIZE:-16384}
 BENCH_SERVER_BIN=${BENCH_SERVER_BIN:-_build/default/examples/eio/eio_h3_echo_server.exe}
@@ -30,9 +31,33 @@ if [ ! -x "$BENCH_SERVER_BIN" ]; then
   exit 1
 fi
 
+payload_size_bytes() {
+  local path=$1
+  if stat -c %s "$path" >/dev/null 2>&1; then
+    stat -c %s "$path"
+  elif stat -f %z "$path" >/dev/null 2>&1; then
+    stat -f %z "$path"
+  else
+    wc -c < "$path" | tr -d ' '
+  fi
+}
+
+create_payload() {
+  local path=$1
+  local size_mib=$2
+  local size_bytes=$((size_mib * 1024 * 1024))
+  if truncate -s "${size_bytes}" "$path" 2>/dev/null; then
+    return 0
+  fi
+  if fallocate -l "${size_bytes}" "$path" 2>/dev/null; then
+    return 0
+  fi
+  dd if=/dev/zero of="$path" bs=1048576 count="$size_mib" status=none
+}
+
 PAYLOAD="$BENCH_OUTPUT_DIR/payload.bin"
-dd if=/dev/zero of="$PAYLOAD" bs=1048576 count="$BENCH_FILE_SIZE_MIB" status=none
-PAYLOAD_SIZE_BYTES=$(wc -c < "$PAYLOAD" | tr -d ' ')
+create_payload "$PAYLOAD" "$BENCH_FILE_SIZE_MIB"
+PAYLOAD_SIZE_BYTES=$(payload_size_bytes "$PAYLOAD")
 
 cleanup() {
   if [ -n "${SERVER_PID:-}" ]; then
@@ -173,11 +198,12 @@ run_scenario() {
     workflow_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${workflow_run_id}"
   fi
 
-  printf '{"timestamp_utc":"%s","commit_sha":"%s","commit_short":"%s","branch":"%s","scenario":"%s","runs":%s,"file_size_bytes":%s,"chunk_size_bytes":%s,"median_total_s":%s,"min_total_s":%s,"max_total_s":%s,"median_bytes_per_s":%s,"min_bytes_per_s":%s,"max_bytes_per_s":%s,"median_mib_per_s":%s,"runner_os":"%s","runner_arch":"%s","workflow_run_id":"%s","workflow_run_number":"%s","workflow_url":"%s"}\n' \
+  printf '{"timestamp_utc":"%s","commit_sha":"%s","commit_short":"%s","branch":"%s","benchmark_profile":"%s","scenario":"%s","runs":%s,"file_size_bytes":%s,"chunk_size_bytes":%s,"median_total_s":%s,"min_total_s":%s,"max_total_s":%s,"median_bytes_per_s":%s,"min_bytes_per_s":%s,"max_bytes_per_s":%s,"median_mib_per_s":%s,"runner_os":"%s","runner_arch":"%s","workflow_run_id":"%s","workflow_run_number":"%s","workflow_url":"%s"}\n' \
     "$timestamp_utc" \
     "$commit_sha" \
     "$commit_short" \
     "$branch_name" \
+    "$BENCH_PROFILE" \
     "$scenario" \
     "$RUNS" \
     "$PAYLOAD_SIZE_BYTES" \

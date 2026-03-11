@@ -15,6 +15,9 @@ workflow records two scenarios on every push to `master`:
 - `h3_upload_curl`
 - `h3_download_curl`
 
+Each record also carries a `benchmark_profile`. The dashboard groups results by
+profile so different payload sizes are not mixed together.
+
 ## How it works
 
 1. `.github/workflows/benchmark.yml` runs on pushes to `master`.
@@ -25,6 +28,17 @@ workflow records two scenarios on every push to `master`:
 4. The workflow appends the new records to `gh-pages/benchmarks/results.jsonl`.
 5. It copies the static dashboard assets from `benchmarks/site/` into the
    `gh-pages` branch and pushes the update.
+
+## Profiles
+
+Two entry points exist:
+
+- Push to `master`: records the default `ci-64mib` profile
+- Manual `workflow_dispatch`: defaults to `large-1536mib` and `1536` MiB
+
+The runner script creates the payload with `truncate`/`fallocate` when
+available, so large files do not require an expensive zero-fill step before the
+benchmark starts.
 
 ## Dashboard
 
