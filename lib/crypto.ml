@@ -250,22 +250,31 @@ module AEAD = struct
         ~plaintext:data
 
   let encrypt_payload_into t ~packet_number ~header data =
-    let { cipher = AEAD { cipher; key }; iv; _ } = t in
-    let nonce = Tls.Crypto.aead_nonce iv packet_number in
-    let module C = (val cipher : Mirage_crypto.AEAD with type key = _) in
-    let len = String.length data in
-    let dst = Bytes.create (len + C.tag_size) in
-    C.authenticate_encrypt_into
-      ~key
-      ~nonce
-      ~adata:header
-      data
-      ~src_off:0
+    let nonce = Tls.Crypto.aead_nonce t.iv packet_number in
+    match t.cipher with
+    | Legacy (AEAD { cipher; key }) ->
+      let module C = (val cipher : Mirage_crypto.AEAD with type key = _) in
+      let len = String.length data in
+      let dst = Bytes.create (len + C.tag_size) in
+      C.authenticate_encrypt_into
+        ~key
+        ~nonce
+        ~adata:header
+        data
+        ~src_off:0
+        dst
+        ~dst_off:0
+        ~tag_off:len
+        len;
       dst
-      ~dst_off:0
-      ~tag_off:len
-      len;
-    dst
+    | OpenSSL { cipher; key; _ } ->
+      Bytes.unsafe_of_string
+        (Libcrypto.aead_encrypt
+           cipher
+           ~key
+           ~nonce
+           ~adata:header
+           ~plaintext:data)
 
   let decrypt_payload t ~packet_number ~header ciphertext =
     (* From RFC<QUIC-TLS-RFC>§5.3:
@@ -291,28 +300,31 @@ module AEAD = struct
       Libcrypto.aead_decrypt cipher ~key ~nonce ~adata:header ~ciphertext
 
   let decrypt_payload_into t ~packet_number ~header ciphertext =
-    let { cipher = AEAD { cipher; key }; iv; _ } = t in
-    let nonce = Tls.Crypto.aead_nonce iv packet_number in
-    let module C = (val cipher : Mirage_crypto.AEAD with type key = _) in
-    let ciphertext_len = String.length ciphertext in
-    if ciphertext_len < C.tag_size
-    then None
-    else (
-      let payload_len = ciphertext_len - C.tag_size in
-      let dst = Bytes.create payload_len in
-      let ok =
-        C.authenticate_decrypt_into
-          ~key
-          ~nonce
-          ~adata:header
-          ciphertext
-          ~src_off:0
-          ~tag_off:payload_len
-          dst
-          ~dst_off:0
-          payload_len
-      in
-      if ok then Some (Bytes.unsafe_to_string dst) else None)
+    let nonce = Tls.Crypto.aead_nonce t.iv packet_number in
+    match t.cipher with
+    | Legacy (AEAD { cipher; key }) ->
+      let module C = (val cipher : Mirage_crypto.AEAD with type key = _) in
+      let ciphertext_len = String.length ciphertext in
+      if ciphertext_len < C.tag_size
+      then None
+      else (
+        let payload_len = ciphertext_len - C.tag_size in
+        let dst = Bytes.create payload_len in
+        let ok =
+          C.authenticate_decrypt_into
+            ~key
+            ~nonce
+            ~adata:header
+            ciphertext
+            ~src_off:0
+            ~tag_off:payload_len
+            dst
+            ~dst_off:0
+            payload_len
+        in
+        if ok then Some (Bytes.unsafe_to_string dst) else None)
+    | OpenSSL { cipher; key; _ } ->
+      Libcrypto.aead_decrypt cipher ~key ~nonce ~adata:header ~ciphertext
 
   (* mutates [header] *)
   (*
