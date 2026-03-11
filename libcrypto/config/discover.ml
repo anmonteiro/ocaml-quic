@@ -77,7 +77,4 @@ let () =
           | None -> default)
       in
       C.Flags.write_sexp "c_library_flags.sexp" libs;
-      C.Flags.write_sexp
-        "link_flags.sexp"
-        (List.concat_map (fun flag -> [ "-cclib"; flag ]) libs);
       C.Flags.write_sexp "c_flags.sexp" (cflags c))
