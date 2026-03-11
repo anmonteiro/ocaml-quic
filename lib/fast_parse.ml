@@ -210,10 +210,10 @@ module Frame = struct
     let stream_id = Int64.of_int (parse_varint cursor) in
     let off = if off then parse_varint cursor else 0 in
     let len = if len then parse_varint cursor else Cursor.remaining cursor in
-    let buffer = Cursor.take_bigstring cursor len in
+    let payload = Cursor.take_string cursor len in
     Frame.Stream
       { id = stream_id
-      ; fragment = { IOVec.off; len; buffer }
+      ; fragment = { Frame.off; len; payload; payload_off = 0 }
       ; is_fin = fin
       }
 
@@ -248,8 +248,8 @@ module Frame = struct
     | Crypto ->
       let off = parse_varint cursor in
       let len = parse_varint cursor in
-      let buffer = Cursor.take_bigstring cursor len in
-      Frame.Crypto { IOVec.off; len; buffer }
+      let payload = Cursor.take_string cursor len in
+      Frame.Crypto { Frame.off; len; payload; payload_off = 0 }
     | New_token ->
       let length = parse_varint cursor in
       let data = Cursor.take_bigstring cursor length in
@@ -351,10 +351,11 @@ module Frame = struct
     let stream_id = Int64.of_int (parse_varint_string cursor) in
     let off = if off then parse_varint_string cursor else 0 in
     let len = if len then parse_varint_string cursor else String_cursor.remaining cursor in
-    let buffer = String_cursor.take_bigstring cursor len in
+    let payload_off = cursor.off in
+    cursor.off <- cursor.off + len;
     Frame.Stream
       { id = stream_id
-      ; fragment = { IOVec.off; len; buffer }
+      ; fragment = { Frame.off; len; payload = cursor.buffer; payload_off }
       ; is_fin = fin
       }
 
@@ -388,8 +389,9 @@ module Frame = struct
     | Crypto ->
       let off = parse_varint_string cursor in
       let len = parse_varint_string cursor in
-      let buffer = String_cursor.take_bigstring cursor len in
-      Frame.Crypto { IOVec.off; len; buffer }
+      let payload_off = cursor.off in
+      cursor.off <- cursor.off + len;
+      Frame.Crypto { Frame.off; len; payload = cursor.buffer; payload_off }
     | New_token ->
       let length = parse_varint_string cursor in
       let data = String_cursor.take_bigstring cursor length in

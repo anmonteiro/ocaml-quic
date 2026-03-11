@@ -43,8 +43,12 @@ let drain_markers t ~encryption_level =
 let ranges_of_tuples ranges = List.map (fun (first, last) -> range first last) ranges
 
 let make_stream_frame ~id ~off ~len =
-  let buffer = Bigstringaf.create len in
-  Frame.Stream { id; fragment = { IOVec.off = off; len; buffer }; is_fin = false }
+  let payload = String.make len '\x00' in
+  Frame.Stream
+    { id
+    ; fragment = { Frame.off = off; len; payload; payload_off = 0 }
+    ; is_fin = false
+    }
 
 let debug_send
       t

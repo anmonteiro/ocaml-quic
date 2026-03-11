@@ -73,9 +73,10 @@ let test_fast_frame_parser_roundtrips_payload () =
       ; Frame.Stream
           { id = 0L
           ; fragment =
-              { IOVec.off = 3
+              { Frame.off = 3
               ; len = 4
-              ; buffer = Bigstringaf.of_string ~off:0 ~len:4 "abcd"
+              ; payload = "abcd"
+              ; payload_off = 0
               }
           ; is_fin = true
           }
@@ -111,9 +112,10 @@ let test_fast_frame_string_parser_matches_bigstring () =
       ; Frame.Stream
           { id = 0L
           ; fragment =
-              { IOVec.off = 3
+              { Frame.off = 3
               ; len = 4
-              ; buffer = Bigstringaf.of_string ~off:0 ~len:4 "abcd"
+              ; payload = "abcd"
+              ; payload_off = 0
               }
           ; is_fin = true
           }

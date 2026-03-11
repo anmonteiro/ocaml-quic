@@ -249,6 +249,24 @@ module AEAD = struct
         ~adata:header
         ~plaintext:data
 
+  let encrypt_payload_into t ~packet_number ~header data =
+    let { cipher = AEAD { cipher; key }; iv; _ } = t in
+    let nonce = Tls.Crypto.aead_nonce iv packet_number in
+    let module C = (val cipher : Mirage_crypto.AEAD with type key = _) in
+    let len = String.length data in
+    let dst = Bytes.create (len + C.tag_size) in
+    C.authenticate_encrypt_into
+      ~key
+      ~nonce
+      ~adata:header
+      data
+      ~src_off:0
+      dst
+      ~dst_off:0
+      ~tag_off:len
+      len;
+    dst
+
   let decrypt_payload t ~packet_number ~header ciphertext =
     (* From RFC<QUIC-TLS-RFC>§5.3:
      *   The nonce, N, is formed by combining the packet protection IV with the
@@ -271,6 +289,30 @@ module AEAD = struct
         ciphertext
     | OpenSSL { cipher; key; _ } ->
       Libcrypto.aead_decrypt cipher ~key ~nonce ~adata:header ~ciphertext
+
+  let decrypt_payload_into t ~packet_number ~header ciphertext =
+    let { cipher = AEAD { cipher; key }; iv; _ } = t in
+    let nonce = Tls.Crypto.aead_nonce iv packet_number in
+    let module C = (val cipher : Mirage_crypto.AEAD with type key = _) in
+    let ciphertext_len = String.length ciphertext in
+    if ciphertext_len < C.tag_size
+    then None
+    else (
+      let payload_len = ciphertext_len - C.tag_size in
+      let dst = Bytes.create payload_len in
+      let ok =
+        C.authenticate_decrypt_into
+          ~key
+          ~nonce
+          ~adata:header
+          ciphertext
+          ~src_off:0
+          ~tag_off:payload_len
+          dst
+          ~dst_off:0
+          payload_len
+      in
+      if ok then Some (Bytes.unsafe_to_string dst) else None)
 
   (* mutates [header] *)
   (*
@@ -490,8 +532,8 @@ module AEAD = struct
       t
       (decrypt_header_in_place ~conn_id_len:t.conn_id_len)
 
-  let encrypt_packet t ~packet_number ~header data =
-    let sealed_payload = encrypt_payload t ~packet_number ~header data in
+  let encrypt_packet_parts t ~packet_number ~header data =
+    let sealed_payload = encrypt_payload_into t ~packet_number ~header data in
     let offset =
       (* From RFC<QUIC-TLS-RFC>§5.4.2:
        *  This results in needing at least 3 bytes of frames in the unprotected
@@ -499,13 +541,15 @@ module AEAD = struct
        *  of frames for a 2-byte packet number encoding. *)
       4 - packet_number_length_str header
     in
-    let sample = String.sub sealed_payload offset 16 in
+    let sample = Bytes.sub_string sealed_payload offset 16 in
     let encrypted_header = encrypt_header t ~sample header in
-    (* Format.eprintf "x: %B %a %a %a@." (header = Bytes.to_string
-       encrypted_header) Hex.pp (Hex.of_string header_copy) Hex.pp
-       (Hex.of_string header) Hex.pp (Hex.of_string (Bytes.to_string
-       encrypted_header)); *)
-    Bytes.unsafe_to_string encrypted_header ^ sealed_payload
+    Bytes.unsafe_to_string encrypted_header, Bytes.unsafe_to_string sealed_payload
+
+  let encrypt_packet t ~packet_number ~header data =
+    let encrypted_header, sealed_payload =
+      encrypt_packet_parts t ~packet_number ~header data
+    in
+    encrypted_header ^ sealed_payload
 
   type ret =
     { packet_number : int64
@@ -514,9 +558,7 @@ module AEAD = struct
     ; pn_length : int
     }
 
-  (* Ciphertext includes header + payload *)
-  let decrypt_packet t ~payload_length ~largest_pn ciphertext =
-    let ciphertext = Bytes.unsafe_of_string ciphertext in
+  let decrypt_packet_bytes t ~payload_length ~largest_pn ciphertext =
     let offset = sample_offset ~conn_id_len:t.conn_id_len ciphertext in
     let sample = Bytes.sub_string ciphertext offset 16 in
     let header = decrypt_header_in_place t ~sample ciphertext in
@@ -557,10 +599,18 @@ module AEAD = struct
         |> Bytes.unsafe_to_string )
     in
 
-    match decrypt_payload t ~packet_number:pn ~header ciphertext with
+    match decrypt_payload_into t ~packet_number:pn ~header ciphertext with
     | Some plaintext ->
       Some { pn_length; packet_number = pn; header; plaintext }
     | None -> None
+
+  (* Ciphertext includes header + payload *)
+  let decrypt_packet t ~payload_length ~largest_pn ciphertext =
+    decrypt_packet_bytes
+      t
+      ~payload_length
+      ~largest_pn
+      (Bytes.unsafe_of_string ciphertext)
 
   let decrypt_packet_bigstring
         t
@@ -572,11 +622,13 @@ module AEAD = struct
         ~len
     =
     let packet_len = min len (header_prefix_len + payload_length) in
-    decrypt_packet
+    let packet = Bytes.create packet_len in
+    Bigstringaf.unsafe_blit_to_bytes ciphertext ~src_off:off packet ~dst_off:0 ~len:packet_len;
+    decrypt_packet_bytes
       t
       ~payload_length
       ~largest_pn
-      (Bigstringaf.substring ciphertext ~off ~len:packet_len)
+      packet
 
   let get_legacy_cipher_st :
     Tls.Ciphersuite.aead_cipher -> string -> legacy_cipher_st

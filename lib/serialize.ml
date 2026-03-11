@@ -52,9 +52,6 @@ let varint_encoding_length n =
   then 4
   else 8
 
-let rec decomp n acc x =
-  if n = 0 then acc else decomp (n - 1) ((x land 0xff) :: acc) (x lsr 8)
-
 let write_variable_length_integer t n =
   let encoding_bytes, encoding =
     if n < 1 lsl 6
@@ -65,16 +62,32 @@ let write_variable_length_integer t n =
     then 4, 2
     else 8, 3
   in
-  let ns = decomp encoding_bytes [] n in
-  let hd = List.hd ns in
-  let tl = List.tl ns in
+  let write_byte shift = Faraday.write_uint8 t ((n lsr shift) land 0xff) in
   (* From RFC9000§16:
    *   The QUIC variable-length integer encoding reserves the two most
    *   significant bits of the first byte to encode the base 2 logarithm of the
    *   integer encoding length in bytes. The integer value is encoded on the
    *   remaining bits, in network byte order. *)
-  Faraday.write_uint8 t ((encoding lsl 6) lor hd);
-  List.iter (fun n -> Faraday.write_uint8 t n) tl
+  match encoding_bytes with
+  | 1 -> Faraday.write_uint8 t ((encoding lsl 6) lor n)
+  | 2 ->
+    Faraday.write_uint8 t ((encoding lsl 6) lor ((n lsr 8) land 0x3f));
+    write_byte 0
+  | 4 ->
+    Faraday.write_uint8 t ((encoding lsl 6) lor ((n lsr 24) land 0x3f));
+    write_byte 16;
+    write_byte 8;
+    write_byte 0
+  | 8 ->
+    Faraday.write_uint8 t ((encoding lsl 6) lor ((n lsr 56) land 0x3f));
+    write_byte 48;
+    write_byte 40;
+    write_byte 32;
+    write_byte 24;
+    write_byte 16;
+    write_byte 8;
+    write_byte 0
+  | _ -> assert false
 
 module Frame = struct
   let padding = Bigstringaf.of_string ~off:0 ~len:1 "\x00"
@@ -124,21 +137,21 @@ module Frame = struct
     write_variable_length_integer t application_protocol_error
 
   let write_crypto t ~fragment =
-    let { IOVec.off; len; buffer } = fragment in
+    let { Frame.off; len; payload; payload_off } = fragment in
     write_variable_length_integer t off;
     write_variable_length_integer t len;
-    Faraday.schedule_bigstring t buffer
+    Faraday.write_string t ~off:payload_off ~len payload
 
   let write_new_token t ~length ~data =
     write_variable_length_integer t length;
     Faraday.schedule_bigstring t data
 
   let write_stream t ~stream_id ~fragment =
-    let { IOVec.off; len; buffer } = fragment in
+    let { Frame.off; len; payload; payload_off } = fragment in
     write_variable_length_integer t (Int64.to_int stream_id);
     if off > 0 then write_variable_length_integer t off;
     if len > 0 then write_variable_length_integer t len;
-    Faraday.schedule_bigstring t buffer
+    Faraday.write_string t ~off:payload_off ~len payload
 
   let write_max_data t ~max = write_variable_length_integer t max
 
@@ -243,8 +256,21 @@ module Pkt = struct
       let packet_number =
         Int64.to_int (Int64.logand packet_number 0xFFFFFFFFL)
       in
-      let pn_bytes = decomp pn_length [] packet_number in
-      List.iter (fun byte -> Faraday.write_uint8 t byte) pn_bytes
+      match pn_length with
+      | 1 -> Faraday.write_uint8 t packet_number
+      | 2 ->
+        Faraday.write_uint8 t ((packet_number lsr 8) land 0xff);
+        Faraday.write_uint8 t (packet_number land 0xff)
+      | 3 ->
+        Faraday.write_uint8 t ((packet_number lsr 16) land 0xff);
+        Faraday.write_uint8 t ((packet_number lsr 8) land 0xff);
+        Faraday.write_uint8 t (packet_number land 0xff)
+      | 4 ->
+        Faraday.write_uint8 t ((packet_number lsr 24) land 0xff);
+        Faraday.write_uint8 t ((packet_number lsr 16) land 0xff);
+        Faraday.write_uint8 t ((packet_number lsr 8) land 0xff);
+        Faraday.write_uint8 t (packet_number land 0xff)
+      | _ -> assert false
 
     let write_payload_length t ~pn_length ~header len =
       match header with
@@ -474,13 +500,10 @@ module Writer = struct
     assert (frames <> []);
     let tag_len = Crypto.AEAD.tag_len header_info.encrypter in
     let pn_length = packet_number_length header_info.packet_number in
-    let tmpf = Faraday.create 0x400 in
-    List.iter (Frame.write_frame tmpf) frames;
-    let frames = Faraday.serialize_to_bigstring tmpf in
-    let tmpf = Faraday.create 0x400 in
-    Pkt.write_packet_payload tmpf (Packet.Payload.Bigstring frames);
+    let payloadf = Faraday.create 0x400 in
+    List.iter (Frame.write_frame payloadf) frames;
     let pn_offset = 4 - pn_length in
-    let cur_size = Bigstringaf.length frames + tag_len in
+    let cur_size = Faraday.pending_bytes payloadf + tag_len in
     (if
        pn_offset
        +
@@ -490,8 +513,8 @@ module Writer = struct
      then
        (* needs padding *)
        let n_padding = pn_offset + 16 - cur_size in
-       Frame.write_padding tmpf n_padding);
-    let plaintext = Faraday.serialize_to_string tmpf in
+       Frame.write_padding payloadf n_padding);
+    let plaintext = Faraday.serialize_to_string payloadf in
     (* AEAD ciphertext length is the same as the plaintext length (+ tag). *)
     let payload_length = String.length plaintext + tag_len in
     let header = header_of_encryption_level header_info in
@@ -517,10 +540,10 @@ module Writer = struct
          *   datagrams carrying ack-eliciting Initial packets to at least the
          *   smallest allowed maximum datagram size of 1200 bytes. *)
         let padding_n = 1200 - packet_len in
-        let padding_f = Faraday.create padding_n in
-        Frame.write_padding padding_f padding_n;
-        ( payload_length + padding_n
-        , plaintext ^ Faraday.serialize_to_string padding_f )
+        let padded_payload = Bytes.create (String.length plaintext + padding_n) in
+        Bytes.blit_string plaintext 0 padded_payload 0 (String.length plaintext);
+        Bytes.fill padded_payload (String.length plaintext) padding_n '\x00';
+        payload_length + padding_n, Bytes.unsafe_to_string padded_payload
       | _ -> payload_length, plaintext
     in
 
@@ -532,14 +555,15 @@ module Writer = struct
 
     let unprotected_header = Faraday.serialize_to_string hf in
 
-    let protected =
-      Crypto.AEAD.encrypt_packet
+    let encrypted_header, sealed_payload =
+      Crypto.AEAD.encrypt_packet_parts
         header_info.encrypter
         ~packet_number:header_info.packet_number
         ~header:unprotected_header
         plaintext
     in
-    Faraday.write_string t.encoder protected
+    Faraday.write_string t.encoder encrypted_header;
+    Faraday.write_string t.encoder sealed_payload
 
   let faraday t = t.encoder
   let flush t f = flush t.encoder f

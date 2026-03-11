@@ -170,7 +170,7 @@ module Q : Psq.S with type k = int and type p = Frame.fragment =
     (struct
       type t = Frame.fragment
 
-      let compare { IOVec.off = off1; _ } { IOVec.off = off2; _ } =
+      let compare { Frame.off = off1; _ } { Frame.off = off2; _ } =
         compare off1 off2
     end)
 
@@ -199,7 +199,7 @@ module Recv = struct
     ; fin_offset = None
     }
 
-  let push ~is_fin ({ IOVec.off; len; _ } as fragment) t =
+  let push ~is_fin ({ Frame.off; len; _ } as fragment) t =
     (match t.fin_offset with
     | Some fin_off -> assert (off <= fin_off)
     | None -> ());
@@ -215,26 +215,11 @@ module Recv = struct
         else
           let drop_prefix = t.offset - off in
           let len = len - drop_prefix in
-          { IOVec.off = t.offset
+          { Frame.off = t.offset
           ; len
-          ; buffer = Bigstringaf.sub fragment.buffer ~off:drop_prefix ~len
+          ; payload = fragment.payload
+          ; payload_off = fragment.payload_off + drop_prefix
           }
-      in
-      let fragment =
-        if fragment.len = 0
-        then fragment
-        else
-          (* Keep an owned copy of incoming stream data. Network parsers can
-             hand us slices into transient read buffers; queueing those directly
-             can corrupt stream reassembly when buffers are reused. *)
-          let buffer = Bigstringaf.create fragment.len in
-          Bigstringaf.blit
-            fragment.buffer
-            ~src_off:0
-            buffer
-            ~dst_off:0
-            ~len:fragment.len;
-          { fragment with buffer }
       in
       let q' = Q.add fragment.off fragment t.q in
       t.q <- q'
@@ -249,6 +234,13 @@ module Recv = struct
         failwith "NYI: Streamd.flush_recv / report_exn")
 
   let rec pop t =
+    let close_if_finished () =
+      if not (Buffer.is_closed t.consumer)
+      then
+        match t.fin_offset with
+        | Some fin_offset when fin_offset = t.offset -> Buffer.close_reader t.consumer
+        | _ -> ()
+    in
     match Q.pop t.q with
     | Some ((off, fragment), q') ->
       if off > t.offset
@@ -261,28 +253,27 @@ module Recv = struct
           else
             let drop_prefix = t.offset - off in
             let len = fragment.len - drop_prefix in
-            { IOVec.off = t.offset
+            { Frame.off = t.offset
             ; len
-            ; buffer = Bigstringaf.sub fragment.buffer ~off:drop_prefix ~len
+            ; payload = fragment.payload
+            ; payload_off = fragment.payload_off + drop_prefix
             }
         in
         if fragment.len = 0
         then (
-          (match t.fin_offset with
-          | Some fin_offset when fin_offset = t.offset ->
-            if not (Buffer.is_closed t.consumer) then Buffer.close_reader t.consumer
-          | Some _ | None -> ());
+          close_if_finished ();
           pop t)
         else (
           t.offset <- t.offset + fragment.len;
           if not (Buffer.is_closed t.consumer)
           then (
-            Buffer.schedule_bigstring t.consumer fragment.buffer;
+            Buffer.write_string
+              t.consumer
+              ~off:fragment.payload_off
+              ~len:fragment.len
+              fragment.payload;
             flush t;
-            match t.fin_offset with
-            | Some fin_offset ->
-              if fin_offset = t.offset then Buffer.close_reader t.consumer
-            | None -> ());
+            close_if_finished ());
           Some fragment))
     | None -> None
 
@@ -309,9 +300,9 @@ module Send = struct
       | Reset_recvd
   end
 
-  let push buffer t =
-    let len = Bigstringaf.length buffer in
-    let fragment = { IOVec.off = t.offset; len; buffer } in
+  let push payload t =
+    let len = String.length payload in
+    let fragment = { Frame.off = t.offset; len; payload; payload_off = 0 } in
     let q' = Q.add t.offset fragment t.q in
     t.q <- q';
     t.offset <- t.offset + len;
@@ -341,7 +332,7 @@ module Send = struct
     t.q <- q'
 
   let requeue fragment t =
-    let q' = Q.add fragment.IOVec.off fragment t.q in
+    let q' = Q.add fragment.Frame.off fragment t.q in
     t.q <- q'
 
   let create when_ready =
@@ -369,7 +360,7 @@ module Send = struct
       (match t.fin_offset with
       | None ->
         t.fin_offset <- Some t.offset;
-        ignore (push Bigstringaf.empty t : Frame.fragment)
+        ignore (push "" t : Frame.fragment)
       | Some _ -> ());
       0
     | `Writev iovecs ->
@@ -385,13 +376,7 @@ module Send = struct
              then (
                (* Copy before shifting Faraday's internal buffer; otherwise
                   queued fragments can alias mutable storage and get corrupted. *)
-               let fragment = Bigstringaf.create take in
-               Bigstringaf.blit
-                 buffer
-                 ~src_off:off
-                 fragment
-                 ~dst_off:0
-                 ~len:take;
+               let fragment = Bigstringaf.substring buffer ~off ~len:take in
                ignore (push fragment t : Frame.fragment);
                remaining := !remaining - take))
         iovecs;

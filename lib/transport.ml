@@ -202,7 +202,6 @@ module Connection = struct
   type packet_info =
     { packet_number : int64
     ; header : Packet.Header.t
-    ; outgoing_frames : Frame.t list Encryption_level.t
     ; encryption_level : Encryption_level.level
     ; connection : t
     }
@@ -551,11 +550,7 @@ module Connection = struct
         let crypto_stream =
           Spaces.of_encryption_level t.crypto_streams cur_encryption_level
         in
-        let _fragment =
-          Stream.Send.push
-            (Bigstringaf.of_string ~off:0 ~len:(String.length cs) cs)
-            crypto_stream.send
-        in
+        let _fragment = Stream.Send.push cs crypto_stream.send in
         (* Encryption_level.update_exn *)
         (* cur_encryption_level *)
         (* (fun xs -> Some (Frame.Crypto fragment :: xs)) *)
@@ -590,8 +585,12 @@ module Connection = struct
   let rec exhaust_crypto_stream t ~packet_info ~(stream : Stream.t) =
     let { encryption_level; _ } = packet_info in
     match Stream.Recv.pop stream.recv with
-    | Some { buffer; _ } ->
-      let fragment_cstruct = Bigstringaf.to_string buffer in
+    | Some { payload; payload_off; len; _ } ->
+      let fragment_cstruct =
+        if payload_off = 0 && len = String.length payload
+        then payload
+        else String.sub payload payload_off len
+      in
       (match t.tls_state.handshake.machina with
       | Server Tls.State.AwaitClientHello | Server13 AwaitClientHelloHRR13 ->
         if encryption_level <> Initial
@@ -869,7 +868,7 @@ module Connection = struct
     in
     let recv_window = current_recv_stream_max_data c id in
     let stream_final_offset =
-      Int64.add (Int64.of_int fragment.IOVec.off) (Int64.of_int fragment.len)
+      Int64.add (Int64.of_int fragment.Frame.off) (Int64.of_int fragment.len)
     in
     if is_locally_initiated && not stream_exists
     then
@@ -1262,27 +1261,18 @@ module Connection = struct
       | false ->
         (* Very first initial packet for the connection, push to the crypto
            stream. *)
-        let _fragment =
-          Stream.Send.push
-            (Bigstringaf.of_string
-               ~off:0
-               ~len:(String.length raw_record)
-               raw_record)
-            crypto_stream.send
-        in
+        let _fragment = Stream.Send.push raw_record crypto_stream.send in
         ()
       | true ->
         send_frames
           t
           ~encryption_level:current_encryption_level
           [ Frame.Crypto
-              (let buffer =
-                 Bigstringaf.of_string
-                   ~off:0
-                   ~len:(String.length raw_record)
-                   raw_record
-               in
-               { IOVec.off = 0; len = Bigstringaf.length buffer; buffer })
+              { Frame.off = 0
+              ; len = String.length raw_record
+              ; payload = raw_record
+              ; payload_off = 0
+              }
           ])
     | Client _ | Client13 _ -> assert false
     | Server _ | Server13 _ -> assert false
@@ -1293,7 +1283,7 @@ module Connection = struct
 
   let can_send_stream_fragment t ~stream_id ~fragment =
     let fragment_end =
-      Int64.add (Int64.of_int fragment.IOVec.off) (Int64.of_int fragment.len)
+      Int64.add (Int64.of_int fragment.Frame.off) (Int64.of_int fragment.len)
     in
     match current_peer_stream_max_data t stream_id with
     | None -> `Blocked
@@ -1346,16 +1336,17 @@ module Connection = struct
     let app_data_payload_budget =
       max 1 (Recovery.Constants.default_max_datagram_size - 64)
 
-    let truncate_fragment ~max_len ({ IOVec.off; len; buffer } as fragment) =
+    let truncate_fragment ~max_len ({ Frame.off; len; payload; payload_off } as fragment) =
       if len <= max_len
       then fragment, None
       else (
         let head = { fragment with len = max_len } in
         let tail_len = len - max_len in
         let tail =
-          { IOVec.off = off + max_len
+          { Frame.off = off + max_len
           ; len = tail_len
-          ; buffer = Bigstringaf.sub buffer ~off:max_len ~len:tail_len
+          ; payload
+          ; payload_off = payload_off + max_len
           }
         in
         head, Some tail)
@@ -1488,7 +1479,6 @@ end
 type packet_info = Connection.packet_info =
   { packet_number : int64
   ; header : Packet.Header.t
-  ; outgoing_frames : Frame.t list Encryption_level.t
   ; encryption_level : Encryption_level.level
   ; connection : Connection.t
   }
@@ -1609,42 +1599,15 @@ let on_timeout t =
   wakeup_writer t
 
 let send_packets t ~packet_info =
-  let { connection = c; outgoing_frames; _ } = packet_info in
-  (* From RFC9000§12.2:
-   *   Coalescing packets in order of increasing encryption levels (Initial,
-   *   0-RTT, Handshake, 1-RTT; see Section 4.1.4 of [QUIC-TLS]) makes it more
-   *   likely the receiver will be able to process all the packets in a single
-   *   pass. *)
-  Encryption_level.ordered_iter
-    (fun encryption_level frames ->
-       match Encryption_level.mem encryption_level c.encdec with
-       | false ->
-         (* Don't attempt to send packets if we can't encrypt them yet. *)
-         ()
-       | true ->
-         let pn_space =
-           Spaces.of_encryption_level c.packet_number_spaces encryption_level
-         in
-         let frames =
-           if pn_space.ack_elicited
-           then Packet_number.compose_ack_frame pn_space :: frames
-           else frames
-         in
-         (* TODO: bundle e.g. a PING frame with a packet that only contains ACK
-            frames. *)
-         (match frames with
-         | [] ->
-           (* Don't send invalid (payload-less) frames *)
-           ()
-         | frames ->
-           Connection.send_frames c ~encryption_level (List.rev frames)))
-    outgoing_frames;
+  let { connection = c; encryption_level; _ } = packet_info in
+  if Encryption_level.mem encryption_level c.encdec
+  then (
+    let pn_space =
+      Spaces.of_encryption_level c.packet_number_spaces encryption_level
+    in
+    if pn_space.ack_elicited
+    then Connection.send_frames c ~encryption_level [ Packet_number.compose_ack_frame pn_space ]);
   wakeup_writer t
-
-let create_outgoing_frames ~current =
-  let r = Encryption_level.create ~current in
-  List.iter (fun lvl -> Encryption_level.add lvl [] r) Encryption_level.all;
-  r
 
 let on_close t (connection : Connection.t) =
   deregister_connection_ids t ~connection
@@ -1863,7 +1826,6 @@ let packet_handler t ?error packet =
           { header
           ; encryption_level
           ; packet_number
-          ; outgoing_frames = create_outgoing_frames ~current:c.encdec.current
           ; connection = c
           }
         in
@@ -1892,14 +1854,14 @@ let packet_handler t ?error packet =
             in
             List.iter
               (function
-                | Frame.Crypto { IOVec.off; _ } ->
+                | Frame.Crypto { Frame.off; _ } ->
                   let crypto_stream =
                     Spaces.of_encryption_level
                       c.crypto_streams
                       packet_info.encryption_level
                   in
                   Stream.Send.remove off crypto_stream.send
-                | Stream { id; fragment = { IOVec.off; _ }; _ } ->
+                | Stream { id; fragment = { Frame.off; _ }; _ } ->
                   (match Hashtbl.find_opt c.streams id with
                   | Some stream -> Stream.Send.remove off stream.send
                   | None -> ())

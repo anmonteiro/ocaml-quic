@@ -207,7 +207,12 @@ module Type = struct
     | x -> Unknown x
 end
 
-type fragment = Bigstringaf.t IOVec.t
+type fragment =
+  { off : int
+  ; len : int
+  ; payload : string
+  ; payload_off : int
+  }
 
 module Range = struct
   (* From RFC<QUIC-RFC>§19.3.1:
@@ -287,7 +292,7 @@ let to_frame_type = function
   | Stop_sending _ -> Stop_sending
   | Crypto _ -> Crypto
   | New_token _ -> New_token
-  | Stream { fragment = { IOVec.len; off; _ }; is_fin; _ } ->
+  | Stream { fragment = { len; off; _ }; is_fin; _ } ->
     Stream { off = off <> 0; len = len <> 0; fin = is_fin }
   | Max_data _ -> Max_data
   | Max_stream_data _ -> Max_stream_data

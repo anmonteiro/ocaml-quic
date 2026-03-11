@@ -6,14 +6,18 @@ usage() {
   cat <<'EOF'
 Usage: scripts/bench_h3_upload.sh /path/to/file [output-dir]
 
-Builds the Eio HTTP/3 echo server in release mode, starts it with uploads
-discarded to /dev/null, runs a curl HTTP/3 upload benchmark against /upload,
-and captures:
+Builds the Eio HTTP/3 echo server in release mode, starts it, runs a curl
+HTTP/3 upload benchmark against /upload, and captures:
 
 - server stderr log
 - curl stdout/stderr
-- a macOS `sample` profile, when available
+- a macOS `sample` profile, when available and `CAPTURE_SAMPLE!=0`
 - a short text summary
+
+Environment:
+- `SKIP_BUILD=1` to skip rebuilding the server
+- `CAPTURE_SAMPLE=0` to disable the macOS sampler during throughput runs
+- `UPLOAD_OUT=/path/to/file` to make the benchmark server persist uploaded data
 EOF
 }
 
@@ -34,6 +38,7 @@ SERVER_HOST=${SERVER_HOST:-127.0.0.1}
 SERVER_PORT=${SERVER_PORT:-4433}
 SERVER_URL=${SERVER_URL:-"https://$SERVER_HOST:$SERVER_PORT/upload"}
 SERVER_BIN=${SERVER_BIN:-"$REPO_ROOT/_build/default/examples/eio/eio_h3_echo_server.exe"}
+UPLOAD_OUT=${UPLOAD_OUT:-}
 mkdir -p "$OUTPUT_DIR"
 
 SERVER_LOG="$OUTPUT_DIR/server.log"
@@ -59,7 +64,12 @@ if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
   dune build --profile=release examples/eio/eio_h3_echo_server.exe
 fi
 
-"$SERVER_BIN" -p "$SERVER_PORT" -upload-out /dev/null > /dev/null 2>"$SERVER_LOG" &
+SERVER_ARGS=( -p "$SERVER_PORT" )
+if [[ -n "$UPLOAD_OUT" ]]; then
+  SERVER_ARGS+=( -upload-out "$UPLOAD_OUT" )
+fi
+
+"$SERVER_BIN" "${SERVER_ARGS[@]}" > /dev/null 2>"$SERVER_LOG" &
 SERVER_PID=$!
 
 for _ in $(seq 1 50); do
@@ -69,7 +79,7 @@ for _ in $(seq 1 50); do
   sleep 0.1
 done
 
-if command -v sample >/dev/null 2>&1; then
+if [[ "${CAPTURE_SAMPLE:-1}" != "0" ]] && command -v sample >/dev/null 2>&1; then
   sample "$SERVER_PID" 15 -file "$SAMPLE_TXT" > /dev/null 2>"$SAMPLE_STDERR" &
   SAMPLE_PID=$!
 fi
