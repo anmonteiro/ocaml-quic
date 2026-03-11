@@ -144,6 +144,7 @@ module Transport : sig
 
   val report_write_result : t -> cid:string -> [ `Ok of int | `Closed ] -> unit
   val yield_writer : t -> (unit -> unit) -> unit
+  val ready_to_write : t -> unit -> unit
   val report_exn : t -> exn -> unit
   val is_closed : t -> bool
   val shutdown : t -> unit
