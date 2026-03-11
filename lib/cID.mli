@@ -37,7 +37,6 @@ val length : t -> int
 val max_length : int
 val src_length : int
 val is_empty : t -> bool
-val parse : t Angstrom.t
 val serialize : Faraday.t -> t -> unit
 val to_string : t -> string
 val of_string : string -> t

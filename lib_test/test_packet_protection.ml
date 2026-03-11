@@ -237,15 +237,17 @@ module Retry = struct
             "ff000000010008f067a5502a4262b5746f6b656e04a265ba2eff4d829058fb3f0f2496ba")
     in
     match
-      Angstrom.parse_string ~consume:All Quic__.Parse.Packet.Payload.retry data
+      Quic.Fast_parse.Packet_parser.parse_unprotected
+        (Bigstringaf.of_string ~off:0 ~len:(String.length data) data)
+        ~off:0
+        ~len:(String.length data)
     with
-    | Ok
-        (Retry
-           { header : Quic.Packet.Header.t = _
-           ; token : string = _
-           ; pseudo : Bigstringaf.t
-           ; tag : Bigstringaf.t = _
-           }) ->
+    | Retry
+        { header : Quic.Packet.Header.t = _
+        ; token : string = _
+        ; pseudo : Bigstringaf.t
+        ; tag : Bigstringaf.t = _
+        } ->
       Alcotest.check
         hex
         "pseudo"
@@ -728,6 +730,205 @@ module ChaCha20_encryption = struct
     ]
 end
 
+module Bigstring_slice = struct
+  let exact_packet_substring ~header_prefix_len ~payload_length packet_with_trailing =
+    Bigstringaf.of_string
+      ~off:0
+      ~len:(String.length packet_with_trailing)
+      packet_with_trailing
+    |> fun bs ->
+    Bigstringaf.substring bs ~off:0 ~len:(header_prefix_len + payload_length)
+
+  let check_exact_slice_matches
+        ~msg
+        ~header_prefix_len
+        ~encrypter
+        ~largest_pn
+        ~payload_length
+        packet
+    =
+    let packet = Hex.to_string packet in
+    let packet_with_trailing = packet ^ "\xde\xad\xbe\xef\xca\xfe\xba\xbe" in
+    let exact_packet =
+      exact_packet_substring
+        ~header_prefix_len
+        ~payload_length
+        packet_with_trailing
+    in
+    Alcotest.(check string)
+      (msg ^ ": exact slice matches original packet")
+      packet
+      exact_packet;
+    let legacy =
+      Crypto.AEAD.decrypt_packet
+        encrypter
+        ~largest_pn
+        ~payload_length
+        packet_with_trailing
+    in
+    let exact =
+      Crypto.AEAD.decrypt_packet
+        encrypter
+        ~largest_pn
+        ~payload_length
+        exact_packet
+    in
+    match legacy, exact with
+    | Some legacy, Some exact ->
+      Alcotest.(check int) (msg ^ ": pn_length") legacy.pn_length exact.pn_length;
+      Alcotest.(check int64)
+        (msg ^ ": packet_number")
+        legacy.packet_number
+        exact.packet_number;
+      Alcotest.(check string) (msg ^ ": header") legacy.header exact.header;
+      Alcotest.(check string) (msg ^ ": plaintext") legacy.plaintext exact.plaintext
+    | Some _, None -> Alcotest.failf "%s: exact slice decrypt returned None" msg
+    | None, Some _ -> Alcotest.failf "%s: legacy decrypt returned None" msg
+    | None, None -> ()
+
+  let test_client_initial_exact_slice () =
+    let encrypter = InitialAEAD.make ~mode:Client (Quic.CID.of_string dest_cid) in
+    check_exact_slice_matches
+      ~msg:"client initial"
+      ~header_prefix_len:(String.length Client_initial.unprotected_header - 4)
+      ~encrypter
+      ~largest_pn:1L
+      ~payload_length:
+        (String.length (Hex.to_string Client_initial.expected_protected_packet)
+        - String.length Client_initial.unprotected_header
+        + 4)
+      Client_initial.expected_protected_packet
+
+  let test_server_initial_exact_slice () =
+    let encrypter = InitialAEAD.make ~mode:Server (Quic.CID.of_string dest_cid) in
+    check_exact_slice_matches
+      ~msg:"server initial"
+      ~header_prefix_len:(String.length Server_initial.unprotected_header - 2)
+      ~encrypter
+      ~largest_pn:0L
+      ~payload_length:
+        (String.length (Hex.to_string Server_initial.expected_protected_packet)
+        - String.length Server_initial.unprotected_header
+        + 2)
+      Server_initial.expected_protected_packet
+
+  let test_chacha_exact_slice () =
+    let packet_number = 654360564L in
+    let encrypter =
+      { (AEAD.make ~ciphersuite:`CHACHA20_POLY1305_SHA256 ChaCha.secret) with
+        conn_id_len = 0
+      }
+    in
+    check_exact_slice_matches
+      ~msg:"chacha short"
+      ~header_prefix_len:1
+      ~encrypter
+      ~largest_pn:(Int64.sub packet_number 100L)
+      ~payload_length:20
+      ChaCha.expected_protected_packet
+
+  let suite =
+    [ "client initial exact slice", `Quick, test_client_initial_exact_slice
+    ; "server initial exact slice", `Quick, test_server_initial_exact_slice
+    ; "chacha short exact slice", `Quick, test_chacha_exact_slice
+    ]
+end
+
+module Bigstring_decrypt = struct
+  let check_matches_legacy
+        ~msg
+        ~header_prefix_len
+        ~encrypter
+        ~largest_pn
+        ~payload_length
+        packet
+    =
+    let packet = Hex.to_string packet in
+    let packet_with_trailing = packet ^ "\xde\xad\xbe\xef\xca\xfe\xba\xbe" in
+    let exact_bigstring =
+      Bigstringaf.of_string
+        ~off:0
+        ~len:(String.length packet_with_trailing)
+        packet_with_trailing
+    in
+    let legacy =
+      Crypto.AEAD.decrypt_packet
+        encrypter
+        ~largest_pn
+        ~payload_length
+        packet_with_trailing
+    in
+    let fast =
+      Crypto.AEAD.decrypt_packet_bigstring
+        encrypter
+        ~largest_pn
+        ~payload_length
+        ~header_prefix_len
+        exact_bigstring
+        ~off:0
+        ~len:(Bigstringaf.length exact_bigstring)
+    in
+    match legacy, fast with
+    | Some legacy, Some fast ->
+      Alcotest.(check int) (msg ^ ": pn_length") legacy.pn_length fast.pn_length;
+      Alcotest.(check int64)
+        (msg ^ ": packet_number")
+        legacy.packet_number
+        fast.packet_number;
+      Alcotest.(check string) (msg ^ ": header") legacy.header fast.header;
+      Alcotest.(check string) (msg ^ ": plaintext") legacy.plaintext fast.plaintext
+    | Some _, None -> Alcotest.failf "%s: bigstring decrypt returned None" msg
+    | None, Some _ -> Alcotest.failf "%s: legacy decrypt returned None" msg
+    | None, None -> ()
+
+  let test_client_initial_bigstring () =
+    let encrypter = InitialAEAD.make ~mode:Client (Quic.CID.of_string dest_cid) in
+    check_matches_legacy
+      ~msg:"client initial"
+      ~header_prefix_len:(String.length Client_initial.unprotected_header - 4)
+      ~encrypter
+      ~largest_pn:1L
+      ~payload_length:
+        (String.length (Hex.to_string Client_initial.expected_protected_packet)
+        - String.length Client_initial.unprotected_header
+        + 4)
+      Client_initial.expected_protected_packet
+
+  let test_server_initial_bigstring () =
+    let encrypter = InitialAEAD.make ~mode:Server (Quic.CID.of_string dest_cid) in
+    check_matches_legacy
+      ~msg:"server initial"
+      ~header_prefix_len:(String.length Server_initial.unprotected_header - 2)
+      ~encrypter
+      ~largest_pn:0L
+      ~payload_length:
+        (String.length (Hex.to_string Server_initial.expected_protected_packet)
+        - String.length Server_initial.unprotected_header
+        + 2)
+      Server_initial.expected_protected_packet
+
+  let test_chacha_bigstring () =
+    let packet_number = 654360564L in
+    let encrypter =
+      { (AEAD.make ~ciphersuite:`CHACHA20_POLY1305_SHA256 ChaCha.secret) with
+        conn_id_len = 0
+      }
+    in
+    check_matches_legacy
+      ~msg:"chacha short"
+      ~header_prefix_len:1
+      ~encrypter
+      ~largest_pn:(Int64.sub packet_number 100L)
+      ~payload_length:20
+      ChaCha.expected_protected_packet
+
+  let suite =
+    [ "client initial", `Quick, test_client_initial_bigstring
+    ; "server initial", `Quick, test_server_initial_bigstring
+    ; "chacha short", `Quick, test_chacha_bigstring
+    ]
+end
+
 let () =
   Alcotest.run
     "packets"
@@ -738,4 +939,6 @@ let () =
     ; "A.5. ChaCha20-Poly1305 Short Header Packet", against_all_backends ChaCha.suite
     ; "Initial AEAD", against_all_backends InitialAEAD_encryption.suite
     ; "ChaCha20", against_all_backends ChaCha20_encryption.suite
+    ; "Bigstring slice", against_all_backends Bigstring_slice.suite
+    ; "Bigstring decrypt", against_all_backends Bigstring_decrypt.suite
     ]

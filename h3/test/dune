@@ -1,0 +1,9 @@
+(tests
+ (names test_body)
+ (libraries alcotest h3 quic tls mirage-crypto-rng.unix)
+ (deps
+  (source_tree ../../certificates))
+ (action
+  (chdir
+   ../..
+   (run %{test}))))

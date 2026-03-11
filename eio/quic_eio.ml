@@ -208,18 +208,22 @@ module IO_loop = struct
     let read_buffer = Buffer.create read_buffer_size in
     let recv_seq_no = ref 0 in
     let send_seq_no = ref 0 in
-    let read_with_cancel () =
-      Fiber.first
-        (fun () -> Io.read socket read_buffer)
+    let read_once =
+      match cancel with
+      | None -> (fun () -> Io.read socket read_buffer)
+      | Some cancel ->
         (fun () ->
-           Promise.await cancel;
-           raise Cancelled)
+           Fiber.first
+             (fun () -> Io.read socket read_buffer)
+             (fun () ->
+                Promise.await cancel;
+                raise Cancelled))
     in
     let rec read_loop () =
       let rec read_loop_step () =
         match Runtime.next_read_operation t with
         | `Read ->
-          (match read_with_cancel () with
+          (match read_once () with
           | _n, addr ->
             let (_ : int) =
               Buffer.get read_buffer ~f:(fun buf ~off ~len ->
@@ -244,11 +248,14 @@ module IO_loop = struct
         | `Yield ->
           let p, u = Promise.create () in
           Runtime.yield_reader t (Promise.resolve u);
-          Fiber.first
-            (fun () -> Promise.await p)
-            (fun () ->
-               Promise.await cancel;
-               raise Cancelled);
+          (match cancel with
+          | None -> Promise.await p
+          | Some cancel ->
+            Fiber.first
+              (fun () -> Promise.await p)
+              (fun () ->
+                 Promise.await cancel;
+                 raise Cancelled));
           `Continue
         | `Close -> `Stop
       in
@@ -257,9 +264,12 @@ module IO_loop = struct
       | `Stop -> ()
       | exception Cancelled -> ()
       | exception exn ->
-        Runtime.report_exn t exn;
-        Fiber.yield ();
-        read_loop ()
+        if Runtime.is_closed t
+        then ()
+        else (
+          Runtime.report_exn t exn;
+          Fiber.yield ();
+          read_loop ())
     in
     let rec write_loop () =
       let rec write_loop_step () =
@@ -288,29 +298,29 @@ module IO_loop = struct
         | `Yield timeout_ms ->
           let wake_p, wake_u = Promise.create () in
           Runtime.yield_writer t (Promise.resolve wake_u);
-          (match timeout_ms with
-          | None ->
+          let wait_for_timeout () =
+            match timeout_ms with
+            | None -> Promise.await wake_p
+            | Some timeout_ms ->
+              Fiber.first
+                (fun () -> Promise.await wake_p)
+                (fun () ->
+                   let now = now_ms clock in
+                   if Int64.compare now timeout_ms < 0
+                   then
+                     Eio.Time.sleep
+                       clock
+                       (Int64.to_float (Int64.sub timeout_ms now) /. 1000.);
+                   Runtime.on_timeout t)
+          in
+          (match cancel with
+          | None -> wait_for_timeout ()
+          | Some cancel ->
             Fiber.first
-              (fun () -> Promise.await wake_p)
+              wait_for_timeout
               (fun () ->
                  Promise.await cancel;
-                 raise Cancelled)
-          | Some timeout_ms ->
-            Fiber.first
-              (fun () -> Promise.await wake_p)
-              (fun () ->
-                 Fiber.first
-                   (fun () ->
-                      let now = now_ms clock in
-                      if Int64.compare now timeout_ms < 0
-                      then
-                        Eio.Time.sleep
-                          clock
-                          (Int64.to_float (Int64.sub timeout_ms now) /. 1000.);
-                      Runtime.on_timeout t)
-                   (fun () ->
-                      Promise.await cancel;
-                      raise Cancelled)));
+                 raise Cancelled));
           `Continue
         | `Close _ -> `Stop
       in
@@ -319,9 +329,12 @@ module IO_loop = struct
       | `Stop -> ()
       | exception Cancelled -> ()
       | exception exn ->
-        Runtime.report_exn t exn;
-        Fiber.yield ();
-        write_loop ()
+        if Runtime.is_closed t
+        then ()
+        else (
+          Runtime.report_exn t exn;
+          Fiber.yield ();
+          write_loop ())
     in
     Fiber.both read_loop write_loop
 end
@@ -343,7 +356,6 @@ module Server = struct
         (Eio.Stdenv.net env)
         listen_address
     in
-    let never, _ = Promise.create () in
     let clock = Eio.Stdenv.clock env in
     let connection =
       Quic.Transport.Server.create
@@ -356,14 +368,14 @@ module Server = struct
       ~sw
       ~clock
       ~read_buffer_size:0x1000
-      ~cancel:never
+      ~cancel:None
       ~should_drop
       server_fd
 end
 
 type t =
   { transport : Quic.Transport.t
-  ; cancel_reader : unit Promise.t * unit Promise.u
+  ; shutdown_io : unit -> unit
   }
 
 module Client = struct
@@ -376,9 +388,6 @@ module Client = struct
         (Eio.Stdenv.net env)
         `UdpV4
     in
-    let _shutdown_p, shutdown_u = Promise.create () in
-    let cancel_reader = Promise.create () in
-    let cancel_reader_p, _ = cancel_reader in
     let clock = Eio.Stdenv.clock env in
     let connection =
       Quic.Transport.Client.create
@@ -386,19 +395,21 @@ module Client = struct
         ~config
         handler
     in
+    let shutdown_io () =
+      Quic.Transport.shutdown connection;
+      Quic.Transport.ready_to_write connection ();
+      try Eio.Resource.close fd with _ -> ()
+    in
     Fiber.fork ~sw (fun () ->
-      Fun.protect ~finally:(Promise.resolve shutdown_u) (fun () ->
-        Switch.run (fun sw ->
-          Fiber.fork ~sw (fun () ->
-            IO_loop.start
-              ~sw
-              ~clock
-              ~cancel:cancel_reader_p
-              ~read_buffer_size:0x1000
-              ~should_drop
-              connection
-              fd))));
-    { transport = connection; cancel_reader }
+      IO_loop.start
+        ~sw
+        ~clock
+        ~cancel:None
+        ~read_buffer_size:0x1000
+        ~should_drop
+        connection
+        fd);
+    { transport = connection; shutdown_io }
 end
 
 let connect t ~address ~host f =
@@ -406,7 +417,4 @@ let connect t ~address ~host f =
   Quic.Transport.connect t.transport ~address ~host f
 
 let shutdown t =
-  let cancel_reader, resolve_cancel_reader = t.cancel_reader in
-  if not (Promise.is_resolved cancel_reader)
-  then Promise.resolve resolve_cancel_reader ();
-  Quic.Transport.shutdown t.transport
+  t.shutdown_io ()

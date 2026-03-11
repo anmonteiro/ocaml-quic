@@ -131,14 +131,13 @@ let test_initial () =
     let packet_hex = Write_operation.iovecs_to_string iovecs in
     Format.eprintf "serialized: %a@." Hex.pp (Hex.of_string packet_hex);
     let header, payload_length =
-      match
-        Angstrom.parse_string
-          ~consume:Prefix
-          Quic.Parse.Packet.protected_header
-          packet_hex
-      with
-      | Ok x -> x
-      | Error e -> Alcotest.failf "failed to parse protected header: %s" e
+      let { Quic.Fast_parse.Packet_parser.header; payload_length; _ } =
+        Quic.Fast_parse.Packet_parser.parse_protected_header
+          (Bigstringaf.of_string ~off:0 ~len:(String.length packet_hex) packet_hex)
+          ~off:0
+          ~len:(String.length packet_hex)
+      in
+      header, payload_length
     in
     (match header with
     | Quic.Packet.Header.Initial _ -> ()
@@ -165,48 +164,6 @@ let test_initial () =
   | _ ->
     Alcotest.fail
       "Expected state machine to issue a write operation after seeing headers."
-
-(* match *)
-(* Angstrom.parse_string ~consume:All Quic.Parse.Packet.parser protected_packet *)
-(* with *)
-(* | Ok packet -> *)
-(* (match packet with *)
-(* | Crypt { header = Initial { source_cid; dest_cid; _ }; payload; _ } -> *)
-(* let decrypter = Quic.Crypto.InitialAEAD.make ~mode:Client dest_cid.id in *)
-(* let _, unprotected = *)
-(* Quic.Crypto.AEAD.decrypt_packet *)
-(* decrypter *)
-(* ~largest_pn:0L *)
-(* (Cstruct.of_string protected_packet) *)
-(* in *)
-(* Format.eprintf "X: %s@." (Cstruct.debug (Option.get unprotected)); *)
-(* Alcotest.(check int) "source_cid len" 20 source_cid.length; *)
-(* Alcotest.(check string) *)
-(* "source_cid" *)
-(* "\238Hb\016\164J\192#e\172a\139-\234\255b\139#\177U" *)
-(* source_cid.id; *)
-(* Format.eprintf "Crypt: %d@." (Bigstringaf.length payload); *)
-(* (match *)
-(* Angstrom.parse_bigstring *)
-(* ~consume:Prefix *)
-(* Quic.Parse.Frame.parser *)
-(* (Option.get unprotected |> Cstruct.to_bigarray) *)
-(* with *)
-(* | Ok frame -> *)
-(* let hex = *)
-(* Hex.of_string (Bigstringaf.substring payload ~off:0 ~len:20) *)
-(* in *)
-(* Format.eprintf "Success %a @." Hex.pp hex; *)
-(* Format.eprintf *)
-(* "Success 0x%x @." *)
-(* (Quic.Frame.to_frame_type frame |> Quic.Frame.Type.serialize) *)
-(* | _ -> *)
-(* assert false); *)
-(* assert false *)
-(* | _ -> *)
-(* assert false) *)
-(* | Error _ -> *)
-(* Alcotest.fail "Expected the parser to succeed" *)
 
 let suites = [ "initial", `Quick, test_initial ]
 

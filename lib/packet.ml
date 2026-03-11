@@ -132,6 +132,20 @@ let parse_type first_byte =
 let parse_type_opt first_byte =
   try Some (parse_type first_byte) with Not_found -> None
 
+module Payload = struct
+  type t =
+    | Bigstring of Bigstringaf.t
+    | String of string
+
+  let length = function
+    | Bigstring bs -> Bigstringaf.length bs
+    | String s -> String.length s
+
+  let to_string = function
+    | Bigstring bs -> Bigstringaf.to_string bs
+    | String s -> s
+end
+
 type t =
   | VersionNegotiation of
       { source_cid : CID.t
@@ -140,7 +154,7 @@ type t =
       }
   | Frames of
       { header : Header.t
-      ; payload : Bigstringaf.t
+      ; payload : Payload.t
       ; payload_length : int
       ; packet_number : int64
       }

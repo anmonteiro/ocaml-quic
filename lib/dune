@@ -1,4 +1,4 @@
 (library
  (public_name quic)
- (libraries angstrom faraday psq hex digestif mirage-crypto kdf.hkdf tls ssl x509 libcrypto)
+ (libraries faraday psq hex digestif mirage-crypto kdf.hkdf tls ssl x509 libcrypto)
  (c_library_flags -lssl -lcrypto))

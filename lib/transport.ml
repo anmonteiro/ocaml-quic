@@ -30,26 +30,24 @@
  *  POSSIBILITY OF SUCH DAMAGE.
  *---------------------------------------------------------------------------*)
 
-module Reader = Parse.Reader
+module Reader = Fast_parse.Reader
 module Writer = Serialize.Writer
 
 module Packet_number = struct
-  module PSet = Set.Make (Int64)
-
   let max_ack_ranges = 32
   let ack_history_window = 4096L
 
   type t =
     { mutable sent : int64
     ; mutable received : int64
-    ; mutable received_need_ack : PSet.t
+    ; mutable received_need_ack : Frame.Range.t list
     ; mutable ack_elicited : bool
     }
 
   let create () =
     { sent = -1L
     ; received = -1L
-    ; received_need_ack = PSet.empty
+    ; received_need_ack = []
     ; ack_elicited = false
     }
 
@@ -58,37 +56,66 @@ module Packet_number = struct
     t.sent <- next;
     next
 
+  let prune_ranges ~cutoff ranges =
+    let rec aux acc = function
+      | [] -> List.rev acc
+      | ({ Frame.Range.first; last } as range) :: rest ->
+        if Int64.compare last cutoff < 0
+        then List.rev acc
+        else if Int64.compare first cutoff < 0
+        then List.rev ({ range with first = cutoff } :: acc)
+        else aux (range :: acc) rest
+    in
+    aux [] ranges
+
+  let merge_following_ranges range ranges =
+    let rec aux range = function
+      | ({ Frame.Range.first; last; _ } as next) :: rest
+        when Int64.compare (Int64.add last 1L) range.Frame.Range.first >= 0 ->
+        let merged =
+          { Frame.Range.first = min range.Frame.Range.first first
+          ; last = max range.Frame.Range.last next.last
+          }
+        in
+        aux merged rest
+      | rest -> range, rest
+    in
+    aux range ranges
+
   let insert_for_acking t packet_number =
     let cutoff = Int64.sub packet_number ack_history_window in
-    let pruned =
-      PSet.filter (fun pn -> Int64.compare pn cutoff >= 0) t.received_need_ack
+    let pruned = prune_ranges ~cutoff t.received_need_ack in
+    let rec insert acc = function
+      | [] ->
+        List.rev
+          ({ Frame.Range.first = packet_number; last = packet_number } :: acc)
+      | ({ Frame.Range.first; last; _ } as range) :: rest ->
+        if Int64.compare packet_number (Int64.add last 1L) > 0
+        then
+          List.rev_append
+            acc
+            ({ Frame.Range.first = packet_number; last = packet_number }
+             :: range
+             :: rest)
+        else if Int64.compare packet_number (Int64.sub first 1L) >= 0
+        then (
+          let merged =
+            { Frame.Range.first = min first packet_number
+            ; last = max last packet_number
+            }
+          in
+          let merged, rest = merge_following_ranges merged rest in
+          List.rev_append acc (merged :: rest))
+        else insert (range :: acc) rest
     in
-    t.received_need_ack <- PSet.add packet_number pruned
+    t.received_need_ack <- insert [] pruned
 
   let rec take n acc = function
     | _ when n <= 0 -> List.rev acc
     | [] -> List.rev acc
     | x :: xs -> take (n - 1) (x :: acc) xs
 
-  let compose_ranges t =
-    (* list is sorted *)
-    let packets = PSet.elements t.received_need_ack in
-    match packets with
-    | [] -> []
-    | first :: rest ->
-      let ranges_desc =
-        List.fold_left
-          (fun acc pn ->
-             let cur_range = List.hd acc in
-             if Int64.compare (Int64.add cur_range.Frame.Range.last 1L) pn = 0
-             then { cur_range with last = pn } :: List.tl acc
-             else
-               (* start a new range, there's a gap. *)
-               { Frame.Range.first = pn; last = pn } :: acc)
-          [ { Frame.Range.first; last = first } ]
-          rest
-      in
-      take max_ack_ranges [] ranges_desc
+  let compose_ranges t = take max_ack_ranges [] t.received_need_ack
 
   let compose_ack_frame t =
     let ranges = compose_ranges t in
@@ -175,7 +202,6 @@ module Connection = struct
   type packet_info =
     { packet_number : int64
     ; header : Packet.Header.t
-    ; outgoing_frames : Frame.t list Encryption_level.t
     ; encryption_level : Encryption_level.level
     ; connection : t
     }
@@ -195,10 +221,13 @@ module Connection = struct
     Frame.is_any_ack_eliciting frames
     || List.exists (function Frame.Padding _ -> true | _ -> false) frames
 
-  let estimated_bytes_sent frames =
+  let estimated_in_flight_bytes frames =
     if packet_is_in_flight frames
     then Recovery.Constants.default_max_datagram_size
     else 0
+
+  let writer_pending_bytes writer =
+    Faraday.pending_bytes (Writer.faraday writer)
 
   let on_packet_sent t ~encryption_level ~packet_number ~bytes_sent frames =
     let time_sent_ms = next_recovery_time_ms t in
@@ -222,20 +251,17 @@ module Connection = struct
       | Some
           ( ({ Writer.encryption_level; packet_number; _ } as header_info)
           , frames ) ->
-        let bytes_sent = estimated_bytes_sent frames in
+        let estimated_bytes = estimated_in_flight_bytes frames in
         if
-          bytes_sent > 0 && not (Recovery.can_send t.recovery ~bytes:bytes_sent)
+          estimated_bytes > 0
+          && not (Recovery.can_send t.recovery ~bytes:estimated_bytes)
         then acc
         else (
           ignore
             (Queue.take t.queued_packets : Writer.header_info * Frame.t list);
-          (* Format.eprintf *)
-          (* "Sending %d frames at encryption level: %a %Ld@." *)
-          (* (List.length frames) *)
-          (* Encryption_level.pp_hum *)
-          (* encryption_level *)
-          (* packet_number; *)
+          let bytes_before = writer_pending_bytes t.writer in
           Writer.write_frames_packet t.writer ~header_info frames;
+          let bytes_sent = writer_pending_bytes t.writer - bytes_before in
           on_packet_sent t ~encryption_level ~packet_number ~bytes_sent frames;
           let can_be_followed_by_other_packets =
             encryption_level <> Application_data
@@ -282,7 +308,7 @@ module Connection = struct
     Queue.add (header_info, frames) t.queued_packets
 
   let process_ack_frame t ~packet_info ~delay ~ranges =
-    let { header; encryption_level; _ } = packet_info in
+    let { encryption_level; _ } = packet_info in
     let ack_delay_ms =
       if encryption_level <> Application_data
       then 0L
@@ -301,13 +327,6 @@ module Connection = struct
       ~ranges
       ~ack_delay_ms
       ~now_ms:(next_recovery_time_ms t);
-    Format.eprintf
-      "got ack %a %Ld %Ld %d@."
-      Encryption_level.pp_hum
-      (Encryption_level.of_header header)
-      (List.hd ranges).Frame.Range.last
-      (List.hd ranges).Frame.Range.first
-      (List.length ranges);
     Recovery.drain_lost t.recovery ~encryption_level
     |> List.iter (fun frames -> send_frames t ~encryption_level frames);
     ()
@@ -352,18 +371,7 @@ module Connection = struct
     t.peer_max_data <-
       (if transport_params.initial_max_data < 0
        then 0L
-       else Int64.of_int transport_params.initial_max_data);
-    Format.eprintf
-      "[flowctl] peer params configured cid=%s max_data=%d bidi_local=%d \
-       bidi_remote=%d uni=%d streams_bidi=%d streams_uni=%d@."
-      (let (`Hex x) = Hex.of_string (CID.to_string t.source_cid) in
-       x)
-      transport_params.initial_max_data
-      transport_params.initial_max_stream_data_bidi_local
-      transport_params.initial_max_stream_data_bidi_remote
-      transport_params.initial_max_stream_data_uni
-      transport_params.initial_max_streams_bidi
-      transport_params.initial_max_streams_uni
+       else Int64.of_int transport_params.initial_max_data)
 
   let process_reset_stream_frame
         t
@@ -542,11 +550,7 @@ module Connection = struct
         let crypto_stream =
           Spaces.of_encryption_level t.crypto_streams cur_encryption_level
         in
-        let _fragment =
-          Stream.Send.push
-            (Bigstringaf.of_string ~off:0 ~len:(String.length cs) cs)
-            crypto_stream.send
-        in
+        let _fragment = Stream.Send.push cs crypto_stream.send in
         (* Encryption_level.update_exn *)
         (* cur_encryption_level *)
         (* (fun xs -> Some (Frame.Crypto fragment :: xs)) *)
@@ -581,8 +585,12 @@ module Connection = struct
   let rec exhaust_crypto_stream t ~packet_info ~(stream : Stream.t) =
     let { encryption_level; _ } = packet_info in
     match Stream.Recv.pop stream.recv with
-    | Some { buffer; _ } ->
-      let fragment_cstruct = Bigstringaf.to_string buffer in
+    | Some { payload; payload_off; len; _ } ->
+      let fragment_cstruct =
+        if payload_off = 0 && len = String.length payload
+        then payload
+        else String.sub payload payload_off len
+      in
       (match t.tls_state.handshake.machina with
       | Server Tls.State.AwaitClientHello | Server13 AwaitClientHelloHRR13 ->
         if encryption_level <> Initial
@@ -805,14 +813,6 @@ module Connection = struct
           if Int64.compare new_limit advertised > 0
           then (
             Hashtbl.replace t.recv_stream_max_data stream_id new_limit;
-            Format.eprintf
-              "[flowctl] return stream credit stream=%Ld consumed=%Ld old=%Ld \
-               new=%Ld window=%Ld@."
-              stream_id
-              new_stream_consumed
-              advertised
-              new_limit
-              stream_window;
             send_frames
               t
               [ Frame.Max_stream_data
@@ -832,13 +832,6 @@ module Connection = struct
         in
         if Int64.compare new_limit t.max_recv_data > 0
         then (
-          Format.eprintf
-            "[flowctl] return connection credit consumed=%Ld old=%Ld new=%Ld \
-             window=%Ld@."
-            t.consumed_data_bytes
-            t.max_recv_data
-            new_limit
-            t.local_initial_max_data;
           t.max_recv_data <- new_limit;
           send_frames t [ Frame.Max_data (int_of_int64_clamped new_limit) ]))
 
@@ -875,7 +868,7 @@ module Connection = struct
     in
     let recv_window = current_recv_stream_max_data c id in
     let stream_final_offset =
-      Int64.add (Int64.of_int fragment.IOVec.off) (Int64.of_int fragment.len)
+      Int64.add (Int64.of_int fragment.Frame.off) (Int64.of_int fragment.len)
     in
     if is_locally_initiated && not stream_exists
     then
@@ -1253,17 +1246,6 @@ module Connection = struct
       ; now_ms
       }
     in
-    Format.eprintf
-      "[flowctl] local params configured cid=%s max_data=%Ld bidi_local=%Ld \
-       bidi_remote=%Ld uni=%Ld streams_bidi=%Ld streams_uni=%Ld@."
-      (let (`Hex x) = Hex.of_string (CID.to_string t.source_cid) in
-       x)
-      t.local_initial_max_data
-      t.local_initial_max_stream_data_bidi_local
-      t.local_initial_max_stream_data_bidi_remote
-      t.local_initial_max_stream_data_uni
-      t.local_initial_max_streams_bidi
-      t.local_initial_max_streams_uni;
     t
 
   let send_handshake_bytes t =
@@ -1279,27 +1261,18 @@ module Connection = struct
       | false ->
         (* Very first initial packet for the connection, push to the crypto
            stream. *)
-        let _fragment =
-          Stream.Send.push
-            (Bigstringaf.of_string
-               ~off:0
-               ~len:(String.length raw_record)
-               raw_record)
-            crypto_stream.send
-        in
+        let _fragment = Stream.Send.push raw_record crypto_stream.send in
         ()
       | true ->
         send_frames
           t
           ~encryption_level:current_encryption_level
           [ Frame.Crypto
-              (let buffer =
-                 Bigstringaf.of_string
-                   ~off:0
-                   ~len:(String.length raw_record)
-                   raw_record
-               in
-               { IOVec.off = 0; len = Bigstringaf.length buffer; buffer })
+              { Frame.off = 0
+              ; len = String.length raw_record
+              ; payload = raw_record
+              ; payload_off = 0
+              }
           ])
     | Client _ | Client13 _ -> assert false
     | Server _ | Server13 _ -> assert false
@@ -1310,7 +1283,7 @@ module Connection = struct
 
   let can_send_stream_fragment t ~stream_id ~fragment =
     let fragment_end =
-      Int64.add (Int64.of_int fragment.IOVec.off) (Int64.of_int fragment.len)
+      Int64.add (Int64.of_int fragment.Frame.off) (Int64.of_int fragment.len)
     in
     match current_peer_stream_max_data t stream_id with
     | None -> `Blocked
@@ -1360,6 +1333,24 @@ module Connection = struct
       | `Data
       ]
 
+    let app_data_payload_budget =
+      max 1 (Recovery.Constants.default_max_datagram_size - 64)
+
+    let truncate_fragment ~max_len ({ Frame.off; len; payload; payload_off } as fragment) =
+      if len <= max_len
+      then fragment, None
+      else (
+        let head = { fragment with len = max_len } in
+        let tail_len = len - max_len in
+        let tail =
+          { Frame.off = off + max_len
+          ; len = tail_len
+          ; payload
+          ; payload_off = payload_off + max_len
+          }
+        in
+        head, Some tail)
+
     let flush t streams =
       let rec inner acc = function
         | Seq.Cons ((encryption_level, stream_type, stream), xs) ->
@@ -1371,7 +1362,10 @@ module Connection = struct
             let max_flush_bytes =
               match stream_type with
               | `Crypto -> Int.max_int
-              | `Data -> available_send_budget t ~stream_id:stream.id
+              | `Data ->
+                min
+                  (available_send_budget t ~stream_id:stream.id)
+                  app_data_payload_budget
             in
             let _flushed =
               Stream.Send.flush ~max_bytes:max_flush_bytes stream.Stream.send
@@ -1380,8 +1374,8 @@ module Connection = struct
               Stream.Send.has_pending_output stream.send
               && Encryption_level.mem encryption_level t.encdec
             then (
-              let bytes_sent = Recovery.Constants.default_max_datagram_size in
-              if not (Recovery.can_send t.recovery ~bytes:bytes_sent)
+              let estimated_bytes = Recovery.Constants.default_max_datagram_size in
+              if not (Recovery.can_send t.recovery ~bytes:estimated_bytes)
               then acc
               else
                 let packet_number =
@@ -1406,7 +1400,9 @@ module Connection = struct
                 match stream_type with
                 | `Crypto ->
                   let frames = [ Frame.Crypto fragment ] in
+                  let bytes_before = writer_pending_bytes t.writer in
                   Writer.write_frames_packet t.writer ~header_info frames;
+                  let bytes_sent = writer_pending_bytes t.writer - bytes_before in
                   on_packet_sent
                     t
                     ~encryption_level
@@ -1420,6 +1416,13 @@ module Connection = struct
                   then inner Wrote (xs ())
                   else Wrote_app_data
                 | `Data ->
+                  let fragment, deferred_fragment =
+                    truncate_fragment ~max_len:app_data_payload_budget fragment
+                  in
+                  Option.iter
+                    (fun fragment -> Stream.Send.requeue fragment stream.send)
+                    deferred_fragment;
+                  let is_fin = is_fin && Option.is_none deferred_fragment in
                   (match can_send_stream_fragment t ~stream_id:stream.id ~fragment with
                   | `Blocked ->
                     Stream.Send.requeue fragment stream.send;
@@ -1428,7 +1431,9 @@ module Connection = struct
                     let frames =
                       [ Frame.Stream { id = stream.id; fragment; is_fin } ]
                     in
+                    let bytes_before = writer_pending_bytes t.writer in
                     Writer.write_frames_packet t.writer ~header_info frames;
+                    let bytes_sent = writer_pending_bytes t.writer - bytes_before in
                     on_packet_sent
                       t
                       ~encryption_level
@@ -1474,7 +1479,6 @@ end
 type packet_info = Connection.packet_info =
   { packet_number : int64
   ; header : Packet.Header.t
-  ; outgoing_frames : Frame.t list Encryption_level.t
   ; encryption_level : Encryption_level.level
   ; connection : Connection.t
   }
@@ -1595,42 +1599,15 @@ let on_timeout t =
   wakeup_writer t
 
 let send_packets t ~packet_info =
-  let { connection = c; outgoing_frames; _ } = packet_info in
-  (* From RFC9000§12.2:
-   *   Coalescing packets in order of increasing encryption levels (Initial,
-   *   0-RTT, Handshake, 1-RTT; see Section 4.1.4 of [QUIC-TLS]) makes it more
-   *   likely the receiver will be able to process all the packets in a single
-   *   pass. *)
-  Encryption_level.ordered_iter
-    (fun encryption_level frames ->
-       match Encryption_level.mem encryption_level c.encdec with
-       | false ->
-         (* Don't attempt to send packets if we can't encrypt them yet. *)
-         ()
-       | true ->
-         let pn_space =
-           Spaces.of_encryption_level c.packet_number_spaces encryption_level
-         in
-         let frames =
-           if pn_space.ack_elicited
-           then Packet_number.compose_ack_frame pn_space :: frames
-           else frames
-         in
-         (* TODO: bundle e.g. a PING frame with a packet that only contains ACK
-            frames. *)
-         (match frames with
-         | [] ->
-           (* Don't send invalid (payload-less) frames *)
-           ()
-         | frames ->
-           Connection.send_frames c ~encryption_level (List.rev frames)))
-    outgoing_frames;
+  let { connection = c; encryption_level; _ } = packet_info in
+  if Encryption_level.mem encryption_level c.encdec
+  then (
+    let pn_space =
+      Spaces.of_encryption_level c.packet_number_spaces encryption_level
+    in
+    if pn_space.ack_elicited
+    then Connection.send_frames c ~encryption_level [ Packet_number.compose_ack_frame pn_space ]);
   wakeup_writer t
-
-let create_outgoing_frames ~current =
-  let r = Encryption_level.create ~current in
-  List.iter (fun lvl -> Encryption_level.add lvl [] r) Encryption_level.all;
-  r
 
 let on_close t (connection : Connection.t) =
   deregister_connection_ids t ~connection
@@ -1849,37 +1826,42 @@ let packet_handler t ?error packet =
           { header
           ; encryption_level
           ; packet_number
-          ; outgoing_frames = create_outgoing_frames ~current:c.encdec.current
           ; connection = c
           }
         in
 
-        if Bigstringaf.length payload = 0
-        then Connection.report_error c Protocol_violation
-        else (
-          match
-            Angstrom.parse_bigstring
-              ~consume:All
-              (Parse.Frame.parser (Connection.frame_handler c ~packet_info))
-              payload
-          with
-          | Ok _frames ->
-            (* process streams for packets that have been acknowledged. *)
-            let acked_frames =
-              Recovery.drain_acknowledged
+	        if Packet.Payload.length payload = 0
+	        then Connection.report_error c Protocol_violation
+	        else (
+	          let parse_result =
+	            match payload with
+	            | Packet.Payload.Bigstring payload ->
+	              Fast_parse.Frame.parse_bigstring
+	                payload
+	                ~handler:(Connection.frame_handler c ~packet_info)
+	            | Packet.Payload.String payload ->
+	              Fast_parse.Frame.parse_string
+	                payload
+	                ~handler:(Connection.frame_handler c ~packet_info)
+	          in
+	          match parse_result with
+	          | Ok () ->
+	            (* process streams for packets that have been acknowledged. *)
+	            let acked_frames =
+	              Recovery.drain_acknowledged
                 c.recovery
                 ~encryption_level:packet_info.encryption_level
             in
             List.iter
               (function
-                | Frame.Crypto { IOVec.off; _ } ->
+                | Frame.Crypto { Frame.off; _ } ->
                   let crypto_stream =
                     Spaces.of_encryption_level
                       c.crypto_streams
                       packet_info.encryption_level
                   in
                   Stream.Send.remove off crypto_stream.send
-                | Stream { id; fragment = { IOVec.off; _ }; _ } ->
+                | Stream { id; fragment = { Frame.off; _ }; _ } ->
                   (match Hashtbl.find_opt c.streams id with
                   | Some stream -> Stream.Send.remove off stream.send
                   | None -> ())
@@ -1889,32 +1871,31 @@ let packet_handler t ?error packet =
                   ()
                 | _other -> ())
               acked_frames;
-            if c.did_send_connection_close
-            then ()
-            else
-              (* This packet has been processed, mark it for acknowledgement. *)
-              let pn_space =
-                Spaces.of_encryption_level
-                  c.packet_number_spaces
-                  packet_info.encryption_level
+	            if c.did_send_connection_close
+	            then ()
+	            else (
+	              (* This packet has been processed, mark it for acknowledgement. *)
+	              let pn_space =
+	                Spaces.of_encryption_level
+	                  c.packet_number_spaces
+	                  packet_info.encryption_level
               in
               Packet_number.insert_for_acking pn_space packet_number;
               (* packet_info should now contain frames we need to send in
                  response. *)
-              send_packets t ~packet_info;
-              (* Reset for the next packet. *)
-              pn_space.ack_elicited <- false
-          | Error e ->
-            Format.eprintf "discarding malformed packet payload: %s@." e)
-      | Retry { header; token; pseudo; tag } ->
-        process_retry_packet t c ~header ~token ~pseudo ~tag))
+	              send_packets t ~packet_info;
+	              (* Reset for the next packet. *)
+	              pn_space.ack_elicited <- false)
+	          | Error e ->
+	            Format.eprintf "discarding malformed packet payload: %s@." e)
+	      | Retry { header; token; pseudo; tag } ->
+	        process_retry_packet t c ~header ~token ~pseudo ~tag))
 
 let create ~mode ~now_ms ~config connection_handler =
   let rec reader_packet_handler t ?error packet =
     packet_handler (Lazy.force t) ?error packet
-  and decrypt t ~payload_length ~header bs ~off ~len =
+  and decrypt t ~payload_length ~header ~header_prefix_len bs ~off ~len =
     let t : t = Lazy.force t in
-    let cs = Bigstringaf.substring ~off ~len bs in
     let connection_id = Packet.Header.destination_cid header in
     if CID.is_empty connection_id
     then None
@@ -1929,11 +1910,14 @@ let create ~mode ~now_ms ~config connection_handler =
         in
         (match Encryption_level.find encryption_level connection.encdec with
         | Some { decrypter = Some decrypter; _ } ->
-          Crypto.AEAD.decrypt_packet
+          Crypto.AEAD.decrypt_packet_bigstring
             decrypter
             ~payload_length
+            ~header_prefix_len
             ~largest_pn:pn_space.received
-            cs
+            bs
+            ~off
+            ~len
         | Some { decrypter = None; _ } | None ->
           if encryption_level = Handshake && connection.encdec.current = Initial
           then
@@ -1952,11 +1936,14 @@ let create ~mode ~now_ms ~config connection_handler =
               ~mode:(Crypto.Mode.peer t.mode)
               connection_id
           in
-          Crypto.AEAD.decrypt_packet
+          Crypto.AEAD.decrypt_packet_bigstring
             decrypter
             ~payload_length
+            ~header_prefix_len
             ~largest_pn:(-1L)
-            cs
+            bs
+            ~off
+            ~len
         else None
   and t =
     lazy
@@ -2121,16 +2108,16 @@ let yield_writer t k =
 
 let yield_reader _t _k = ()
 
-let read_with_more t bs ~off ~len more =
-  Reader.read_with_more t.reader bs ~off ~len more
+let read_with_more t bs ~off ~len ~eof =
+  Reader.read_with_more t.reader bs ~off ~len ~eof
 
 let read t ~client_address bs ~off ~len =
   (* let hex = Hex.of_string (Bigstringaf.substring bs ~off ~len) in *)
   (* Format.eprintf "wtf(%d): %a@." len Hex.pp hex; *)
   t.current_peer_address <- Some client_address;
-  read_with_more t bs ~off ~len Incomplete
+  read_with_more t bs ~off ~len ~eof:false
 
-let read_eof t bs ~off ~len = read_with_more t bs ~off ~len Complete
+let read_eof t bs ~off ~len = read_with_more t bs ~off ~len ~eof:true
 
 let next_read_operation t =
   match Reader.next t.reader with

@@ -53,24 +53,6 @@ module Preferred_address = struct
 
   let serialized_length t = 4 + 2 + 8 + 2 + 1 + CID.length t.cid + 8
 
-  let parse =
-    let open Angstrom in
-    take 4 >>= fun ipv4_addr ->
-    BE.any_uint16 >>= fun ipv4_port ->
-    take 8 >>= fun ipv6_addr ->
-    BE.any_uint16 >>= fun ipv6_port ->
-    lift2
-      (fun cid token ->
-         { ipv4_addr
-         ; ipv4_port
-         ; ipv6_addr
-         ; ipv6_port
-         ; cid
-         ; stateless_reset_token = token
-         })
-      CID.parse
-      (take 16)
-
   let serialize
         f
         { ipv4_addr
@@ -88,6 +70,75 @@ module Preferred_address = struct
     CID.serialize f cid;
     Faraday.write_string f stateless_reset_token
 end
+
+exception Parse_error of string
+
+let failf fmt = Format.kasprintf (fun s -> raise (Parse_error s)) fmt
+
+module Cursor = struct
+  type t =
+    { buffer : string
+    ; base : int
+    ; limit : int
+    ; mutable off : int
+    }
+
+  let create buffer ~off ~len = { buffer; base = off; limit = off + len; off }
+  let remaining t = t.limit - t.off
+
+  let ensure t needed =
+    if remaining t < needed
+    then failf "truncated input: need %d bytes, have %d" needed (remaining t)
+
+  let consumed t = t.off - t.base
+
+  let uint8 t =
+    ensure t 1;
+    let x = Char.code (String.unsafe_get t.buffer t.off) in
+    t.off <- t.off + 1;
+    x
+
+  let uint16_be t =
+    ensure t 2;
+    let x =
+      (Char.code (String.unsafe_get t.buffer t.off) lsl 8)
+      lor Char.code (String.unsafe_get t.buffer (t.off + 1))
+    in
+    t.off <- t.off + 2;
+    x
+
+  let take_string t len =
+    ensure t len;
+    let s = String.sub t.buffer t.off len in
+    t.off <- t.off + len;
+    s
+
+  let advance t len =
+    ensure t len;
+    t.off <- t.off + len
+
+  let sub t len =
+    let off = t.off in
+    advance t len;
+    create t.buffer ~off ~len
+end
+
+let parse_varint cursor =
+  let first_byte = Cursor.uint8 cursor in
+  let encoding = first_byte lsr 6 in
+  let b1 = first_byte land 0b00111111 in
+  let rec gather acc remaining =
+    if remaining = 0 then acc else gather ((acc lsl 8) lor Cursor.uint8 cursor) (remaining - 1)
+  in
+  match encoding with
+  | 0 -> b1
+  | 1 -> gather b1 1
+  | 2 -> gather b1 3
+  | _ -> gather b1 7
+
+let parse_cid cursor =
+  let len = Cursor.uint8 cursor in
+  Cursor.take_string cursor len |> CID.of_string
 
 module Encoding = struct
   type t =
@@ -109,90 +160,89 @@ module Encoding = struct
     | Initial_source_connection_id of CID.t
     | Retry_source_connection_id of CID.t
 
-  let parse_transport_parameter type_ length =
-    let open Angstrom in
-    match type_ with
-    | 0x00 ->
-      lift
-        (fun cid -> Original_destination_connection_id (CID.of_string cid))
-        (take length)
-    | 0x01 ->
-      lift
-        (fun timeout -> Max_idle_timeout timeout)
-        Parse.variable_length_integer
-    | 0x02 ->
-      (* From RFC<QUIC-RFC>§18.2:
-       *   This parameter is a sequence of 16 bytes. *)
-      if length <> 16
-      then fail "stateless reset token should be 16 bytes"
-      else lift (fun token -> Stateless_reset_token token) (take length)
-    | 0x03 ->
-      lift (fun max -> Max_udp_payload_size max) Parse.variable_length_integer
-    | 0x04 ->
-      lift (fun max -> Initial_max_data max) Parse.variable_length_integer
-    | 0x05 ->
-      lift
-        (fun max -> Initial_max_stream_data_bidi_local max)
-        Parse.variable_length_integer
-    | 0x06 ->
-      lift
-        (fun max -> Initial_max_stream_data_bidi_remote max)
-        Parse.variable_length_integer
-    | 0x07 ->
-      lift
-        (fun max -> Initial_max_stream_data_uni max)
-        Parse.variable_length_integer
-    | 0x08 ->
-      lift
-        (fun max -> Initial_max_streams_bidi max)
-        Parse.variable_length_integer
-    | 0x09 ->
-      lift
-        (fun max -> Initial_max_streams_uni max)
-        Parse.variable_length_integer
-    | 0x0a ->
-      lift
-        (fun exponent -> Ack_delay_exponent exponent)
-        Parse.variable_length_integer
-    | 0x0b -> lift (fun max -> Max_ack_delay max) Parse.variable_length_integer
-    | 0x0c ->
-      (match length with
-      | 0 ->
-        (* From RFC<QUIC-RFC>§18.2:
-         *   This parameter is a zero-length value. *)
-        return (Disable_active_migration true)
-      | _ -> fail "zero-length param")
-    | 0x0d -> lift (fun addr -> Preferred_address addr) Preferred_address.parse
-    | 0x0e ->
-      lift
-        (fun limit -> Active_connection_id_limit limit)
-        Parse.variable_length_integer
-    | 0x0f ->
-      lift
-        (fun cid -> Initial_source_connection_id (CID.of_string cid))
-        (take length)
-    | 0x10 ->
-      lift
-        (fun cid -> Retry_source_connection_id (CID.of_string cid))
-        (take length)
-    | _other -> fail "other"
+  let parse_preferred_address cursor =
+    let ipv4_addr = Cursor.take_string cursor 4 in
+    let ipv4_port = Cursor.uint16_be cursor in
+    let ipv6_addr = Cursor.take_string cursor 8 in
+    let ipv6_port = Cursor.uint16_be cursor in
+    let cid = parse_cid cursor in
+    let stateless_reset_token = Cursor.take_string cursor 16 in
+    Preferred_address.
+      { ipv4_addr
+      ; ipv4_port
+      ; ipv6_addr
+      ; ipv6_port
+      ; cid
+      ; stateless_reset_token
+      }
+
+  let parse_varint_value cursor constructor =
+    constructor (parse_varint cursor)
+
+  let parse_transport_parameter type_ value =
+    let cursor = Cursor.create value ~off:0 ~len:(String.length value) in
+    let parameter =
+      match type_ with
+      | 0x00 ->
+        Original_destination_connection_id (Cursor.take_string cursor (String.length value) |> CID.of_string)
+      | 0x01 -> parse_varint_value cursor (fun timeout -> Max_idle_timeout timeout)
+      | 0x02 ->
+        if String.length value <> 16
+        then failf "stateless reset token should be 16 bytes"
+        else Stateless_reset_token (Cursor.take_string cursor 16)
+      | 0x03 -> parse_varint_value cursor (fun max -> Max_udp_payload_size max)
+      | 0x04 -> parse_varint_value cursor (fun max -> Initial_max_data max)
+      | 0x05 ->
+        parse_varint_value cursor (fun max -> Initial_max_stream_data_bidi_local max)
+      | 0x06 ->
+        parse_varint_value cursor (fun max -> Initial_max_stream_data_bidi_remote max)
+      | 0x07 -> parse_varint_value cursor (fun max -> Initial_max_stream_data_uni max)
+      | 0x08 -> parse_varint_value cursor (fun max -> Initial_max_streams_bidi max)
+      | 0x09 -> parse_varint_value cursor (fun max -> Initial_max_streams_uni max)
+      | 0x0a -> parse_varint_value cursor (fun exponent -> Ack_delay_exponent exponent)
+      | 0x0b -> parse_varint_value cursor (fun max -> Max_ack_delay max)
+      | 0x0c ->
+        if String.length value <> 0
+        then failf "disable_active_migration should be zero-length"
+        else Disable_active_migration true
+      | 0x0d -> Preferred_address (parse_preferred_address cursor)
+      | 0x0e ->
+        parse_varint_value cursor (fun limit -> Active_connection_id_limit limit)
+      | 0x0f ->
+        Initial_source_connection_id
+          (Cursor.take_string cursor (String.length value) |> CID.of_string)
+      | 0x10 ->
+        Retry_source_connection_id
+          (Cursor.take_string cursor (String.length value) |> CID.of_string)
+      | _other -> failf "unknown transport parameter 0x%x" type_
+    in
+    if Cursor.remaining cursor <> 0
+    then failf "transport parameter 0x%x has trailing bytes" type_
+    else parameter
 
   (* From RFC<QUIC-RFC>§18.1:
    *   Transport parameters with an identifier of the form 31 * N + 27 for
    *   integer values of N are reserved to exercise the requirement that unknown
    *   transport parameters be ignored. These transport parameters have no
    *   semantics, and may carry arbitrary values. *)
-  let parser =
-    let open Angstrom in
+  let parse_string s =
+    let cursor = Cursor.create s ~off:0 ~len:(String.length s) in
     let is_known_transport_parameter type_ = type_ >= 0x00 && type_ <= 0x10 in
-    let p =
-      Parse.variable_length_integer >>= fun type_ ->
-      Parse.variable_length_integer >>= fun length ->
-      if is_known_transport_parameter type_
-      then parse_transport_parameter type_ length >>| Option.some
-      else lift (fun () -> None) (advance length)
-    in
-    many p >>| List.filter_map (fun x -> x)
+    try
+      let rec loop acc =
+        if Cursor.remaining cursor = 0
+        then Ok (List.rev acc)
+        else
+          let type_ = parse_varint cursor in
+          let length = parse_varint cursor in
+          let value = Cursor.take_string cursor length in
+          if is_known_transport_parameter type_
+          then loop (parse_transport_parameter type_ value :: acc)
+          else loop acc
+      in
+      loop []
+    with
+    | Parse_error e -> Error e
 
   module Type = struct
     let serialize = function
@@ -404,8 +454,7 @@ let default =
 exception Local
 
 let decode_and_validate ~(perspective : Crypto.Mode.t) enc =
-  let bs = Bigstringaf.of_string ~off:0 ~len:(String.length enc) enc in
-  match Angstrom.parse_bigstring ~consume:All Encoding.parser bs with
+  match Encoding.parse_string enc with
   | Ok (_ :: _ as t) ->
     (* From RFC<QUIC-RFC>§7.4:
      *   An endpoint MUST NOT send a parameter more than once in a given
