@@ -255,9 +255,11 @@ let () =
               let n = input ic buf 0 (Bytes.length buf) in
               if n > 0
               then (
-                let chunk = Bytes.sub_string buf 0 n in
-                let b = Bigstringaf.of_string ~off:0 ~len:n chunk in
-                Body.Writer.schedule_bigstring request_body b;
+                Body.Writer.write_string
+                  request_body
+                  ~off:0
+                  ~len:n
+                  (Bytes.unsafe_to_string buf);
                 incr chunks_since_flush;
                 if !chunks_since_flush >= 32
                 then (

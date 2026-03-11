@@ -39,9 +39,6 @@ let varint_encoding_length n =
   then 4
   else 8
 
-let rec decomp n acc x =
-  if n = 0 then acc else decomp (n - 1) ((x land 0xff) :: acc) (x lsr 8)
-
 let write_variable_length_integer t n =
   let encoding_bytes, encoding =
     if n < 1 lsl 6
@@ -52,16 +49,18 @@ let write_variable_length_integer t n =
     then 4, 2
     else 8, 3
   in
-  let ns = decomp encoding_bytes [] n in
-  let hd = List.hd ns in
-  let tl = List.tl ns in
+  let first_shift = (encoding_bytes - 1) * 8 in
+  let hd = (n lsr first_shift) land 0xff in
   (* From RFC<QUIC-RFC>§16:
    *   The QUIC variable-length integer encoding reserves the two most
    *   significant bits of the first byte to encode the base 2 logarithm of the
    *   integer encoding length in bytes. The integer value is encoded on the
    *   remaining bits, in network byte order. *)
   Quic.Stream.write_uint8 t ((encoding lsl 6) lor hd);
-  List.iter (fun n -> Quic.Stream.write_uint8 t n) tl
+  for byte_index = 1 to encoding_bytes - 1 do
+    let shift = (encoding_bytes - byte_index - 1) * 8 in
+    Quic.Stream.write_uint8 t ((n lsr shift) land 0xff)
+  done
 
 let write_data_frame_header t length =
   write_variable_length_integer t (Frame.Type.serialize Data);
