@@ -89,6 +89,16 @@ code {
 .panel-header {
   margin-bottom: 16px;
 }
+.chart-wrap {
+  position: relative;
+  height: 340px;
+  width: 100%;
+}
+.chart-wrap canvas {
+  display: block;
+  width: 100% !important;
+  height: 100% !important;
+}
 .table-wrap {
   overflow-x: auto;
 }
@@ -120,6 +130,9 @@ a { color: inherit; }
 @media (max-width: 720px) {
   .page {
     padding: 28px 14px 48px;
+  }
+  .chart-wrap {
+    height: 260px;
   }
   th, td {
     padding: 10px 8px;
