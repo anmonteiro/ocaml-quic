@@ -592,20 +592,12 @@ module Connection = struct
         let crypto_stream =
           Spaces.of_encryption_level t.crypto_streams cur_encryption_level
         in
-        let _fragment =
-          Stream.Send.push
-            (Bigstringaf.of_string ~off:0 ~len:(String.length cs) cs)
-            crypto_stream.send
-        in
+        let _fragment = Stream.Send.push cs crypto_stream.send in
         process_packets cur_encryption_level xs
       | `Level_record (level, cs) :: xs ->
         let level = encryption_level_of_qtls level in
         let crypto_stream = Spaces.of_encryption_level t.crypto_streams level in
-        let _fragment =
-          Stream.Send.push
-            (Bigstringaf.of_string ~off:0 ~len:(String.length cs) cs)
-            crypto_stream.send
-        in
+        let _fragment = Stream.Send.push cs crypto_stream.send in
         (* Encryption_level.update_exn *)
         (* cur_encryption_level *)
         (* (fun xs -> Some (Frame.Crypto fragment :: xs)) *)
@@ -671,8 +663,12 @@ module Connection = struct
   let rec exhaust_crypto_stream t ~packet_info ~(stream : Stream.t) =
     let { encryption_level; _ } = packet_info in
     match Stream.Recv.pop stream.recv with
-    | Some { buffer; _ } ->
-      let fragment_cstruct = Bigstringaf.to_string buffer in
+    | Some { payload; payload_off; len; _ } ->
+      let fragment_cstruct =
+        if payload_off = 0 && len = String.length payload
+        then payload
+        else String.sub payload payload_off len
+      in
       (match encryption_level with
       | Initial when t.mode = Server ->
         handle_crypto_record
