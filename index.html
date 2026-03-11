@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>ocaml-quic Benchmarks</title>
   <link rel="stylesheet" href="./benchmarks/style.css">
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 </head>
 <body>
   <main class="page">
@@ -41,7 +41,9 @@
         <h2>Median throughput by commit</h2>
         <p>Upload and download, measured in MiB/s, for the 1.5GB benchmark run.</p>
       </div>
-      <canvas id="throughput-chart" height="120"></canvas>
+      <div class="chart-wrap">
+        <canvas id="throughput-chart"></canvas>
+      </div>
     </section>
 
     <section class="panel">
@@ -70,6 +72,6 @@
       </div>
     </section>
   </main>
-  <script src="./benchmarks/app.js"></script>
+  <script defer src="./benchmarks/app.js"></script>
 </body>
 </html>
