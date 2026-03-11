@@ -159,6 +159,29 @@ let test_dynamic_flow_control_allows_large_upload () =
     completed;
   Alcotest.(check int) "server received full payload" payload_len !server_received
 
+let test_zero_length_fin_closes_reader () =
+  let stream =
+    Stream.create
+      ~typ:(Stream.Type.Client Direction.Bidirectional)
+      ~id:0L
+      ~report_application_error:(fun _ -> ())
+      ignore
+  in
+  let saw_eof = ref false in
+  Stream.schedule_read
+    stream
+    ~on_eof:(fun () -> saw_eof := true)
+    ~on_read:(fun _buffer ~off:_ ~len:_ -> Alcotest.fail "unexpected payload");
+  Stream.Recv.push
+    ~is_fin:true
+    { Frame.off = 0; len = 0; payload = ""; payload_off = 0 }
+    stream.recv;
+  ignore (Stream.Recv.pop stream.recv);
+  Alcotest.(check bool)
+    "zero-length FIN closes the reader at the final offset"
+    true
+    !saw_eof
+
 let () =
   Mirage_crypto_rng_unix.use_default ();
   Alcotest.run
@@ -168,4 +191,7 @@ let () =
              beyond initial window"
           , `Quick
           , test_dynamic_flow_control_allows_large_upload )
+        ; ( "zero-length FIN closes the stream reader"
+          , `Quick
+          , test_zero_length_fin_closes_reader )
         ] ) ]

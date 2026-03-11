@@ -60,9 +60,11 @@ let connection_handler clock ~serve_file ~upload_out ~chunk_size =
               let n = input ic buf 0 (Bytes.length buf) in
               if n > 0
               then (
-                let chunk = Bytes.sub_string buf 0 n in
-                let b = Bigstringaf.of_string ~off:0 ~len:n chunk in
-                Body.Writer.schedule_bigstring response_body b;
+                Body.Writer.write_string
+                  response_body
+                  ~off:0
+                  ~len:n
+                  (Bytes.unsafe_to_string buf);
                 incr chunks_since_flush;
                 if !chunks_since_flush >= 32
                 then (
@@ -108,7 +110,6 @@ let connection_handler clock ~serve_file ~upload_out ~chunk_size =
           finished := true;
           report_progress ();
           Option.iter close_out_noerr oc;
-          Body.Reader.close request_body;
           print_transfer_stats
             ~label:"server recv upload"
             ~bytes:!received_bytes
@@ -132,10 +133,10 @@ let connection_handler clock ~serve_file ~upload_out ~chunk_size =
             received_bytes :=
               Int64.add !received_bytes (Int64.of_int len);
             report_progress ();
-            (match expected_len with
+            match expected_len with
             | Some expected when Int64.compare !received_bytes expected >= 0 ->
               finalize ()
-            | _ -> read_body ()))
+            | _ -> read_body ())
       in
       read_body ()
     | _, "/streaming" ->

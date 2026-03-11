@@ -88,12 +88,14 @@ module Reader = struct
   let schedule_read t ~on_eof ~on_read =
     if t.read_scheduled
     then failwith "Body.schedule_read: reader already scheduled";
-    if is_closed t
-    then do_execute_read t on_eof on_read
-    else (
+    (
       t.read_scheduled <- true;
       t.on_eof <- on_eof;
-      t.on_read <- on_read)
+      t.on_read <- on_read);
+    (* Mirror Quic.Stream.Buffer.schedule_read: if DATA or EOF is already
+       buffered when the application asks to read, deliver it immediately
+       instead of waiting for another frame to arrive. *)
+    execute_read t
 
   let close t =
     Faraday.close t.faraday;

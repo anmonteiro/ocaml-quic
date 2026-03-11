@@ -171,18 +171,19 @@ let read_eof_unidirectional _t _stream ~reader () =
   Reader.read_with_more reader Bigstringaf.empty Complete;
   ()
 
+let parser_input bs ~off ~len =
+  if off = 0 && len = Bigstringaf.length bs then bs else Bigstringaf.sub bs ~off ~len
+
 (* TODO: need to schedule read again. *)
-let rec read t stream ~reader bs ~off ~len:_ =
-  assert (off = 0);
-  Reader.read_with_more reader bs Incomplete;
+let rec read t stream ~reader bs ~off ~len =
+  Reader.read_with_more reader (parser_input bs ~off ~len) Incomplete;
   Stream.schedule_read
     stream.stream
     ~on_eof:(read_eof t stream ~reader)
     ~on_read:(read t stream ~reader)
 
-let rec read_unidirectional t stream ~reader bs ~off ~len:_ =
-  assert (off = 0);
-  Reader.read_with_more reader bs Incomplete;
+let rec read_unidirectional t stream ~reader bs ~off ~len =
+  Reader.read_with_more reader (parser_input bs ~off ~len) Incomplete;
   Stream.schedule_read
     stream.stream
     ~on_eof:(read_eof t stream ~reader)

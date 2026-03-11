@@ -213,9 +213,11 @@ let is_peer_critical_stream t stream_id =
   in
   is_control || is_qencoder || is_qdecoder
 
-let rec read t stream ~reader bs ~off ~len:_ =
-  assert (off = 0);
-  Reader.read_with_more reader bs Incomplete;
+let parser_input bs ~off ~len =
+  if off = 0 && len = Bigstringaf.length bs then bs else Bigstringaf.sub bs ~off ~len
+
+let rec read t stream ~reader bs ~off ~len =
+  Reader.read_with_more reader (parser_input bs ~off ~len) Incomplete;
   Stream.schedule_read
     stream.stream
     ~on_eof:(read_eof t stream ~reader)
