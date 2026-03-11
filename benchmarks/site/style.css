@@ -1,0 +1,128 @@
+:root {
+  color-scheme: light;
+  --bg: #f4f1e8;
+  --panel: rgba(255, 251, 240, 0.9);
+  --ink: #1b1a17;
+  --muted: #5f5a4f;
+  --border: rgba(27, 26, 23, 0.12);
+  --accent-upload: #0057b8;
+  --accent-download: #c05621;
+  --shadow: 0 18px 60px rgba(35, 31, 23, 0.08);
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  background:
+    radial-gradient(circle at top left, rgba(0, 87, 184, 0.08), transparent 30%),
+    radial-gradient(circle at top right, rgba(192, 86, 33, 0.08), transparent 24%),
+    var(--bg);
+  color: var(--ink);
+}
+code {
+  font-family: "SFMono-Regular", ui-monospace, monospace;
+  font-size: 0.95em;
+}
+.page {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 48px 20px 72px;
+}
+.hero {
+  margin-bottom: 32px;
+}
+.eyebrow {
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-size: 0.78rem;
+  color: var(--muted);
+  margin: 0 0 12px;
+}
+.hero h1 {
+  margin: 0;
+  font-size: clamp(2.4rem, 5vw, 4.6rem);
+  line-height: 0.94;
+}
+.lede {
+  max-width: 760px;
+  margin-top: 16px;
+  color: var(--muted);
+  font-size: 1.05rem;
+  line-height: 1.5;
+}
+.summary-grid {
+  display: grid;
+  gap: 16px;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  margin-bottom: 24px;
+}
+.summary-card,
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  box-shadow: var(--shadow);
+}
+.summary-card {
+  padding: 18px 20px;
+}
+.summary-card h2,
+.panel h2 {
+  margin: 0;
+  font-size: 1rem;
+}
+.metric {
+  margin: 12px 0 4px;
+  font-size: clamp(1.4rem, 4vw, 2.6rem);
+  line-height: 1;
+}
+.submetric,
+.panel-header p {
+  margin: 0;
+  color: var(--muted);
+}
+.panel {
+  padding: 20px;
+  margin-top: 20px;
+}
+.panel-header {
+  margin-bottom: 16px;
+}
+.table-wrap {
+  overflow-x: auto;
+}
+table {
+  width: 100%;
+  border-collapse: collapse;
+}
+th, td {
+  padding: 12px 10px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  font-size: 0.96rem;
+}
+thead th {
+  color: var(--muted);
+  font-weight: 600;
+}
+tbody tr:hover {
+  background: rgba(0, 0, 0, 0.02);
+}
+a { color: inherit; }
+.badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 0.82rem;
+  border: 1px solid var(--border);
+}
+@media (max-width: 720px) {
+  .page {
+    padding: 28px 14px 48px;
+  }
+  th, td {
+    padding: 10px 8px;
+    font-size: 0.88rem;
+  }
+}

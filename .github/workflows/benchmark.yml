@@ -1,0 +1,91 @@
+name: Benchmark
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+      - main
+
+concurrency:
+  group: benchmark-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  benchmark:
+    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            extra-substituters = https://anmonteiro.nix-cache.workers.dev
+            extra-trusted-public-keys = ocaml.nix-cache.com-1:/xI2h2+56rwFfKyyFVbkJSeGqSIYMC/Je+7XXqGKDIY=
+
+      - name: Run loopback benchmarks
+        run: |
+          mkdir -p benchmark-output
+          nix develop .#release -c bash ./scripts/bench/run_h3_loopback_benchmarks.sh > benchmark-output/results.jsonl
+        env:
+          RUNS: 3
+          BENCH_FILE_SIZE_MIB: 64
+          BENCH_CHUNK_SIZE: 16384
+          BENCH_OUTPUT_DIR: benchmark-output/raw
+
+      - name: Upload benchmark artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-output-${{ github.sha }}
+          path: benchmark-output
+
+      - name: Checkout gh-pages
+        id: checkout_pages
+        continue-on-error: true
+        uses: actions/checkout@v6
+        with:
+          ref: gh-pages
+          path: gh-pages
+          fetch-depth: 0
+
+      - name: Initialize gh-pages branch
+        if: steps.checkout_pages.outcome == 'failure'
+        run: |
+          mkdir -p gh-pages
+          cd gh-pages
+          git init
+          git checkout --orphan gh-pages
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update dashboard data
+        run: |
+          mkdir -p gh-pages/benchmarks
+          touch gh-pages/benchmarks/results.jsonl
+          cat benchmark-output/results.jsonl >> gh-pages/benchmarks/results.jsonl
+          cp benchmarks/site/index.html gh-pages/index.html
+          cp benchmarks/site/app.js gh-pages/benchmarks/app.js
+          cp benchmarks/site/style.css gh-pages/benchmarks/style.css
+
+      - name: Commit and push gh-pages
+        run: |
+          cd gh-pages
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add index.html benchmarks
+          if git diff --cached --quiet; then
+            echo 'No benchmark page changes to publish.'
+            exit 0
+          fi
+          git commit -m "Update benchmark dashboard for ${GITHUB_SHA}"
+          git push origin HEAD:gh-pages
