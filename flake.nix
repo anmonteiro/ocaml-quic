@@ -13,7 +13,18 @@
           let
             pkgs = nixpkgs.legacyPackages.${system}.extend (
               self: super: {
-                ocamlPackages = super.ocaml-ng.ocamlPackages_5_4;
+                ocamlPackages = super.ocaml-ng.ocamlPackages_5_4.overrideScope (
+                  oself: osuper: {
+                    ssl = osuper.ssl.overrideAttrs (_: {
+                      src = super.fetchFromGitHub {
+                        owner = "savonet";
+                        repo = "ocaml-ssl";
+                        rev = "844d0675f4f76e34442cab8f1d3329770bede208";
+                        hash = "sha256-UJTBaGiUDRyzeU4aL+WcRm0/mYAvyMhhdM1ybi3K2Ow=";
+                      };
+                    });
+                  }
+                );
               }
             );
           in
