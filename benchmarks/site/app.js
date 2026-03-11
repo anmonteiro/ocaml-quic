@@ -1,5 +1,6 @@
 const RESULTS_PATH = './benchmarks/results.jsonl';
 const REPO_URL = 'https://github.com/anmonteiro/ocaml-quic';
+const BENCHMARK_PROFILE = 'large-1536mib';
 const SCENARIOS = {
   h3_upload_curl: { label: 'Upload', color: '#0057b8' },
   h3_download_curl: { label: 'Download', color: '#c05621' },
@@ -28,10 +29,6 @@ function parseJsonLines(text) {
     .map((line) => JSON.parse(line));
 }
 
-function profileOf(record) {
-  return record.benchmark_profile || `size-${Math.round((record.file_size_bytes || 0) / 1048576)}mib`;
-}
-
 function groupByCommit(records) {
   const map = new Map();
   records.forEach((record) => {
@@ -58,14 +55,10 @@ function groupByCommit(records) {
   return Array.from(map.values()).sort((a, b) => new Date(a.timestamp_utc) - new Date(b.timestamp_utc));
 }
 
-function availableProfiles(records) {
-  return Array.from(new Set(records.map(profileOf))).sort();
-}
-
-function renderSummary(commits, rawRecords, profile) {
+function renderSummary(commits, rawRecords) {
   const latest = commits.at(-1);
   document.getElementById('dataset-commits').textContent = `${commits.length}`;
-  document.getElementById('dataset-runs').textContent = `${rawRecords.length} scenario runs in ${profile}`;
+  document.getElementById('dataset-runs').textContent = `${rawRecords.length} scenario runs in ${BENCHMARK_PROFILE}`;
   if (!latest) return;
 
   const latestUpload = latest.scenarios.h3_upload_curl;
@@ -131,7 +124,7 @@ function renderChart(commits) {
 function renderTable(commits) {
   const tbody = document.getElementById('results-body');
   if (commits.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="8">No benchmark data yet.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="8">No 1.5GB benchmark data yet.</td></tr>';
     return;
   }
 
@@ -164,34 +157,20 @@ async function main() {
   const response = await fetch(RESULTS_PATH, { cache: 'no-store' });
   if (!response.ok) throw new Error(`Failed to fetch ${RESULTS_PATH}: ${response.status}`);
   const text = await response.text();
-  const records = parseJsonLines(text);
-  const profiles = availableProfiles(records);
-  const select = document.getElementById('profile-select');
+  const records = parseJsonLines(text).filter(
+    (record) => (record.benchmark_profile || '') === BENCHMARK_PROFILE,
+  );
 
-  if (profiles.length === 0) {
-    renderSummary([], [], '-');
+  if (records.length === 0) {
+    renderSummary([], []);
     renderTable([]);
     return;
   }
 
-  profiles.forEach((profile) => {
-    const option = document.createElement('option');
-    option.value = profile;
-    option.textContent = profile;
-    select.appendChild(option);
-  });
-
-  const renderProfile = (profile) => {
-    const filtered = records.filter((record) => profileOf(record) === profile);
-    const commits = groupByCommit(filtered);
-    renderSummary(commits, filtered, profile);
-    renderChart(commits);
-    renderTable(commits);
-  };
-
-  select.value = profiles.at(-1);
-  renderProfile(select.value);
-  select.addEventListener('change', () => renderProfile(select.value));
+  const commits = groupByCommit(records);
+  renderSummary(commits, records);
+  renderChart(commits);
+  renderTable(commits);
 }
 
 main().catch((error) => {

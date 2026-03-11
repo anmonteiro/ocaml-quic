@@ -15,8 +15,7 @@ workflow records two scenarios on every push to `master`:
 - `h3_upload_curl`
 - `h3_download_curl`
 
-Each record also carries a `benchmark_profile`. The dashboard groups results by
-profile so different payload sizes are not mixed together.
+Each record carries the fixed benchmark profile `large-1536mib`.
 
 ## How it works
 
@@ -29,16 +28,13 @@ profile so different payload sizes are not mixed together.
 5. It copies the static dashboard assets from `benchmarks/site/` into the
    `gh-pages` branch and pushes the update.
 
-## Profiles
+## Payload size
 
-Two entry points exist:
-
-- Push to `master`: records the default `ci-64mib` profile
-- Manual `workflow_dispatch`: defaults to `large-1536mib` and `1536` MiB
+The benchmark is fixed at a `1536` MiB payload for both upload and download.
 
 The runner script creates the payload with `truncate`/`fallocate` when
-available, so large files do not require an expensive zero-fill step before the
-benchmark starts.
+available, so the large file does not require an expensive zero-fill step
+before the benchmark starts.
 
 ## Dashboard
 

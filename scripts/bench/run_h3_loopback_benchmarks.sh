@@ -6,10 +6,10 @@ LC_ALL=C
 ROOT_DIR=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$ROOT_DIR"
 
-RUNS=${RUNS:-3}
-BENCH_PROFILE=${BENCH_PROFILE:-size-${BENCH_FILE_SIZE_MIB:-64}mib}
-BENCH_FILE_SIZE_MIB=${BENCH_FILE_SIZE_MIB:-64}
-BENCH_CHUNK_SIZE=${BENCH_CHUNK_SIZE:-16384}
+RUNS=${RUNS:-1}
+BENCH_FILE_SIZE_MIB=${BENCH_FILE_SIZE_MIB:-1536}
+BENCH_PROFILE=${BENCH_PROFILE:-large-1536mib}
+BENCH_CHUNK_SIZE=${BENCH_CHUNK_SIZE:-1024}
 BENCH_SERVER_BIN=${BENCH_SERVER_BIN:-_build/default/examples/eio/eio_h3_echo_server.exe}
 BENCH_BUILD=${BENCH_BUILD:-1}
 BENCH_PORT_BASE=${BENCH_PORT_BASE:-4600}
@@ -19,6 +19,11 @@ mkdir -p "$BENCH_OUTPUT_DIR"
 
 if ! curl --help all 2>/dev/null | grep -q -- '--http3-only'; then
   echo 'curl in this environment does not support --http3-only' >&2
+  exit 1
+fi
+
+if [ "$BENCH_CHUNK_SIZE" -lt 1 ] || [ "$BENCH_CHUNK_SIZE" -gt 1024 ]; then
+  echo "BENCH_CHUNK_SIZE must be in 1..1024" >&2
   exit 1
 fi
 
@@ -112,7 +117,6 @@ run_scenario() {
   local server_mode=$3
   local curl_mode=$4
   local curl_url=$5
-  local speed_key=$6
 
   local totals_file="$BENCH_OUTPUT_DIR/${scenario}.totals"
   local speeds_file="$BENCH_OUTPUT_DIR/${scenario}.speeds"
@@ -222,5 +226,5 @@ run_scenario() {
     "$workflow_url"
 }
 
-run_scenario h3_upload_curl "$BENCH_PORT_BASE" upload upload "https://127.0.0.1:${BENCH_PORT_BASE}/upload" speed_upload
-run_scenario h3_download_curl "$((BENCH_PORT_BASE + 1))" download download "https://127.0.0.1:$((BENCH_PORT_BASE + 1))/file" speed_download
+run_scenario h3_upload_curl "$BENCH_PORT_BASE" upload upload "https://127.0.0.1:${BENCH_PORT_BASE}/upload"
+run_scenario h3_download_curl "$((BENCH_PORT_BASE + 1))" download download "https://127.0.0.1:$((BENCH_PORT_BASE + 1))/file"
