@@ -1,4 +1,0 @@
-(rule
- (targets openssl_link_flags.sexp)
- (action
-  (run ./config/discover.exe)))
