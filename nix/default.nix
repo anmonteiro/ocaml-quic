@@ -1,6 +1,7 @@
 {
   lib,
   stdenv,
+  pkg-config,
   ocamlPackages,
 }:
 
@@ -59,12 +60,16 @@ rec {
           ../certificates
           ../dune-project
           ../lib
+          ../libcrypto
           ../lib_test
           ../vendor
           ../quic.opam
         ];
       };
 
+    nativeBuildInputs = [
+      pkg-config
+    ];
     buildInputs = [
       alcotest
       hex
@@ -87,6 +92,7 @@ rec {
       mirage-crypto-rng
       x509
       domain-name
+      dune-configurator
       fmt
       ptime
       # hacl_x25519
