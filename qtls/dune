@@ -1,0 +1,6 @@
+(library
+ (name qtls)
+ (public_name quic.qtls)
+ ; (wrapped false)
+ (virtual_modules qtls)
+ (libraries tls x509))

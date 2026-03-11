@@ -1,0 +1,6 @@
+(library
+ (name qtls_openssl)
+ (public_name quic.qtls-openssl)
+ (implements qtls)
+ (modules qtls)
+ (libraries tls ssl x509))

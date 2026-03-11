@@ -274,4 +274,5 @@ let () =
           ~ic
           request_body
       | Print | Download _ -> Body.Writer.close request_body);
+
       Eio.Promise.await done_p))

@@ -1,6 +1,6 @@
 (tests
  (names test_server test_packet_protection test_parser test_rfc9002 test_flow_control)
- (libraries alcotest hex quic tls mirage-crypto-rng.unix fmt.tty logs.fmt)
+ (libraries alcotest hex quic qtls_ocaml_tls tls mirage-crypto-rng.unix fmt.tty logs.fmt)
  (deps
   (source_tree ../certificates))
  (action
