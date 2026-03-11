@@ -25,21 +25,18 @@ let lib_paths dir =
   | Some ssl, Some crypto -> Some [ ssl; crypto ]
   | _ -> None
 
-let normalize_libs c libs =
-  if C.ocaml_config_var_exn c "system" <> "macosx"
-  then libs
-  else
-    let dirs =
-      List.filter_map
-        (fun flag ->
-          if String.starts_with ~prefix:"-L" flag
-          then Some (String.sub flag 2 (String.length flag - 2))
-          else None)
-        libs
-    in
-    match find_map lib_paths dirs with
-    | Some libs -> libs
-    | None -> libs
+let normalize_libs libs =
+  let dirs =
+    List.filter_map
+      (fun flag ->
+        if String.starts_with ~prefix:"-L" flag
+        then Some (String.sub flag 2 (String.length flag - 2))
+        else None)
+      libs
+  in
+  match find_map lib_paths dirs with
+  | Some libs -> libs
+  | None -> libs
 
 let default c =
   if C.ocaml_config_var_exn c "system" = "macosx"
@@ -76,7 +73,7 @@ let () =
         | None -> default
         | Some pc ->
           (match C.Pkg_config.query pc ~package:"openssl" with
-          | Some s -> normalize_libs c s.libs
+          | Some s -> normalize_libs s.libs
           | None -> default)
       in
       C.Flags.write_sexp "c_library_flags.sexp" libs;
