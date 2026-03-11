@@ -71,6 +71,7 @@ jobs:
       - name: Initialize gh-pages branch
         if: steps.checkout_pages.outcome == 'failure'
         run: |
+          rm -rf gh-pages
           mkdir -p gh-pages
           cd gh-pages
           git init
