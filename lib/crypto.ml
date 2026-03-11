@@ -38,12 +38,35 @@ module Mode = struct
   let peer = function Client -> Server | Server -> Client
 end
 
+type backend =
+  [ `Legacy
+  | `OpenSSL
+  ]
+
+let backend : backend ref = ref `OpenSSL
+
 (* initial_salt: 0x38762cf7f55934b34d179ae6a4c80cadccbb7f0a *)
 let initial_salt =
   "\x38\x76\x2c\xf7\xf5\x59\x34\xb3\x4d\x17\x9a\xe6\xa4\xc8\x0c\xad\xcc\xbb\x7f\x0a"
 
+module Legacy_hkdf = Hkdf
+
 module Hkdf = struct
-  include Hkdf
+  let openssl_hash = function
+    | `SHA256 -> Libcrypto.SHA256
+    | `SHA384 -> SHA384
+    | _ -> invalid_arg "OpenSSL HKDF only supports SHA-256 and SHA-384"
+
+  let extract ~hash ~salt ikm =
+    match !backend with
+    | `Legacy -> Legacy_hkdf.extract ~hash ~salt ikm
+    | `OpenSSL -> Libcrypto.hkdf_extract (openssl_hash hash) ~salt ~ikm
+
+  let expand ~hash ~prk ~info length =
+    match !backend with
+    | `Legacy -> Legacy_hkdf.expand ~hash ~prk ~info length
+    | `OpenSSL ->
+      Libcrypto.hkdf_expand (openssl_hash hash) ~prk ~info ~length
 
   let expand_label label context length =
     let len =
@@ -74,7 +97,7 @@ module Hkdf = struct
       | Some x -> x
     in
     let info = expand_label label Cstruct.empty length |> Cstruct.to_string in
-    let key = Hkdf.expand ~hash ~prk ~info length in
+    let key = expand ~hash ~prk ~info length in
     key
 end
 
@@ -168,12 +191,22 @@ let decode_packet_number ~largest_pn ~truncated_pn ~pn_nbits =
   else candidate_pn
 
 module AEAD = struct
-  type 'k aead_state =
+  type 'k legacy_aead_state =
     { cipher : 'k Tls.State.aead_cipher
     ; key : 'k
     }
 
-  type cipher_st = AEAD : 'k aead_state -> cipher_st
+  type legacy_cipher_st = AEAD : 'k legacy_aead_state -> legacy_cipher_st
+
+  type openssl_cipher_st =
+    { cipher : Libcrypto.cipher
+    ; key : string
+    ; tag_len : int
+    }
+
+  type cipher_st =
+    | Legacy of legacy_cipher_st
+    | OpenSSL of openssl_cipher_st
 
   type t =
     { conn_id_len : int
@@ -184,48 +217,60 @@ module AEAD = struct
     }
 
   let tag_len t =
-    let (AEAD { cipher; _ }) = t.cipher in
-    Tls.Crypto.tag_len cipher
+    match t.cipher with
+    | Legacy (AEAD { cipher; _ }) -> Tls.Crypto.tag_len cipher
+    | OpenSSL { tag_len; _ } -> tag_len
 
   let encrypt_payload t ~packet_number ~header data =
-    let { cipher = AEAD { cipher; key }; iv; _ } = t in
     (* From RFC<QUIC-TLS-RFC>§5.3:
      *   The nonce, N, is formed by combining the packet protection IV with the
      *   packet number. The 62 bits of the reconstructed QUIC packet number in
      *   network byte order are left-padded with zeros to the size of the IV.
      *   The exclusive OR of the padded packet number and the IV forms the AEAD
      *   nonce. *)
-    let nonce = Tls.Crypto.aead_nonce iv packet_number in
-    Tls.Crypto.encrypt_aead
-      ~cipher
-      ~key
-      ~nonce
-        (*
-         * The associated data, A, for the AEAD is the contents of the QUIC
-         * header, starting from the flags byte in either the short or long
-         * header, up to and including the unprotected packet number. *)
-      ~adata:header
-      data
+    let nonce = Tls.Crypto.aead_nonce t.iv packet_number in
+    match t.cipher with
+    | Legacy (AEAD { cipher; key }) ->
+      Tls.Crypto.encrypt_aead
+        ~cipher
+        ~key
+        ~nonce
+          (*
+           * The associated data, A, for the AEAD is the contents of the QUIC
+           * header, starting from the flags byte in either the short or long
+           * header, up to and including the unprotected packet number. *)
+        ~adata:header
+        data
+    | OpenSSL { cipher; key; _ } ->
+      Libcrypto.aead_encrypt
+        cipher
+        ~key
+        ~nonce
+        ~adata:header
+        ~plaintext:data
 
   let decrypt_payload t ~packet_number ~header ciphertext =
-    let { cipher = AEAD { cipher; key }; iv; _ } = t in
     (* From RFC<QUIC-TLS-RFC>§5.3:
      *   The nonce, N, is formed by combining the packet protection IV with the
      *   packet number. The 62 bits of the reconstructed QUIC packet number in
      *   network byte order are left-padded with zeros to the size of the IV.
      *   The exclusive OR of the padded packet number and the IV forms the AEAD
      *   nonce. *)
-    let nonce = Tls.Crypto.aead_nonce iv packet_number in
-    Tls.Crypto.decrypt_aead
-      ~cipher
-      ~key
-      ~nonce
-        (*
-         * The associated data, A, for the AEAD is the contents of the QUIC
-         * header, starting from the flags byte in either the short or long
-         * header, up to and including the unprotected packet number. *)
-      ~adata:header
-      ciphertext
+    let nonce = Tls.Crypto.aead_nonce t.iv packet_number in
+    match t.cipher with
+    | Legacy (AEAD { cipher; key }) ->
+      Tls.Crypto.decrypt_aead
+        ~cipher
+        ~key
+        ~nonce
+          (*
+           * The associated data, A, for the AEAD is the contents of the QUIC
+           * header, starting from the flags byte in either the short or long
+           * header, up to and including the unprotected packet number. *)
+        ~adata:header
+        ciphertext
+    | OpenSSL { cipher; key; _ } ->
+      Libcrypto.aead_decrypt cipher ~key ~nonce ~adata:header ~ciphertext
 
   (* mutates [header] *)
   (*
@@ -390,39 +435,45 @@ module AEAD = struct
   module AES_ECB = Mirage_crypto.AES.ECB
 
   let encrypt_or_decrypt_header_ecb t f ~sample header =
-    (* From RFC<QUIC-TLS-RFC>§5.4.3:
-     *   mask = AES-ECB(hp_key, sample) *)
-    let mask = AES_ECB.encrypt ~key:(AES_ECB.of_secret t.hp_key) sample in
+    let mask =
+      match !backend with
+      | `Legacy ->
+        (* From RFC<QUIC-TLS-RFC>§5.4.3:
+         *   mask = AES-ECB(hp_key, sample) *)
+        AES_ECB.encrypt ~key:(AES_ECB.of_secret t.hp_key) sample
+      | `OpenSSL -> Libcrypto.hp_mask_aes_ecb ~key:t.hp_key ~sample
+    in
     f ~mask header
 
   let encrypt_or_decrypt_header_chacha20 t f ~sample header =
-    let module Chacha20 = Mirage_crypto.Chacha20 in
-    (* From RFC<QUIC-TLS-RFC>§5.4.3:
-     *   counter = sample[0..3]
-     *   nonce = sample[4..15]
-     *   mask = ChaCha20(hp_key, counter, nonce, {0,0,0,0,0}) *)
-    let counter = String.sub sample 0 4 in
-    let nonce = String.sub sample 4 12 in
-    let ctr : int64 =
-      let b0 = Char.code counter.[0] in
-      let b1 = Char.code counter.[1] in
-      let b2 = Char.code counter.[2] in
-      let b3 = Char.code counter.[3] in
-      Int64.(
-        logor
-          (of_int b0)
-          (logor
-             (shift_left (of_int b1) 8)
-             (logor (shift_left (of_int b2) 16) (shift_left (of_int b3) 24))))
-    in
-    (* let ctr = Int64.logand (Int64.of_int32 (Cstruct.LE.get_uint32 counter 0))
-       0x00000000FFFFFFFFL in *)
     let mask =
-      Chacha20.crypt
-        ~key:(Chacha20.of_secret t.hp_key)
-        ~nonce
-        ~ctr
-        (String.make 5 '\x00')
+      match !backend with
+      | `Legacy ->
+        let module Chacha20 = Mirage_crypto.Chacha20 in
+        (* From RFC<QUIC-TLS-RFC>§5.4.3:
+         *   counter = sample[0..3]
+         *   nonce = sample[4..15]
+         *   mask = ChaCha20(hp_key, counter, nonce, {0,0,0,0,0}) *)
+        let counter = String.sub sample 0 4 in
+        let nonce = String.sub sample 4 12 in
+        let ctr : int64 =
+          let b0 = Char.code counter.[0] in
+          let b1 = Char.code counter.[1] in
+          let b2 = Char.code counter.[2] in
+          let b3 = Char.code counter.[3] in
+          Int64.(
+            logor
+              (of_int b0)
+              (logor
+                 (shift_left (of_int b1) 8)
+                 (logor (shift_left (of_int b2) 16) (shift_left (of_int b3) 24))))
+        in
+        Chacha20.crypt
+          ~key:(Chacha20.of_secret t.hp_key)
+          ~nonce
+          ~ctr
+          (String.make 5 '\x00')
+      | `OpenSSL -> Libcrypto.hp_mask_chacha20 ~key:t.hp_key ~sample
     in
     f ~mask header
 
@@ -511,20 +562,35 @@ module AEAD = struct
       Some { pn_length; packet_number = pn; header; plaintext }
     | None -> None
 
-  let get_cipher_st : Tls.Ciphersuite.aead_cipher -> string -> cipher_st =
+  let get_legacy_cipher_st :
+    Tls.Ciphersuite.aead_cipher -> string -> legacy_cipher_st
+    =
    fun ciphersuite secret ->
     match Tls.Crypto.Ciphers.get_aead_cipher ~secret ~nonce:"" ciphersuite with
     | Tls.State.AEAD { cipher; cipher_secret; _ } ->
       AEAD { cipher; key = cipher_secret }
     | CBC _ -> assert false
 
+  let openssl_cipher = function
+    | Tls.Ciphersuite.AES_128_GCM -> Libcrypto.AES_128_GCM
+    | AES_256_GCM -> AES_256_GCM
+    | AES_128_CCM -> AES_128_CCM
+    | AES_256_CCM -> AES_256_CCM
+    | CHACHA20_POLY1305 -> CHACHA20_POLY1305
+
   let make ~ciphersuite secret =
     let ciphersuite13 = Tls.Ciphersuite.privprot13 ciphersuite in
     let hash = Tls.Ciphersuite.hash13 ciphersuite in
     let kn, ivn = Tls.Ciphersuite.kn_13 ciphersuite13 in
     let key, iv = Kdf.get_key_and_iv ~hash ~kn ~ivn secret in
+    let cipher =
+      match !backend with
+      | `Legacy -> Legacy (get_legacy_cipher_st ciphersuite13 key)
+      | `OpenSSL ->
+        OpenSSL { cipher = openssl_cipher ciphersuite13; key; tag_len = 16 }
+    in
     { conn_id_len = CID.src_length
-    ; cipher = get_cipher_st ciphersuite13 key
+    ; cipher
     ; ciphersuite = ciphersuite13
     ; iv
     ; hp_key = Kdf.get_header_protection_key ~hash ~kn secret
@@ -612,11 +678,18 @@ module Retry = struct
         (i + cid_len + 1)
         (Bigstringaf.unsafe_get pseudo0 i)
     done;
-    AES_GCM.authenticate_encrypt
-      ~key
-      ~nonce
-      ~adata:(Cstruct.to_string pseudo)
-      ""
+    match !backend with
+    | `Legacy ->
+      AES_GCM.authenticate_encrypt
+        ~key
+        ~nonce
+        ~adata:(Cstruct.to_string pseudo)
+        ""
+    | `OpenSSL ->
+      Libcrypto.aes_128_gcm_auth_tag
+        ~key:"\xbe\x0c\x69\x0b\x9f\x66\x57\x5a\x1d\x76\x6b\x54\xe3\x68\xc8\x4e"
+        ~nonce
+        ~adata:(Cstruct.to_string pseudo)
 end
 
 type encdec =

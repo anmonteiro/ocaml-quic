@@ -31,6 +31,7 @@
  *---------------------------------------------------------------------------*)
 
 module Config = Config
+module Crypto = Crypto
 module Direction = Direction
 module Transport = Transport
 module IOVec = IOVec

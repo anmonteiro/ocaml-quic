@@ -7,6 +7,28 @@ module Crypto = Quic.Crypto
 module InitialAEAD = Quic.Crypto.InitialAEAD
 module AEAD = Quic.Crypto.AEAD
 
+let all_backends =
+  [ "legacy", (`Legacy : Crypto.backend)
+  ; "openssl", `OpenSSL
+  ]
+
+let with_backend backend f () =
+  let previous = !(Crypto.backend) in
+  Fun.protect
+    ~finally:(fun () -> Crypto.backend := previous)
+    (fun () ->
+      Crypto.backend := backend;
+      f ())
+
+let against_all_backends suite =
+  List.concat_map
+    (fun (backend_name, backend) ->
+      List.map
+        (fun (name, speed, f) ->
+          (backend_name ^ ": " ^ name, speed, with_backend backend f))
+        suite)
+    all_backends
+
 module Keys = struct
   let test_initial_secret () =
     Alcotest.check
@@ -709,11 +731,11 @@ end
 let () =
   Alcotest.run
     "packets"
-    [ "A.1. Keys", Keys.suite
-    ; "A.2. Client Initial", Client_initial.suite
-    ; "A.3. Server Initial", Server_initial.suite
-    ; "A.4. Retry", Retry.suite
-    ; "A.5. ChaCha20-Poly1305 Short Header Packet", ChaCha.suite
-    ; "Initial AEAD", InitialAEAD_encryption.suite
-    ; "ChaCha20", ChaCha20_encryption.suite
+    [ "A.1. Keys", against_all_backends Keys.suite
+    ; "A.2. Client Initial", against_all_backends Client_initial.suite
+    ; "A.3. Server Initial", against_all_backends Server_initial.suite
+    ; "A.4. Retry", against_all_backends Retry.suite
+    ; "A.5. ChaCha20-Poly1305 Short Header Packet", against_all_backends ChaCha.suite
+    ; "Initial AEAD", against_all_backends InitialAEAD_encryption.suite
+    ; "ChaCha20", against_all_backends ChaCha20_encryption.suite
     ]

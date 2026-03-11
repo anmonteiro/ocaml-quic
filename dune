@@ -1,0 +1,6 @@
+(data_only_dirs ocaml-ssl ocaml-ssl-readfix ocaml-ssl-readfix-verify)
+
+(rule
+ (targets openssl_link_flags.sexp)
+ (action
+  (run ./config/discover.exe)))
