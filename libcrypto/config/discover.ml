@@ -3,6 +3,16 @@ module C = Configurator.V1
 let file_exists path =
   try Sys.file_exists path with _ -> false
 
+let find_map f xs =
+  let rec go = function
+    | [] -> None
+    | x :: xs ->
+      (match f x with
+      | Some _ as y -> y
+      | None -> go xs)
+  in
+  go xs
+
 let lib_paths dir =
   let pick names =
     List.find_map
@@ -14,6 +24,22 @@ let lib_paths dir =
   match pick [ "libssl.dylib"; "libssl.so" ], pick [ "libcrypto.dylib"; "libcrypto.so" ] with
   | Some ssl, Some crypto -> Some [ ssl; crypto ]
   | _ -> None
+
+let normalize_libs c libs =
+  if C.ocaml_config_var_exn c "system" <> "macosx"
+  then libs
+  else
+    let dirs =
+      List.filter_map
+        (fun flag ->
+          if String.starts_with ~prefix:"-L" flag
+          then Some (String.sub flag 2 (String.length flag - 2))
+          else None)
+        libs
+    in
+    match find_map lib_paths dirs with
+    | Some libs -> libs
+    | None -> libs
 
 let default c =
   if C.ocaml_config_var_exn c "system" = "macosx"
@@ -50,7 +76,7 @@ let () =
         | None -> default
         | Some pc ->
           (match C.Pkg_config.query pc ~package:"openssl" with
-          | Some s -> s.libs
+          | Some s -> normalize_libs c s.libs
           | None -> default)
       in
       C.Flags.write_sexp "c_library_flags.sexp" libs;
