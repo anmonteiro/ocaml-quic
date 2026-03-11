@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ocaml-quic Benchmarks</title>
+  <link rel="stylesheet" href="./benchmarks/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+</head>
+<body>
+  <main class="page">
+    <header class="hero">
+      <p class="eyebrow">Continuous Benchmarking</p>
+      <h1>ocaml-quic master performance</h1>
+      <p class="lede">
+        Loopback HTTP/3 benchmarks recorded on every push to <code>master</code>.
+        Results are append-only and published from the <code>gh-pages</code> branch.
+      </p>
+    </header>
+
+    <section class="summary-grid" id="summary-grid">
+      <article class="summary-card">
+        <h2>Latest upload</h2>
+        <p class="metric" id="latest-upload-throughput">-</p>
+        <p class="submetric" id="latest-upload-total">-</p>
+      </article>
+      <article class="summary-card">
+        <h2>Latest download</h2>
+        <p class="metric" id="latest-download-throughput">-</p>
+        <p class="submetric" id="latest-download-total">-</p>
+      </article>
+      <article class="summary-card">
+        <h2>Dataset</h2>
+        <p class="metric" id="dataset-commits">-</p>
+        <p class="submetric" id="dataset-runs">-</p>
+      </article>
+    </section>
+
+    <section class="panel">
+      <div class="panel-header">
+        <h2>Median throughput by commit</h2>
+        <p>Upload and download, measured in MiB/s, for the 1.5GB benchmark run.</p>
+      </div>
+      <canvas id="throughput-chart" height="120"></canvas>
+    </section>
+
+    <section class="panel">
+      <div class="panel-header">
+        <h2>Results table</h2>
+        <p>One row per commit on <code>master</code>, grouped from the append-only benchmark dataset.</p>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Date</th>
+              <th>Commit</th>
+              <th>Upload MiB/s</th>
+              <th>Upload s</th>
+              <th>Download MiB/s</th>
+              <th>Download s</th>
+              <th>Runner</th>
+              <th>Run</th>
+            </tr>
+          </thead>
+          <tbody id="results-body">
+            <tr><td colspan="8">Loading benchmark history...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+  <script src="./benchmarks/app.js"></script>
+</body>
+</html>
