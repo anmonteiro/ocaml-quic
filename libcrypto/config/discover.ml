@@ -1,31 +1,60 @@
 module C = Configurator.V1
 
-let directory_exists fsp = Sys.file_exists fsp && Sys.is_directory fsp
+let file_exists path =
+  try Sys.file_exists path with _ -> false
 
-let default c : C.Pkg_config.package_conf =
+let lib_paths dir =
+  let pick names =
+    List.find_map
+      (fun name ->
+        let path = Filename.concat dir name in
+        if file_exists path then Some path else None)
+      names
+  in
+  match pick [ "libssl.dylib"; "libssl.so" ], pick [ "libcrypto.dylib"; "libcrypto.so" ] with
+  | Some ssl, Some crypto -> Some [ ssl; crypto ]
+  | _ -> None
+
+let default c =
   if C.ocaml_config_var_exn c "system" = "macosx"
   then
-    if directory_exists "/usr/local/opt/openssl"
+    let dir = "/usr/local/opt/openssl/lib" in
+    (match lib_paths dir with
+    | Some libs -> libs
+    | None -> [ "-lssl"; "-lcrypto" ])
+  else [ "-lssl"; "-lcrypto" ]
+
+let cflags_default c : C.Pkg_config.package_conf =
+  if C.ocaml_config_var_exn c "system" = "macosx"
+  then
+    if Sys.file_exists "/usr/local/opt/openssl/include"
     then
-      { libs = [ "-L/usr/local/opt/openssl/lib"; "-lcrypto" ]
-      ; cflags = [ "-I/usr/local/opt/openssl/include" ]
-      }
-    else { libs = [ "-lcrypto" ]; cflags = [] }
-  else { libs = [ "-lcrypto" ]; cflags = [] }
+      { libs = []; cflags = [ "-I/usr/local/opt/openssl/include" ] }
+    else { libs = []; cflags = [] }
+  else { libs = []; cflags = [] }
+
+let cflags c =
+  let default = cflags_default c in
+  match C.Pkg_config.get c with
+  | None -> default.cflags
+  | Some pc ->
+    (match C.Pkg_config.query pc ~package:"openssl" with
+    | Some s -> s.cflags
+    | None -> default.cflags)
 
 let () =
   C.main ~name:"quic-openssl-crypto" (fun c ->
       let default = default c in
-      let conf =
+      let libs =
         match C.Pkg_config.get c with
         | None -> default
         | Some pc ->
           (match C.Pkg_config.query pc ~package:"openssl" with
-          | Some s ->
-            { libs = List.filter (fun flag -> flag <> "-lssl") s.libs
-            ; cflags = s.cflags
-            }
+          | Some s -> s.libs
           | None -> default)
       in
-      C.Flags.write_sexp "c_library_flags.sexp" conf.libs;
-      C.Flags.write_sexp "c_flags.sexp" conf.cflags)
+      C.Flags.write_sexp "c_library_flags.sexp" libs;
+      C.Flags.write_sexp
+        "link_flags.sexp"
+        (List.concat_map (fun flag -> [ "-cclib"; flag ]) libs);
+      C.Flags.write_sexp "c_flags.sexp" (cflags c))

@@ -2,7 +2,7 @@
  (names test_server test_packet_protection test_parser test_rfc9002 test_flow_control)
  (libraries alcotest hex quic tls mirage-crypto-rng.unix fmt.tty logs.fmt)
  (link_flags
-  (:include ../openssl_link_flags.sexp))
+  (:include ../libcrypto/link_flags.sexp))
  (deps
   (source_tree ../certificates))
  (action
