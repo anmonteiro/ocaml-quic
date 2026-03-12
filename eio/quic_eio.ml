@@ -55,9 +55,24 @@ type should_drop =
 module Addr = struct
   (* type t = Eio.Net.Sockaddr.datagram *)
 
-  let parse (s : string) : Eio.Net.Sockaddr.datagram = Marshal.from_string s 0
+  let parsed = Hashtbl.create 16
+  let last_serialized : (Eio.Net.Sockaddr.datagram * string) option ref = ref None
 
-  let serialize (dgram : Eio.Net.Sockaddr.datagram) = Marshal.to_string dgram []
+  let parse (s : string) : Eio.Net.Sockaddr.datagram =
+    match Hashtbl.find_opt parsed s with
+    | Some addr -> addr
+    | None ->
+      let addr = Marshal.from_string s 0 in
+      Hashtbl.replace parsed s addr;
+      addr
+
+  let serialize (dgram : Eio.Net.Sockaddr.datagram) =
+    match !last_serialized with
+    | Some (cached_addr, serialized) when cached_addr = dgram -> serialized
+    | _ ->
+      let serialized = Marshal.to_string dgram [] in
+      last_serialized := Some (dgram, serialized);
+      serialized
 end
 
 module IO_loop = struct
@@ -181,21 +196,12 @@ module IO_loop = struct
       let lenv =
         List.fold_left (fun acc { Faraday.len; _ } -> acc + len) 0 iovecs
       in
-      let cstruct = Cstruct.create lenv in
-      let _ =
-        List.fold_left
-          (fun pos { Faraday.buffer; off; len } ->
-             Cstruct.blit
-               (Cstruct.of_bigarray ~off ~len buffer)
-               0
-               cstruct
-               pos
-               len;
-             pos + len)
-          0
+      let iovecs =
+        List.map
+          (fun { Faraday.buffer; off; len } -> Cstruct.of_bigarray ~off ~len buffer)
           iovecs
       in
-      match Eio.Net.send dsock ~dst:client_address [ cstruct ] with
+      match Eio.Net.send dsock ~dst:client_address iovecs with
       | () -> `Ok lenv
       | exception End_of_file -> `Closed
   end
