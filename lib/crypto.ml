@@ -341,13 +341,13 @@ module AEAD = struct
    *  # pn_offset is the start of the Packet Number field.
    *  packet[pn_offset:pn_offset+pn_length] ^= mask[1:1+pn_length]
    *)
-  let encrypt_header ~mask header =
+  let apply_header_mask ~mask header =
     let header = Bytes.of_string header in
     let pn_length = packet_number_length header in
     (* From RFC<QUIC-TLS-RFC>§5.4.1:
      *   The output of this algorithm is a 5 byte mask which is applied to the
      *   protected header fields using exclusive OR. *)
-    let mask = String.sub mask 0 5 in
+    let mask = if String.length mask = 5 then mask else String.sub mask 0 5 in
     let masked_bits =
       if is_long header
       then (* Long header: 4 bits masked *)
@@ -451,7 +451,7 @@ module AEAD = struct
        *)
       1 + conn_id_len + 4
 
-  let decrypt_header_in_place ~conn_id_len ~mask header =
+  let remove_header_mask_in_place ~conn_id_len ~mask header =
     (* From RFC<QUIC-TLS-RFC>§5.4.1:
      *   The output of this algorithm is a 5 byte mask which is applied to the
      *   protected header fields using exclusive OR. *)
@@ -537,12 +537,12 @@ module AEAD = struct
       encrypt_or_decrypt_header_ecb t f
     | CHACHA20_POLY1305 -> encrypt_or_decrypt_header_chacha20 t f
 
-  let encrypt_header t = encrypt_or_decrypt_header t encrypt_header
+  let encrypt_header t = encrypt_or_decrypt_header t apply_header_mask
 
   let decrypt_header_in_place t =
     encrypt_or_decrypt_header
       t
-      (decrypt_header_in_place ~conn_id_len:t.conn_id_len)
+      (remove_header_mask_in_place ~conn_id_len:t.conn_id_len)
 
   let encrypt_packet_parts t ~packet_number ~header data =
     let sealed_payload = encrypt_payload_into t ~packet_number ~header data in
