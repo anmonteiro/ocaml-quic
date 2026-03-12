@@ -73,6 +73,7 @@ type t =
   ; error_handler : error_handler
   ; qpack_encoder : Qpack.Encoder.t
   ; qpack_decoder : Qdecoder.t
+  ; start_stream : Quic.Transport.start_stream
   }
 
 let qpack_decompression_failed = 0x200
@@ -203,6 +204,36 @@ let process_settings_frame t stream settings =
 
 let process_goaway_frame _t _id = ()
 
+let register_peer_control_stream t stream =
+  match t.critical_streams.peer_control with
+  | None ->
+    t.critical_streams.peer_control <- Some stream;
+    true
+  | Some existing when Stream.id existing.stream = Stream.id stream.stream -> true
+  | Some _ ->
+    close_with_h3_error stream Error.Code.Stream_creation_error;
+    false
+
+let register_peer_qencoder_stream t stream =
+  match t.critical_streams.peer_qencoder with
+  | None ->
+    t.critical_streams.peer_qencoder <- Some stream.stream;
+    true
+  | Some existing when Stream.id existing = Stream.id stream.stream -> true
+  | Some _ ->
+    close_with_h3_error stream Error.Code.Stream_creation_error;
+    false
+
+let register_peer_qdecoder_stream t stream =
+  match t.critical_streams.peer_qdecoder with
+  | None ->
+    t.critical_streams.peer_qdecoder <- Some stream.stream;
+    true
+  | Some existing when Stream.id existing = Stream.id stream.stream -> true
+  | Some _ ->
+    close_with_h3_error stream Error.Code.Stream_creation_error;
+    false
+
 let is_peer_critical_stream t stream_id =
   let is_control =
     match t.critical_streams.peer_control with
@@ -296,37 +327,40 @@ let start_unidirectional_stream ~start_stream typ =
   control_stream
 
 let unistream_frame_handler t (stream : stream) unitype =
-  (* TODO: check that these are only called once. The client shouldn't open more
-     than one of these streams. *)
   let open Angstrom in
   match unitype with
   | Unidirectional_stream.Qencoder ->
-    t.critical_streams.peer_qencoder <- Some stream.stream;
-    let f = Stream.unsafe_faraday stream.stream in
-    Qdecoder.parse_instructions t.qpack_decoder f >>| ( function
-     | Ok () -> Ok ()
-     | Error qpack_error ->
-       close_with_qpack_error stream qpack_error;
-       Ok () )
+    if register_peer_qencoder_stream t stream
+    then
+      let f = Stream.unsafe_faraday stream.stream in
+      Qdecoder.parse_instructions t.qpack_decoder f >>| ( function
+       | Ok () -> Ok ()
+       | Error qpack_error ->
+         close_with_qpack_error stream qpack_error;
+         Ok () )
+    else Reader.ignored_stream
   | Qdecoder ->
-    t.critical_streams.peer_qdecoder <- Some stream.stream;
-    let rec parse_qdecoder_stream () =
-      peek_char >>= function
-      | None -> return (Ok ())
-      | Some _ ->
-        Qpack.Encoder.Instruction.parser t.qpack_encoder >>= ( function
-         | Ok (Qpack.Encoder.Instruction.Insert_count_increment 0) ->
-           close_connection stream qpack_decoder_stream_error;
-           return (Ok ())
-         | Ok _ -> parse_qdecoder_stream ()
-         | Error _ ->
-           close_connection stream qpack_decoder_stream_error;
-           return (Ok ()) )
-    in
-    parse_qdecoder_stream ()
+    if register_peer_qdecoder_stream t stream
+    then
+      let rec parse_qdecoder_stream () =
+        peek_char >>= function
+        | None -> return (Ok ())
+        | Some _ ->
+          Qpack.Encoder.Instruction.parser t.qpack_encoder >>= ( function
+           | Ok (Qpack.Encoder.Instruction.Insert_count_increment 0) ->
+             close_connection stream qpack_decoder_stream_error;
+             return (Ok ())
+           | Ok _ -> parse_qdecoder_stream ()
+           | Error _ ->
+             close_connection stream qpack_decoder_stream_error;
+             return (Ok ()) )
+      in
+      parse_qdecoder_stream ()
+    else Reader.ignored_stream
   | Control ->
-    t.critical_streams.peer_control <- Some stream;
-    Reader.http3_frames (frame_handler t stream)
+    if register_peer_control_stream t stream
+    then Reader.http3_frames (frame_handler t stream)
+    else Reader.ignored_stream
   | Push _ ->
     (* Client shouldn't send push frames. *)
     assert false
@@ -338,8 +372,7 @@ let unistream_frame_handler t (stream : stream) unitype =
      *   when application-layer padding is desired. *)
     Reader.ignored_stream
 
-(* ?(config = Config.default) *)
-let create
+let create_connection
       ?(error_handler = default_error_handler)
       request_handler
       ~cid:_
@@ -354,6 +387,7 @@ let create
     ; error_handler
     ; qpack_encoder = Qpack.Encoder.create 0
     ; qpack_decoder = Qdecoder.create ~max_size:0 ~max_blocked_streams:100
+    ; start_stream
     ; critical_streams =
         { control = start_unidirectional_stream ~start_stream Control
         ; peer_control = None
@@ -369,8 +403,8 @@ let create
    *   the connection and send its SETTINGS frame as the first frame on this
    *   stream. *)
   Writer.write_settings t.critical_streams.control.writer Settings.default;
-
-  Quic.Transport.F
+  ( t
+  , Quic.Transport.F
     (fun quic_stream ->
       let id = Stream.id quic_stream in
       let direction = Stream.direction quic_stream in
@@ -396,4 +430,11 @@ let create
         ~on_eof:(read_eof t stream ~reader)
         ~on_read:(read t stream ~reader);
       Hashtbl.add t.streams id stream;
-      { Quic.Transport.on_error = ignore })
+      { Quic.Transport.on_error = ignore }) )
+
+(* ?(config = Config.default) *)
+let create ?error_handler request_handler ~cid ~start_stream =
+  let _t, handler =
+    create_connection ?error_handler request_handler ~cid ~start_stream
+  in
+  handler

@@ -43,6 +43,10 @@ let copy_iovecs_to_bigstring iovecs =
     iovecs;
   bs
 
+let to_public_stream (stream : Quic__Stream.t) : Quic.Stream.t = Obj.magic stream
+let to_public_client_connection (conn : H3__Client_connection.t) : H3.Client_connection.t = Obj.magic conn
+let to_public_reqd (reqd : H3__Reqd.t) : H3.Reqd.t = Obj.magic reqd
+
 let pump_write ~src ~dst ~client_address =
   match Transport.next_write_operation src with
   | `Writev (iovecs, _peer_address, cid) ->
@@ -89,16 +93,24 @@ let create_stack ~server_request_handler =
   let now = ref 0L in
   let now_ms () = !now in
   let client_conn = ref None in
+  let server_conn = ref None in
   let server =
     Transport.Server.create
       ~now_ms
       ~config
       (fun ~cid ~start_stream ->
-        H3.Server_connection.create server_request_handler ~cid ~start_stream)
+        let conn, handler =
+          H3__Server_connection.create_connection
+            (fun reqd -> server_request_handler (to_public_reqd reqd))
+            ~cid
+            ~start_stream
+        in
+        server_conn := Some conn;
+        handler)
   in
   let client_stream_handler ~cid ~start_stream =
     let conn, handler =
-      H3.Client_connection.create
+      H3__Client_connection.create
         ~error_handler:(fun _ -> Alcotest.fail "unexpected client H3 error")
         ~cid
         ~start_stream
@@ -108,7 +120,52 @@ let create_stack ~server_request_handler =
   in
   let client = Transport.Client.create ~now_ms ~config client_stream_handler in
   Transport.connect client ~address:"server-address" ~host:"localhost" client_stream_handler;
-  now, client, server, client_conn
+  now, client, server, client_conn, server_conn
+
+let make_start_stream side =
+  let next = ref 0L in
+  fun ?error_handler:_ direction ->
+    let direction' =
+      match direction with
+      | Quic.Direction.Unidirectional -> Quic__.Direction.Unidirectional
+      | Bidirectional -> Quic__.Direction.Bidirectional
+    in
+    let typ =
+      match side with
+      | `Client -> Quic__Stream.Type.Client direction'
+      | `Server -> Quic__Stream.Type.Server direction'
+    in
+    let id = Quic__Stream.Type.gen_id ~typ !next in
+    next := Int64.succ !next;
+    Quic__Stream.create ~typ ~id ~report_application_error:ignore ignore
+    |> to_public_stream
+
+let make_peer_quic_stream side ~id app_errors =
+  let typ =
+    match side with
+    | `Client -> Quic__Stream.Type.Client Quic__.Direction.Unidirectional
+    | `Server -> Quic__Stream.Type.Server Quic__.Direction.Unidirectional
+  in
+  Quic__Stream.create
+    ~typ
+    ~id
+    ~report_application_error:(fun code -> app_errors := code :: !app_errors)
+    ignore
+  |> to_public_stream
+
+let make_client_h3_stream stream : H3__Client_connection.stream =
+  { stream
+  ; direction = Quic.Direction.Unidirectional
+  ; writer = H3__Serialize.Writer.create stream
+  ; state = H3__Client_connection.Uninitialized
+  }
+
+let make_server_h3_stream stream : H3__Server_connection.stream =
+  { stream
+  ; direction = Quic.Direction.Unidirectional
+  ; reqd = None
+  ; writer = H3__Serialize.Writer.create stream
+  }
 
 let test_unknown_unidirectional_stream_type_is_ignored () =
   let payload = Bigstringaf.of_string ~off:0 ~len:1 "\x09" in
@@ -122,6 +179,60 @@ let test_unknown_unidirectional_stream_type_is_ignored () =
   | Ok _ -> Alcotest.fail "expected parser to preserve unknown stream type"
   | Error err ->
     Alcotest.failf "expected unknown stream type to parse cleanly: %s" err
+
+let test_client_rejects_duplicate_critical_streams () =
+  let conn, _handler =
+    H3__Client_connection.create
+      ~error_handler:(fun _ -> Alcotest.fail "unexpected client H3 error")
+      ~cid:"client-test"
+      ~start_stream:(make_start_stream `Client)
+  in
+  let app_errors = ref [] in
+  let first =
+    make_peer_quic_stream `Server ~id:3L app_errors |> make_client_h3_stream
+  in
+  let second =
+    make_peer_quic_stream `Server ~id:7L app_errors |> make_client_h3_stream
+  in
+  Alcotest.(check bool)
+    "first peer control stream is accepted"
+    true
+    (H3__Client_connection.register_peer_control_stream conn first);
+  Alcotest.(check bool)
+    "duplicate peer control stream is rejected"
+    false
+    (H3__Client_connection.register_peer_control_stream conn second);
+  Alcotest.(check (list int))
+    "duplicate control stream closes the connection"
+    [ H3__Error.Code.serialize H3__Error.Code.Stream_creation_error ]
+    (List.rev !app_errors)
+
+let test_server_rejects_duplicate_critical_streams () =
+  let conn, _handler =
+    H3__Server_connection.create_connection
+      (fun _reqd -> Alcotest.fail "unexpected request")
+      ~cid:"server-test"
+      ~start_stream:(make_start_stream `Server)
+  in
+  let app_errors = ref [] in
+  let first =
+    make_peer_quic_stream `Client ~id:2L app_errors |> make_server_h3_stream
+  in
+  let second =
+    make_peer_quic_stream `Client ~id:6L app_errors |> make_server_h3_stream
+  in
+  Alcotest.(check bool)
+    "first peer control stream is accepted"
+    true
+    (H3__Server_connection.register_peer_control_stream conn first);
+  Alcotest.(check bool)
+    "duplicate peer control stream is rejected"
+    false
+    (H3__Server_connection.register_peer_control_stream conn second);
+  Alcotest.(check (list int))
+    "duplicate control stream closes the connection"
+    [ H3__Error.Code.serialize H3__Error.Code.Stream_creation_error ]
+    (List.rev !app_errors)
 
 let test_buffered_request_body_delivery () =
   let request_payload = String.init (256 * 1024) (fun i -> Char.chr (97 + (i mod 26))) in
@@ -141,12 +252,12 @@ let test_buffered_request_body_delivery () =
         client_response := Some (Buffer.contents response_buf);
         client_done := true)
   in
-  let now, client, server, client_conn = create_stack ~server_request_handler in
+  let now, client, server, client_conn, _server_conn = create_stack ~server_request_handler in
   let got_conn =
     run_until ~now ~client ~server ~max_steps:20_000 (fun () -> Option.is_some !client_conn)
   in
   Alcotest.(check bool) "client connection established" true got_conn;
-  let conn = Option.get !client_conn in
+  let conn = Option.get !client_conn |> to_public_client_connection in
   let headers =
     Headers.of_list
       [ ":authority", "localhost"
@@ -218,12 +329,12 @@ let test_buffered_response_body_delivery () =
     Alcotest.(check int) "response status" 200 (Status.to_code status);
     pending_response_body := Some response_body
   in
-  let now, client, server, client_conn = create_stack ~server_request_handler in
+  let now, client, server, client_conn, _server_conn = create_stack ~server_request_handler in
   let got_conn =
     run_until ~now ~client ~server ~max_steps:20_000 (fun () -> Option.is_some !client_conn)
   in
   Alcotest.(check bool) "client connection established" true got_conn;
-  let conn = Option.get !client_conn in
+  let conn = Option.get !client_conn |> to_public_client_connection in
   let request =
     Request.create
       ~scheme:"https"
@@ -273,12 +384,12 @@ let test_bigstring_response_body_write () =
     Alcotest.(check int) "response status" 200 (Status.to_code status);
     pending_response_body := Some response_body
   in
-  let now, client, server, client_conn = create_stack ~server_request_handler in
+  let now, client, server, client_conn, _server_conn = create_stack ~server_request_handler in
   let got_conn =
     run_until ~now ~client ~server ~max_steps:20_000 (fun () -> Option.is_some !client_conn)
   in
   Alcotest.(check bool) "client connection established" true got_conn;
-  let conn = Option.get !client_conn in
+  let conn = Option.get !client_conn |> to_public_client_connection in
   let request =
     Request.create
       ~scheme:"https"
@@ -318,6 +429,8 @@ let () =
     "h3-body"
     [ ( "body"
       , [ "unknown unidirectional stream type", `Quick, test_unknown_unidirectional_stream_type_is_ignored
+        ; "client duplicate critical stream", `Quick, test_client_rejects_duplicate_critical_streams
+        ; "server duplicate critical stream", `Quick, test_server_rejects_duplicate_critical_streams
         ; "buffered request body delivery", `Quick, test_buffered_request_body_delivery
         ; "buffered response body delivery", `Quick, test_buffered_response_body_delivery
         ; "bigstring response body write", `Quick, test_bigstring_response_body_write

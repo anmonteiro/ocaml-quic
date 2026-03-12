@@ -64,7 +64,9 @@ type critical_streams =
   { mutable control : stream option
   ; mutable peer_control : stream option
   ; mutable qencoder : Stream.t option
+  ; mutable peer_qencoder : Stream.t option
   ; mutable qdecoder : Stream.t option
+  ; mutable peer_qdecoder : Stream.t option
   }
 
 type t =
@@ -79,6 +81,9 @@ type t =
   ; qpack_decoder : Qdecoder.t
   ; start_stream : Quic.Transport.start_stream
   }
+
+let close_with_h3_error stream code =
+  Quic.Stream.report_application_error stream.stream (Error.Code.serialize code)
 
 let handle_headers _t stream headers =
   (* let stream_id = Stream.id stream in *)
@@ -157,6 +162,36 @@ let process_settings_frame t stream _settings_list =
 
 let process_goaway_frame _t _id = failwith "NYI: goaway"
 
+let register_peer_control_stream t stream =
+  match t.critical_streams.peer_control with
+  | None ->
+    t.critical_streams.peer_control <- Some stream;
+    true
+  | Some existing when Stream.id existing.stream = Stream.id stream.stream -> true
+  | Some _ ->
+    close_with_h3_error stream Error.Code.Stream_creation_error;
+    false
+
+let register_peer_qencoder_stream t stream =
+  match t.critical_streams.peer_qencoder with
+  | None ->
+    t.critical_streams.peer_qencoder <- Some stream.stream;
+    true
+  | Some existing when Stream.id existing = Stream.id stream.stream -> true
+  | Some _ ->
+    close_with_h3_error stream Error.Code.Stream_creation_error;
+    false
+
+let register_peer_qdecoder_stream t stream =
+  match t.critical_streams.peer_qdecoder with
+  | None ->
+    t.critical_streams.peer_qdecoder <- Some stream.stream;
+    true
+  | Some existing when Stream.id existing = Stream.id stream.stream -> true
+  | Some _ ->
+    close_with_h3_error stream Error.Code.Stream_creation_error;
+    false
+
 let read_eof _t stream ~reader () =
   Reader.read_with_more reader Bigstringaf.empty Complete;
   match stream.state with
@@ -224,28 +259,33 @@ let start_control_stream ~start_stream =
   control_stream
 
 let unistream_frame_handler t (stream : stream) unitype =
-  (* TODO: check that these are only called once. The client shouldn't open more
-     than one of these streams. *)
   let open Angstrom in
   match unitype with
   | Unidirectional_stream.Qencoder ->
-    let f = Faraday.create 0x100 in
-    (Qdecoder.parse_instructions t.qpack_decoder f >>| function
-     | Ok () -> Ok ()
-     | Error _ -> Ok ())
+    if register_peer_qencoder_stream t stream
+    then
+      let f = Faraday.create 0x100 in
+      (Qdecoder.parse_instructions t.qpack_decoder f >>| function
+       | Ok () -> Ok ()
+       | Error _ -> Ok ())
+    else Reader.ignored_stream
   | Qdecoder ->
-    let rec parse_qdecoder_stream () =
-      peek_char >>= function
-      | None -> return (Ok ())
-      | Some _ ->
-        Qpack.Encoder.Instruction.parser t.qpack_encoder >>= function
-        | Ok _ -> parse_qdecoder_stream ()
-        | Error _ -> return (Ok ())
-    in
-    parse_qdecoder_stream ()
+    if register_peer_qdecoder_stream t stream
+    then
+      let rec parse_qdecoder_stream () =
+        peek_char >>= function
+        | None -> return (Ok ())
+        | Some _ ->
+          Qpack.Encoder.Instruction.parser t.qpack_encoder >>= function
+          | Ok _ -> parse_qdecoder_stream ()
+          | Error _ -> return (Ok ())
+      in
+      parse_qdecoder_stream ()
+    else Reader.ignored_stream
   | Control ->
-    t.critical_streams.peer_control <- Some stream;
-    Reader.http3_frames (frame_handler t stream)
+    if register_peer_control_stream t stream
+    then Reader.http3_frames (frame_handler t stream)
+    else Reader.ignored_stream
   | Push _ ->
     (* Client shouldn't send push frames. *)
     assert false
@@ -275,7 +315,9 @@ let create ~error_handler ~cid:_ ~(start_stream : Quic.Transport.start_stream) =
         { control = Some (start_control_stream ~start_stream)
         ; peer_control = None
         ; qencoder = Some (start_unidirectional_stream ~start_stream Qencoder)
+        ; peer_qencoder = None
         ; qdecoder = Some (start_unidirectional_stream ~start_stream Qdecoder)
+        ; peer_qdecoder = None
         }
     ; start_stream : Quic.Transport.start_stream
     }
