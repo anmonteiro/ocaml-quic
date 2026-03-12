@@ -1448,8 +1448,7 @@ module Connection = struct
         ~stream_highest:prev_stream_highest
         ~sent_data_bytes:t.sent_data_bytes
     let flush t streams =
-      let rec inner acc = function
-        | Seq.Cons ((encryption_level, stream_type, stream), xs) ->
+      let process_stream acc encryption_level stream_type stream =
           (match t.mode, stream.Stream.typ with
           | Server, Stream.Type.Server Unidirectional
           | Client, Client Unidirectional
@@ -1458,10 +1457,7 @@ module Connection = struct
             let max_flush_bytes =
               match stream_type with
               | `Crypto -> Int.max_int
-              | `Data ->
-                min
-                  (available_send_budget t ~stream_id:stream.id)
-                  app_data_payload_budget
+              | `Data -> available_send_budget t ~stream_id:stream.id
             in
             let _flushed =
               Stream.Send.flush ~max_bytes:max_flush_bytes stream.Stream.send
@@ -1505,18 +1501,16 @@ module Connection = struct
                     ~packet_number
                     ~bytes_sent
                     frames;
-                  let can_be_followed_by_other_packets =
-                    encryption_level <> Application_data
-                  in
-                  if can_be_followed_by_other_packets
-                  then inner Wrote (xs ())
-                  else Wrote_app_data
+                    let can_be_followed_by_other_packets =
+                      encryption_level <> Application_data
+                    in
+                    if can_be_followed_by_other_packets then Wrote else Wrote_app_data
                 | `Data ->
                   let frames, new_stream_highest, new_sent_data_bytes =
                     collect_stream_frames t stream
                   in
                   (match frames with
-                  | [] -> inner acc (xs ())
+                  | [] -> acc
                   | _ ->
                     let bytes_before = writer_pending_bytes t.writer in
                     Writer.write_frames_packet t.writer ~header_info frames;
@@ -1535,31 +1529,24 @@ module Connection = struct
                     let can_be_followed_by_other_packets =
                       encryption_level <> Application_data
                     in
-                    if can_be_followed_by_other_packets
-                    then inner Wrote (xs ())
-                    else Wrote_app_data))
-            else inner acc (xs ())
+                    if can_be_followed_by_other_packets then Wrote else Wrote_app_data))
+            else acc
           | Client, Server Unidirectional | Server, Client Unidirectional ->
             (* Server can't send on unidirectional streams created by the client *)
-            inner acc (xs ()))
-        | Nil -> acc
+            acc)
       in
-      let crypto_streams =
-        Spaces.to_list t.crypto_streams
-        |> List.map (fun (enc_level, stream) -> enc_level, `Crypto, stream)
-        |> List.to_seq
+      let acc = ref Didnt_write in
+      let process encryption_level stream_type stream =
+        if !acc <> Wrote_app_data
+        then acc := process_stream !acc encryption_level stream_type stream
       in
-      let all_streams =
-        let app_streams =
-          Seq.map
-            (fun stream -> Encryption_level.Application_data, `Data, stream)
-            (Hashtbl.to_seq_values streams)
-        in
-        Seq.append crypto_streams app_streams
-      in
-
-      let ret = inner Didnt_write (all_streams ()) in
-      ret
+      process Encryption_level.Initial `Crypto t.crypto_streams.initial;
+      process Handshake `Crypto t.crypto_streams.handshake;
+      process Application_data `Crypto t.crypto_streams.application_data;
+      Hashtbl.iter
+        (fun _ stream -> process Application_data `Data stream)
+        streams;
+      !acc
   end
 end
 

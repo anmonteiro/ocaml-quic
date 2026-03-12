@@ -614,6 +614,97 @@ module InitialAEAD_encryption = struct
       Alcotest.(check int) "packet number length" 1 pn_length
     | None -> Alcotest.fail "expected packet to decrypt successfully"
 
+  let serialize_with writer_fn ~header_info frames =
+    let module Writer = Quic.Serialize.Writer in
+    let writer = Writer.create 0x1000 in
+    writer_fn writer ~header_info frames;
+    Faraday.serialize_to_string writer.encoder
+
+  let test_writer_direct_matches_legacy_ack_initial () =
+    let module Writer = Quic.Serialize.Writer in
+    let encrypter = InitialAEAD.make ~mode:Server (Quic.CID.of_string "abc") in
+    let header_info =
+      Writer.make_header_info
+        ~encrypter
+        ~encryption_level:Initial
+        ~packet_number:1L
+        ~token:""
+        (Quic.CID.of_string "abc")
+    in
+    let frames =
+      [ Quic.Frame.Ack
+          { delay = 0
+          ; ranges = [ { Quic.Frame.Range.first = 1L; last = 1L } ]
+          ; ecn_counts = None
+          }
+      ]
+    in
+    let direct = serialize_with Writer.write_frames_packet ~header_info frames in
+    let legacy =
+      serialize_with Writer.write_frames_packet_legacy ~header_info frames
+    in
+    Alcotest.(check string) "direct matches legacy" legacy direct
+
+  let test_writer_direct_matches_legacy_stream_app_data () =
+    let module Writer = Quic.Serialize.Writer in
+    let encrypter = InitialAEAD.make ~mode:Server (Quic.CID.of_string "abc") in
+    let header_info =
+      Writer.make_header_info
+        ~encrypter
+        ~encryption_level:Application_data
+        ~packet_number:17L
+        ~token:""
+        (Quic.CID.of_string "abcdefgh")
+    in
+    let frames =
+      [ Quic.Frame.Stream
+          { id = 0L
+          ; fragment = { off = 0; len = 5; payload = "hello"; payload_off = 0 }
+          ; is_fin = true
+          }
+      ]
+    in
+    let direct = serialize_with Writer.write_frames_packet ~header_info frames in
+    let legacy =
+      serialize_with Writer.write_frames_packet_legacy ~header_info frames
+    in
+    Alcotest.(check string) "direct matches legacy" legacy direct
+
+  let test_writer_direct_matches_legacy_multi_frame () =
+    let module Writer = Quic.Serialize.Writer in
+    let encrypter = InitialAEAD.make ~mode:Server (Quic.CID.of_string "abc") in
+    let header_info =
+      Writer.make_header_info
+        ~encrypter
+        ~encryption_level:Application_data
+        ~packet_number:23L
+        ~token:""
+        (Quic.CID.of_string "abcdefgh")
+    in
+    let frames =
+      [ Quic.Frame.Ack
+          { delay = 3
+          ; ranges =
+              [ { Quic.Frame.Range.first = 8L; last = 10L }
+              ; { Quic.Frame.Range.first = 4L; last = 5L }
+              ]
+          ; ecn_counts = Some (1, 2, 3)
+          }
+      ; Quic.Frame.Max_data 4096
+      ; Quic.Frame.Stream
+          { id = 4L
+          ; fragment =
+              { off = 1024; len = 11; payload = "hello world"; payload_off = 0 }
+          ; is_fin = false
+          }
+      ]
+    in
+    let direct = serialize_with Writer.write_frames_packet ~header_info frames in
+    let legacy =
+      serialize_with Writer.write_frames_packet_legacy ~header_info frames
+    in
+    Alcotest.(check string) "direct matches legacy" legacy direct
+
   let suite =
     [ ( "header encryption / decryption"
       , `Quick
@@ -626,6 +717,15 @@ module InitialAEAD_encryption = struct
       , test_server_initial_aead_packet_encryption_decryption )
     ; "ocaml-quic generated", `Quick, test_ocaml_quic_enc_dec
     ; "ocaml-quic serialized", `Quick, test_ocaml_quic_decrypt_serialized
+    ; ( "writer direct matches legacy ack initial"
+      , `Quick
+      , test_writer_direct_matches_legacy_ack_initial )
+    ; ( "writer direct matches legacy stream app data"
+      , `Quick
+      , test_writer_direct_matches_legacy_stream_app_data )
+    ; ( "writer direct matches legacy multi frame"
+      , `Quick
+      , test_writer_direct_matches_legacy_multi_frame )
     ]
 end
 
