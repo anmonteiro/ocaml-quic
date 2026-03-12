@@ -36,6 +36,7 @@ type t =
   | Qdecoder
   | Push of int
   | Ignored of int
+  | Unknown of int
 
 let serialize = function
   | Control ->
@@ -48,3 +49,5 @@ let serialize = function
     0x03
   | Ignored n ->
     Settings.Type.unknown n
+  | Unknown x ->
+    x

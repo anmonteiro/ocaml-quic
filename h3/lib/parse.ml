@@ -178,7 +178,11 @@ let unidirectional_stream_header =
      *   types be ignored. These streams have no semantics, and can be sent
      *   when application-layer padding is desired. *)
     return (Unidirectional_stream.Ignored (Settings.Type.unknown_n x))
-  | _ -> failwith "unknown"
+  | x ->
+    (* From RFC9114§6.2:
+     *   Implementations MUST either abort reading of or discard incoming data
+     *   on unidirectional streams that have unknown types. *)
+    return (Unidirectional_stream.Unknown x)
 
 module Reader = struct
   module AB = Angstrom.Buffered
