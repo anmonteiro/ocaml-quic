@@ -202,6 +202,8 @@ module AEAD = struct
     { cipher : Libcrypto.cipher
     ; key : string
     ; tag_len : int
+    ; enc_ctx : Libcrypto.aead_ctx option
+    ; dec_ctx : Libcrypto.aead_ctx option
     }
 
   type cipher_st =
@@ -241,13 +243,22 @@ module AEAD = struct
            * header, up to and including the unprotected packet number. *)
         ~adata:header
         data
-    | OpenSSL { cipher; key; _ } ->
-      Libcrypto.aead_encrypt
-        cipher
-        ~key
-        ~nonce
-        ~adata:header
-        ~plaintext:data
+    | OpenSSL { cipher; key; enc_ctx; _ } ->
+      (match enc_ctx with
+       | Some ctx ->
+         Libcrypto.aead_encrypt_with_ctx_pn
+           ctx
+           ~iv:t.iv
+           ~packet_number
+           ~adata:header
+           ~plaintext:data
+       | None ->
+         Libcrypto.aead_encrypt
+           cipher
+           ~key
+           ~nonce
+           ~adata:header
+           ~plaintext:data)
 
   let encrypt_payload_into t ~packet_number ~header data =
     let nonce = Tls.Crypto.aead_nonce t.iv packet_number in
@@ -267,14 +278,23 @@ module AEAD = struct
         ~tag_off:len
         len;
       dst
-    | OpenSSL { cipher; key; _ } ->
+    | OpenSSL { cipher; key; enc_ctx; _ } ->
       Bytes.unsafe_of_string
-        (Libcrypto.aead_encrypt
-           cipher
-           ~key
-           ~nonce
-           ~adata:header
-           ~plaintext:data)
+        (match enc_ctx with
+         | Some ctx ->
+           Libcrypto.aead_encrypt_with_ctx_pn
+             ctx
+             ~iv:t.iv
+             ~packet_number
+             ~adata:header
+             ~plaintext:data
+         | None ->
+           Libcrypto.aead_encrypt
+             cipher
+             ~key
+             ~nonce
+             ~adata:header
+             ~plaintext:data)
 
   let decrypt_payload t ~packet_number ~header ciphertext =
     (* From RFC<QUIC-TLS-RFC>§5.3:
@@ -296,8 +316,17 @@ module AEAD = struct
            * header, up to and including the unprotected packet number. *)
         ~adata:header
         ciphertext
-    | OpenSSL { cipher; key; _ } ->
-      Libcrypto.aead_decrypt cipher ~key ~nonce ~adata:header ~ciphertext
+    | OpenSSL { cipher; key; dec_ctx; _ } ->
+      (match dec_ctx with
+       | Some ctx ->
+         Libcrypto.aead_decrypt_with_ctx_pn
+           ctx
+           ~iv:t.iv
+           ~packet_number
+           ~adata:header
+           ~ciphertext
+       | None ->
+         Libcrypto.aead_decrypt cipher ~key ~nonce ~adata:header ~ciphertext)
 
   let decrypt_payload_into t ~packet_number ~header ciphertext =
     let nonce = Tls.Crypto.aead_nonce t.iv packet_number in
@@ -323,8 +352,17 @@ module AEAD = struct
             payload_len
         in
         if ok then Some (Bytes.unsafe_to_string dst) else None)
-    | OpenSSL { cipher; key; _ } ->
-      Libcrypto.aead_decrypt cipher ~key ~nonce ~adata:header ~ciphertext
+    | OpenSSL { cipher; key; dec_ctx; _ } ->
+      (match dec_ctx with
+       | Some ctx ->
+         Libcrypto.aead_decrypt_with_ctx_pn
+           ctx
+           ~iv:t.iv
+           ~packet_number
+           ~adata:header
+           ~ciphertext
+       | None ->
+         Libcrypto.aead_decrypt cipher ~key ~nonce ~adata:header ~ciphertext)
 
   (* mutates [header] *)
   (*
@@ -488,16 +526,33 @@ module AEAD = struct
 
   module AES_ECB = Mirage_crypto.AES.ECB
 
-  let encrypt_or_decrypt_header_ecb t f ~sample header =
-    let mask =
-      match !backend with
-      | `Legacy ->
+  let encrypt_header_ecb t ~sample header =
+    match !backend with
+    | `Legacy ->
+      let mask =
         (* From RFC<QUIC-TLS-RFC>§5.4.3:
          *   mask = AES-ECB(hp_key, sample) *)
         AES_ECB.encrypt ~key:(AES_ECB.of_secret t.hp_key) sample
-      | `OpenSSL -> Libcrypto.hp_mask_aes_ecb ~key:t.hp_key ~sample
-    in
-    f ~mask header
+      in
+      apply_header_mask ~mask header
+    | `OpenSSL -> Libcrypto.hp_encrypt_header_aes_ecb ~key:t.hp_key ~sample ~header
+
+  let decrypt_header_ecb_in_place t ~sample ciphertext =
+    match !backend with
+    | `Legacy ->
+      let mask =
+        (* From RFC<QUIC-TLS-RFC>§5.4.3:
+         *   mask = AES-ECB(hp_key, sample) *)
+        AES_ECB.encrypt ~key:(AES_ECB.of_secret t.hp_key) sample
+      in
+      remove_header_mask_in_place ~conn_id_len:t.conn_id_len ~mask ciphertext
+    | `OpenSSL ->
+      let pn_offset = sample_offset ~conn_id_len:t.conn_id_len ciphertext - 4 in
+      Libcrypto.hp_decrypt_header_aes_ecb
+        ~key:t.hp_key
+        ~sample
+        ~pn_offset
+        ~ciphertext
 
   let encrypt_or_decrypt_header_chacha20 t f ~sample header =
     let mask =
@@ -531,18 +586,23 @@ module AEAD = struct
     in
     f ~mask header
 
-  let encrypt_or_decrypt_header t f =
+  let encrypt_header t ~sample header =
     match t.ciphersuite with
     | Tls.Ciphersuite.AES_128_GCM | AES_256_GCM | AES_128_CCM | AES_256_CCM ->
-      encrypt_or_decrypt_header_ecb t f
-    | CHACHA20_POLY1305 -> encrypt_or_decrypt_header_chacha20 t f
+      encrypt_header_ecb t ~sample header
+    | CHACHA20_POLY1305 ->
+      encrypt_or_decrypt_header_chacha20 t apply_header_mask ~sample header
 
-  let encrypt_header t = encrypt_or_decrypt_header t apply_header_mask
-
-  let decrypt_header_in_place t =
-    encrypt_or_decrypt_header
-      t
-      (remove_header_mask_in_place ~conn_id_len:t.conn_id_len)
+  let decrypt_header_in_place t ~sample ciphertext =
+    match t.ciphersuite with
+    | Tls.Ciphersuite.AES_128_GCM | AES_256_GCM | AES_128_CCM | AES_256_CCM ->
+      decrypt_header_ecb_in_place t ~sample ciphertext
+    | CHACHA20_POLY1305 ->
+      encrypt_or_decrypt_header_chacha20
+        t
+        (remove_header_mask_in_place ~conn_id_len:t.conn_id_len)
+        ~sample
+        ciphertext
 
   let encrypt_packet_parts t ~packet_number ~header data =
     let sealed_payload = encrypt_payload_into t ~packet_number ~header data in
@@ -663,17 +723,36 @@ module AEAD = struct
     let hash = Tls.Ciphersuite.hash13 ciphersuite in
     let kn, ivn = Tls.Ciphersuite.kn_13 ciphersuite13 in
     let key, iv = Kdf.get_key_and_iv ~hash ~kn ~ivn secret in
+    let hp_key = Kdf.get_header_protection_key ~hash ~kn secret in
+    let use_ctx =
+      match ciphersuite13 with
+      | Tls.Ciphersuite.AES_128_GCM | AES_256_GCM | CHACHA20_POLY1305 -> true
+      | _ -> false
+    in
     let cipher =
       match !backend with
       | `Legacy -> Legacy (get_legacy_cipher_st ciphersuite13 key)
       | `OpenSSL ->
-        OpenSSL { cipher = openssl_cipher ciphersuite13; key; tag_len = 16 }
+        let cipher = openssl_cipher ciphersuite13 in
+        OpenSSL
+          { cipher
+          ; key
+          ; tag_len = 16
+          ; enc_ctx =
+              (if use_ctx
+               then Some (Libcrypto.aead_encrypt_ctx cipher ~key ~nonce_len:ivn)
+               else None)
+          ; dec_ctx =
+              (if use_ctx
+               then Some (Libcrypto.aead_decrypt_ctx cipher ~key ~nonce_len:ivn)
+               else None)
+          }
     in
     { conn_id_len = CID.src_length
     ; cipher
     ; ciphersuite = ciphersuite13
     ; iv
-    ; hp_key = Kdf.get_header_protection_key ~hash ~kn secret
+    ; hp_key
     }
 end
 
