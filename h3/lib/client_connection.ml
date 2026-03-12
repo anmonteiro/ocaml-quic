@@ -74,6 +74,7 @@ type t =
         (* ; writer : Writer.t *)
         (* ; config : Config.t *)
   ; mutable saw_control_settings : bool
+  ; mutable peer_goaway : int option
   ; critical_streams : critical_streams
   ; streams : (Quic.Stream_id.t, stream) Hashtbl.t
   ; error_handler : error_handler
@@ -160,7 +161,16 @@ let process_settings_frame t stream _settings_list =
      *   H3_FRAME_UNEXPECTED. *)
     failwith "TODO: report error"
 
-let process_goaway_frame _t _id = failwith "NYI: goaway"
+let is_client_initiated_bidirectional_stream_id id = id >= 0 && id land 0x3 = 0
+
+let process_goaway_frame t stream id =
+  if not (is_client_initiated_bidirectional_stream_id id)
+  then close_with_h3_error stream Error.Code.Id_error
+  else
+    match t.peer_goaway with
+    | None -> t.peer_goaway <- Some id
+    | Some previous when id <= previous -> t.peer_goaway <- Some id
+    | Some _ -> close_with_h3_error stream Error.Code.Id_error
 
 let register_peer_control_stream t stream =
   match t.critical_streams.peer_control with
@@ -239,7 +249,7 @@ let frame_handler t (stream : stream) frame =
   | Push_promise _ -> assert false
   | Cancel_push _ -> ()
   | Max_push_id _ -> ()
-  | GoAway id -> process_goaway_frame t id
+  | GoAway id -> process_goaway_frame t stream id
   | Ignored _ | Unknown _ -> ()
 
 let start_unidirectional_stream ~start_stream unitype =
@@ -307,6 +317,7 @@ let create ~error_handler ~cid:_ ~(start_stream : Quic.Transport.start_stream) =
   let t =
     { settings (* ; config *)
     ; saw_control_settings = false
+    ; peer_goaway = None
     ; streams = Hashtbl.create ~random:true 1024
     ; error_handler
     ; qpack_encoder = Qpack.Encoder.create 0

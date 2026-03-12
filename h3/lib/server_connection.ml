@@ -67,6 +67,7 @@ type t =
     (* ; writer : Writer.t *)
     (* ; config : Config.t *)
   ; mutable saw_control_settings : bool
+  ; mutable peer_goaway : int option
   ; critical_streams : critical_streams
   ; streams : (Quic.Stream_id.t, stream) Hashtbl.t
   ; request_handler : request_handler
@@ -202,7 +203,11 @@ let process_settings_frame t stream settings =
      *   H3_FRAME_UNEXPECTED. *)
     close_with_h3_error stream Error.Code.Frame_unexpected
 
-let process_goaway_frame _t _id = ()
+let process_goaway_frame t stream id =
+  match t.peer_goaway with
+  | None -> t.peer_goaway <- Some id
+  | Some previous when id <= previous -> t.peer_goaway <- Some id
+  | Some _ -> close_with_h3_error stream Error.Code.Id_error
 
 let register_peer_control_stream t stream =
   match t.critical_streams.peer_control with
@@ -296,7 +301,7 @@ let frame_handler t (stream : stream) frame =
         close_with_h3_error stream Error.Code.Frame_unexpected
       | Push_promise _ | Max_push_id _ ->
         close_with_h3_error stream Error.Code.Frame_unexpected
-      | GoAway id -> process_goaway_frame t id
+      | GoAway id -> process_goaway_frame t stream id
       | Cancel_push _ | Ignored _ | Unknown _ -> ()
   else
     match frame with
@@ -382,6 +387,7 @@ let create_connection
   let t =
     { settings (* ; config *)
     ; saw_control_settings = false
+    ; peer_goaway = None
     ; streams = Hashtbl.create ~random:true 1024
     ; request_handler
     ; error_handler
