@@ -184,6 +184,8 @@ module Connection = struct
     ; local_initial_max_stream_data_uni : int64
     ; local_initial_max_streams_bidi : int64
     ; local_initial_max_streams_uni : int64
+    ; mutable advertised_max_streams_bidi : int64
+    ; mutable advertised_max_streams_uni : int64
     ; mutable max_recv_data : int64
     ; recv_stream_max_data : (Stream_id.t, int64) Hashtbl.t
     ; mutable recv_data_bytes : int64
@@ -191,6 +193,8 @@ module Connection = struct
     ; mutable consumed_data_bytes : int64
     ; recv_stream_consumed_offsets : (Stream_id.t, int64) Hashtbl.t
     ; mutable peer_max_data : int64
+    ; mutable peer_max_streams_bidi : int64
+    ; mutable peer_max_streams_uni : int64
     ; peer_stream_max_data : (Stream_id.t, int64) Hashtbl.t
     ; mutable sent_data_bytes : int64
     ; sent_stream_highest_offsets : (Stream_id.t, int64) Hashtbl.t
@@ -202,6 +206,7 @@ module Connection = struct
     ; start_stream : start_stream
     ; wakeup_writer : unit -> unit
     ; shutdown : t -> unit
+    ; mutable next_bidirectional_stream_id : Stream_id.t
     ; mutable next_unidirectional_stream_id : Stream_id.t
     ; mutable did_send_connection_close : bool
     ; (* TODO: should be retry or initial? *)
@@ -396,12 +401,18 @@ module Connection = struct
       ~frame_type:Frame.Type.Crypto
       (Crypto_error (Tls.Packet.alert_type_to_int alert))
 
+  let nonnegative_int64 n = if n < 0 then 0L else Int64.of_int n
+
   let apply_peer_transport_params t transport_params =
     t.peer_transport_params <- transport_params;
     t.peer_max_data <-
       (if transport_params.initial_max_data < 0
        then 0L
-       else Int64.of_int transport_params.initial_max_data)
+       else Int64.of_int transport_params.initial_max_data);
+    t.peer_max_streams_bidi <-
+      nonnegative_int64 transport_params.initial_max_streams_bidi;
+    t.peer_max_streams_uni <-
+      nonnegative_int64 transport_params.initial_max_streams_uni
 
   let process_reset_stream_frame
         t
@@ -807,6 +818,31 @@ module Connection = struct
         (Hashtbl.find_opt t.peer_stream_max_data stream_id
          |> Option.value ~default:initial)
 
+  let current_peer_stream_limit t direction =
+    match direction with
+    | Direction.Bidirectional -> t.peer_max_streams_bidi
+    | Direction.Unidirectional -> t.peer_max_streams_uni
+
+  let effective_peer_stream_limit_for_open t direction =
+    let current = current_peer_stream_limit t direction in
+    if Int64.compare current 0L > 0
+    then current
+    else
+      match direction with
+      | Direction.Bidirectional ->
+        if t.peer_transport_params.initial_max_streams_bidi >= 0
+        then Int64.of_int t.peer_transport_params.initial_max_streams_bidi
+        else t.local_initial_max_streams_bidi
+      | Direction.Unidirectional ->
+        if t.peer_transport_params.initial_max_streams_uni >= 0
+        then Int64.of_int t.peer_transport_params.initial_max_streams_uni
+        else t.local_initial_max_streams_uni
+
+  let current_local_stream_limit t direction =
+    match direction with
+    | Direction.Bidirectional -> t.advertised_max_streams_bidi
+    | Direction.Unidirectional -> t.advertised_max_streams_uni
+
   let should_grow_window ~advertised ~consumed ~window =
     let threshold = Int64.max 1L (Int64.div window 2L) in
     Int64.compare (Int64.sub advertised consumed) threshold <= 0
@@ -891,11 +927,7 @@ module Connection = struct
     let stream_exists = Hashtbl.mem c.streams id in
     let is_peer_initiated = not is_locally_initiated in
     let stream_count = Int64.add (Int64.shift_right_logical id 2) 1L in
-    let max_peer_streams =
-      match direction with
-      | Bidirectional -> c.local_initial_max_streams_bidi
-      | Unidirectional -> c.local_initial_max_streams_uni
-    in
+    let max_peer_streams = current_local_stream_limit c direction in
     let recv_window = current_recv_stream_max_data c id in
     let stream_final_offset =
       Int64.add (Int64.of_int fragment.Frame.off) (Int64.of_int fragment.len)
@@ -1081,6 +1113,15 @@ module Connection = struct
         t
         ~frame_type:(Frame.Type.Max_streams direction)
         Frame_encoding_error
+    else
+      let max_streams = Int64.of_int max_streams in
+      let current = current_peer_stream_limit t direction in
+      if Int64.compare max_streams current > 0
+      then (
+        (match direction with
+        | Bidirectional -> t.peer_max_streams_bidi <- max_streams
+        | Unidirectional -> t.peer_max_streams_uni <- max_streams);
+        wakeup_writer t)
 
   let process_streams_blocked_frame t ~direction max_streams =
     if max_streams > Stream_id.max
@@ -1089,6 +1130,14 @@ module Connection = struct
         t
         ~frame_type:(Frame.Type.Streams_blocked direction)
         Frame_encoding_error
+    else
+      let current = current_local_stream_limit t direction in
+      let max_streams = Int64.of_int max_streams in
+      if Int64.compare current max_streams > 0
+      then
+        send_frames
+          t
+          [ Frame.Max_streams (direction, int_of_int64_clamped current) ]
 
   let process_new_connection_id_frame t ~cid ~retire_prior_to ~sequence_no =
     if CID.length cid = 0 || retire_prior_to > sequence_no
@@ -1200,11 +1249,33 @@ module Connection = struct
       | Unknown x ->
         report_error t ~frame_type:(Frame.Type.Unknown x) Frame_encoding_error)
 
-  let next_unidirectional_stream_id t ~typ =
-    let id = Stream.Type.gen_id ~typ t.next_unidirectional_stream_id in
-    t.next_unidirectional_stream_id <-
-      Int64.succ t.next_unidirectional_stream_id;
-    id
+  let next_stream_id t ~typ ~direction =
+    let seq =
+      match direction with
+      | Direction.Bidirectional -> t.next_bidirectional_stream_id
+      | Direction.Unidirectional -> t.next_unidirectional_stream_id
+    in
+    let stream_count = Int64.succ seq in
+    let peer_limit = effective_peer_stream_limit_for_open t direction in
+    if Int64.compare stream_count peer_limit > 0
+    then (
+      if Encryption_level.mem Application_data t.encdec
+      then (
+        send_frames
+          t
+          ~encryption_level:Application_data
+          [ Frame.Streams_blocked (direction, int_of_int64_clamped peer_limit) ];
+        wakeup_writer t);
+      invalid_arg "peer stream limit reached")
+    else (
+      let id = Stream.Type.gen_id ~typ seq in
+      (match direction with
+      | Direction.Bidirectional ->
+        t.next_bidirectional_stream_id <- Int64.succ t.next_bidirectional_stream_id
+      | Direction.Unidirectional ->
+        t.next_unidirectional_stream_id <-
+          Int64.succ t.next_unidirectional_stream_id);
+      id)
 
   let initialize_crypto_streams () =
     (* From RFC9000§19.6:
@@ -1258,6 +1329,10 @@ module Connection = struct
           Int64.of_int transport_parameters.Config.initial_max_streams_bidi
       ; local_initial_max_streams_uni =
           Int64.of_int transport_parameters.Config.initial_max_streams_uni
+      ; advertised_max_streams_bidi =
+          Int64.of_int transport_parameters.Config.initial_max_streams_bidi
+      ; advertised_max_streams_uni =
+          Int64.of_int transport_parameters.Config.initial_max_streams_uni
       ; max_recv_data =
           Int64.of_int transport_parameters.Config.initial_max_data
       ; recv_stream_max_data = Hashtbl.create ~random:true 1024
@@ -1266,6 +1341,8 @@ module Connection = struct
       ; consumed_data_bytes = 0L
       ; recv_stream_consumed_offsets = Hashtbl.create ~random:true 1024
       ; peer_max_data = 0L
+      ; peer_max_streams_bidi = 0L
+      ; peer_max_streams_uni = 0L
       ; peer_stream_max_data = Hashtbl.create ~random:true 1024
       ; sent_data_bytes = 0L
       ; sent_stream_highest_offsets = Hashtbl.create ~random:true 1024
@@ -1276,6 +1353,7 @@ module Connection = struct
       ; handler = Uninitialized connection_handler
       ; wakeup_writer
       ; shutdown
+      ; next_bidirectional_stream_id = 0L
       ; next_unidirectional_stream_id = 0L
       ; start_stream =
           (fun ?error_handler direction ->
@@ -1284,7 +1362,7 @@ module Connection = struct
               | Server -> Stream.Type.Server direction
               | Client -> Client direction
             in
-            let id = next_unidirectional_stream_id t ~typ in
+            let id = next_stream_id t ~typ ~direction in
             let stream = create_stream t ~typ ~id in
             (match error_handler with
             | Some f -> stream.error_handler <- f

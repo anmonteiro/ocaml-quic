@@ -135,9 +135,12 @@ let test_dynamic_flow_control_allows_large_upload () =
         match !client_start_stream with
         | None -> ()
         | Some start_stream ->
-          upload_started := true;
-          let stream = start_stream Direction.Bidirectional in
-          write_payload stream ~total_len:payload_len
+           (try
+             let stream = start_stream Direction.Bidirectional in
+             upload_started := true;
+             write_payload stream ~total_len:payload_len
+           with
+           | Invalid_argument _ -> ())
       else ();
       let client_to_server =
         pump_write ~src:client ~dst:server ~client_address:"client-address"
