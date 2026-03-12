@@ -249,7 +249,7 @@ let unistream_frame_handler t (stream : stream) unitype =
   | Push _ ->
     (* Client shouldn't send push frames. *)
     assert false
-  | Ignored _ ->
+  | Ignored _ | Unknown _ ->
     (* From RFC<HTTP3-RFC>§8.1:
      *   Stream types of the format 0x1f * N + 0x21 for non-negative integer
      *   values of N are reserved to exercise the requirement that unknown

@@ -110,6 +110,19 @@ let create_stack ~server_request_handler =
   Transport.connect client ~address:"server-address" ~host:"localhost" client_stream_handler;
   now, client, server, client_conn
 
+let test_unknown_unidirectional_stream_type_is_ignored () =
+  let payload = Bigstringaf.of_string ~off:0 ~len:1 "\x09" in
+  match
+    Angstrom.parse_bigstring
+      ~consume:All
+      H3__Parse.unidirectional_stream_header
+      payload
+  with
+  | Ok (H3__Unidirectional_stream.Unknown 0x09) -> ()
+  | Ok _ -> Alcotest.fail "expected parser to preserve unknown stream type"
+  | Error err ->
+    Alcotest.failf "expected unknown stream type to parse cleanly: %s" err
+
 let test_buffered_request_body_delivery () =
   let request_payload = String.init (256 * 1024) (fun i -> Char.chr (97 + (i mod 26))) in
   let buffered_reqqd = ref None in
@@ -304,7 +317,8 @@ let () =
   Alcotest.run
     "h3-body"
     [ ( "body"
-      , [ "buffered request body delivery", `Quick, test_buffered_request_body_delivery
+      , [ "unknown unidirectional stream type", `Quick, test_unknown_unidirectional_stream_type_is_ignored
+        ; "buffered request body delivery", `Quick, test_buffered_request_body_delivery
         ; "buffered response body delivery", `Quick, test_buffered_response_body_delivery
         ; "bigstring response body write", `Quick, test_bigstring_response_body_write
         ] ) ]
