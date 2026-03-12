@@ -246,6 +246,54 @@ let test_packet_number_ack_ranges_trim_cutoff () =
       (ack_ranges_to_tuples ranges)
   | _ -> Alcotest.fail "expected ACK frame"
 
+let test_frame_validity_by_encryption_level () =
+  let open Quic.Transport.Connection in
+  let cases =
+    [ "initial accepts ACK", Encryption_level.Initial, Frame.Ack { delay = 0; ranges = []; ecn_counts = None }, true
+    ; ( "initial rejects STREAM"
+      , Encryption_level.Initial
+      , Frame.Stream
+          { id = 0L
+          ; fragment =
+              { Frame.off = 0
+              ; len = 0
+              ; payload = ""
+              ; payload_off = 0
+              }
+          ; is_fin = false
+          }
+      , false )
+    ; "handshake rejects MAX_DATA", Encryption_level.Handshake, Frame.Max_data 1, false
+    ; ( "0-rtt accepts STREAM"
+      , Encryption_level.Zero_RTT
+      , Frame.Stream
+          { id = 0L
+          ; fragment =
+              { Frame.off = 0
+              ; len = 0
+              ; payload = ""
+              ; payload_off = 0
+              }
+          ; is_fin = false
+          }
+      , true )
+    ; "0-rtt rejects ACK", Encryption_level.Zero_RTT, Frame.Ack { delay = 0; ranges = []; ecn_counts = None }, false
+    ; ( "0-rtt rejects PATH_RESPONSE"
+      , Encryption_level.Zero_RTT
+      , Frame.Path_response (Bigstringaf.of_string ~off:0 ~len:4 "path")
+      , false )
+    ; "1-rtt accepts HANDSHAKE_DONE", Encryption_level.Application_data, Frame.Handshake_done, true
+    ; "initial preserves unknown frame handling", Encryption_level.Initial, Frame.Unknown 0x2f, true
+    ]
+  in
+  List.iter
+    (fun (name, encryption_level, frame, expected) ->
+      Alcotest.(check bool)
+        name
+        expected
+        (frame_allowed_at_encryption_level ~encryption_level frame))
+    cases
+
 let suite =
   [ "parser", `Quick, test_parser
   ; "fast frame roundtrip", `Quick, test_fast_frame_parser_roundtrips_payload
@@ -256,6 +304,7 @@ let suite =
   ; "packet number ack pruning", `Quick, test_packet_number_ack_ranges_prune_old_packets
   ; "packet number ack bridging", `Quick, test_packet_number_ack_ranges_merge_bridged_gap
   ; "packet number ack cutoff trim", `Quick, test_packet_number_ack_ranges_trim_cutoff
+  ; "frame validity by encryption level", `Quick, test_frame_validity_by_encryption_level
   ]
 
 let () = Alcotest.run "parsing" [ "parser", suite ]
