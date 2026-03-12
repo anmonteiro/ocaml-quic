@@ -36,8 +36,8 @@ module Writer = Serialize.Writer
 module Packet_number = struct
   let max_ack_ranges = 32
   let ack_history_window = 4096L
-  let delayed_ack_packet_threshold = 2
-  let delayed_ack_timeout_ms = 25L
+  let delayed_ack_packet_threshold = 4
+  let delayed_ack_timeout_ms = 5L
 
   type t =
     { mutable sent : int64
@@ -46,6 +46,7 @@ module Packet_number = struct
     ; mutable ack_elicited : bool
     ; mutable ack_eliciting_since_last_ack : int
     ; mutable ack_deadline_ms : int64 option
+    ; mutable ack_delay_start_ms : int64 option
     }
 
   let create () =
@@ -55,6 +56,7 @@ module Packet_number = struct
     ; ack_elicited = false
     ; ack_eliciting_since_last_ack = 0
     ; ack_deadline_ms = None
+    ; ack_delay_start_ms = None
     }
 
   let send_next t =
@@ -123,32 +125,47 @@ module Packet_number = struct
 
   let compose_ranges t = take max_ack_ranges [] t.received_need_ack
 
-  let compose_ack_frame t =
+  let compose_ack_frame t ~ack_delay_exponent ~now_ms =
     let ranges = compose_ranges t in
-    Frame.Ack { delay = 0; ranges; ecn_counts = None }
+    let delay =
+      match t.ack_delay_start_ms with
+      | None -> 0
+      | Some start_ms ->
+        let delay_us =
+          Int64.mul (Int64.max 0L (Int64.sub now_ms start_ms)) 1000L
+        in
+        Int64.to_int (Int64.shift_right_logical delay_us ack_delay_exponent)
+    in
+    Frame.Ack { delay; ranges; ecn_counts = None }
 
   let on_ack_sent t =
     t.ack_elicited <- false;
     t.ack_eliciting_since_last_ack <- 0;
     t.ack_deadline_ms <- None
+    ;
+    t.ack_delay_start_ms <- None
 
-  let note_ack_eliciting_received t ~encryption_level ~now_ms =
+  let note_ack_eliciting_received t ~encryption_level ~now_ms ~in_order =
     match encryption_level with
     | Encryption_level.Application_data ->
       let count = t.ack_eliciting_since_last_ack + 1 in
       t.ack_eliciting_since_last_ack <- count;
-      if count >= delayed_ack_packet_threshold
+      if not in_order || count >= delayed_ack_packet_threshold
       then (
+        if Option.is_none t.ack_delay_start_ms then t.ack_delay_start_ms <- Some now_ms;
         t.ack_elicited <- true;
         t.ack_deadline_ms <- None)
-      else if Option.is_none t.ack_deadline_ms
-      then t.ack_deadline_ms <- Some (Int64.add now_ms delayed_ack_timeout_ms)
+      else (
+        if Option.is_none t.ack_delay_start_ms then t.ack_delay_start_ms <- Some now_ms;
+        if Option.is_none t.ack_deadline_ms
+        then t.ack_deadline_ms <- Some (Int64.add now_ms delayed_ack_timeout_ms))
     | Encryption_level.Initial
     | Encryption_level.Zero_RTT
     | Encryption_level.Handshake ->
       t.ack_elicited <- true;
       t.ack_eliciting_since_last_ack <- 0;
-      t.ack_deadline_ms <- None
+      t.ack_deadline_ms <- None;
+      t.ack_delay_start_ms <- None
 end
 
 type error_handler = int -> unit
@@ -184,6 +201,7 @@ module Connection = struct
     ; local_initial_max_stream_data_uni : int64
     ; local_initial_max_streams_bidi : int64
     ; local_initial_max_streams_uni : int64
+    ; local_ack_delay_exponent : int
     ; mutable max_recv_data : int64
     ; recv_stream_max_data : (Stream_id.t, int64) Hashtbl.t
     ; mutable recv_data_bytes : int64
@@ -344,7 +362,7 @@ module Connection = struct
       then 0L
       else
         let ack_delay_multiplier_us =
-          Int64.of_int (max 1 t.peer_transport_params.ack_delay_exponent)
+          Int64.shift_left 1L (max 0 t.peer_transport_params.ack_delay_exponent)
         in
         let ack_delay_us =
           Int64.mul (Int64.of_int delay) ack_delay_multiplier_us
@@ -813,6 +831,11 @@ module Connection = struct
     if bytes_read <= 0
     then ()
     else (
+      let queued_control_frame = ref false in
+      let queue_control_frame frame =
+        queued_control_frame := true;
+        send_frames t [ frame ]
+      in
       let bytes_read = Int64.of_int bytes_read in
       let prev_stream_consumed =
         Hashtbl.find_opt t.recv_stream_consumed_offsets stream_id
@@ -841,11 +864,9 @@ module Connection = struct
           if Int64.compare new_limit advertised > 0
           then (
             Hashtbl.replace t.recv_stream_max_data stream_id new_limit;
-            send_frames
-              t
-              [ Frame.Max_stream_data
-                  { stream_id; max_data = int_of_int64_clamped new_limit }
-              ])
+            queue_control_frame
+              (Frame.Max_stream_data
+                 { stream_id; max_data = int_of_int64_clamped new_limit }))
       | Some _ | None -> ());
 
       if
@@ -861,7 +882,8 @@ module Connection = struct
         if Int64.compare new_limit t.max_recv_data > 0
         then (
           t.max_recv_data <- new_limit;
-          send_frames t [ Frame.Max_data (int_of_int64_clamped new_limit) ]))
+          queue_control_frame (Frame.Max_data (int_of_int64_clamped new_limit)));
+      if !queued_control_frame then wakeup_writer t)
 
   let create_stream (c : t) ~typ ~id =
     let stream =
@@ -1233,6 +1255,7 @@ module Connection = struct
           Int64.of_int transport_parameters.Config.initial_max_streams_bidi
       ; local_initial_max_streams_uni =
           Int64.of_int transport_parameters.Config.initial_max_streams_uni
+      ; local_ack_delay_exponent = Transport_parameters.default.ack_delay_exponent
       ; max_recv_data =
           Int64.of_int transport_parameters.Config.initial_max_data
       ; recv_stream_max_data = Hashtbl.create ~random:true 1024
@@ -1706,7 +1729,11 @@ let on_timeout t =
              Connection.send_frames
                connection
                ~encryption_level
-               [ Packet_number.compose_ack_frame pn_space ];
+               [ Packet_number.compose_ack_frame
+                   pn_space
+                   ~ack_delay_exponent:connection.local_ack_delay_exponent
+                   ~now_ms
+               ];
              Packet_number.on_ack_sent pn_space
            | Some _ | None -> ()
          in
@@ -1733,7 +1760,11 @@ let send_packets t ~packet_info =
       Connection.send_frames
         c
         ~encryption_level
-        [ Packet_number.compose_ack_frame pn_space ];
+        [ Packet_number.compose_ack_frame
+            pn_space
+            ~ack_delay_exponent:c.local_ack_delay_exponent
+            ~now_ms:(c.now_ms ())
+        ];
       Packet_number.on_ack_sent pn_space));
   wakeup_writer t
 
@@ -1935,6 +1966,9 @@ let packet_handler t ?error packet =
         let pn_space =
           Spaces.of_encryption_level c.packet_number_spaces encryption_level
         in
+        let in_order =
+          Int64.equal packet_number (Int64.add pn_space.received 1L)
+        in
         pn_space.received <- Int64.max pn_space.received packet_number;
 
         (match Packet.source_cid packet with
@@ -2016,7 +2050,8 @@ let packet_handler t ?error packet =
                 Packet_number.note_ack_eliciting_received
                   pn_space
                   ~encryption_level:packet_info.encryption_level
-                  ~now_ms:(c.now_ms ());
+                  ~now_ms:(c.now_ms ())
+                  ~in_order;
               (* packet_info should now contain frames we need to send in
                  response. *)
 	              send_packets t ~packet_info;

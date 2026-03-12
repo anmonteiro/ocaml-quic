@@ -1165,18 +1165,22 @@ let test_application_data_ack_is_delayed_until_second_packet_or_timeout () =
   Transport.Packet_number.note_ack_eliciting_received
     pn
     ~encryption_level:Application_data
-    ~now_ms:0L;
+    ~now_ms:0L
+    ~in_order:true;
   Alcotest.(check bool) "first application-data packet does not force ACK" false
     pn.ack_elicited;
   Alcotest.(check (option int64))
     "first application-data packet arms delayed ACK timer"
-    (Some 25L)
+    (Some 5L)
     pn.ack_deadline_ms;
-  Transport.Packet_number.note_ack_eliciting_received
-    pn
-    ~encryption_level:Application_data
-    ~now_ms:5L;
-  Alcotest.(check bool) "second application-data packet forces ACK" true
+  for i = 1 to 3 do
+    Transport.Packet_number.note_ack_eliciting_received
+      pn
+      ~encryption_level:Application_data
+      ~now_ms:(Int64.of_int i)
+      ~in_order:true
+  done;
+  Alcotest.(check bool) "fourth application-data packet forces ACK" true
     pn.ack_elicited;
   Alcotest.(check (option int64))
     "forced ACK clears delayed timer"
@@ -1188,7 +1192,8 @@ let test_handshake_ack_remains_immediate () =
   Transport.Packet_number.note_ack_eliciting_received
     pn
     ~encryption_level:Handshake
-    ~now_ms:0L;
+    ~now_ms:0L
+    ~in_order:true;
   Alcotest.(check bool) "handshake packet forces immediate ACK" true
     pn.ack_elicited;
   Alcotest.(check (option int64)) "no delayed timer for handshake" None

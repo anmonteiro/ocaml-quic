@@ -200,7 +200,12 @@ let test_packet_number_ack_ranges_are_incremental () =
   List.iter
     (Quic.Transport.Packet_number.insert_for_acking pn)
     [ 1L; 2L; 4L; 3L; 7L; 6L; 5L; 20L ];
-  match Quic.Transport.Packet_number.compose_ack_frame pn with
+  match
+    Quic.Transport.Packet_number.compose_ack_frame
+      pn
+      ~ack_delay_exponent:3
+      ~now_ms:0L
+  with
   | Frame.Ack { ranges; _ } ->
     Alcotest.(check (list (pair int int)))
       "ack ranges stay merged and sorted"
@@ -212,7 +217,12 @@ let test_packet_number_ack_ranges_prune_old_packets () =
   let pn = Quic.Transport.Packet_number.create () in
   Quic.Transport.Packet_number.insert_for_acking pn 1L;
   Quic.Transport.Packet_number.insert_for_acking pn 5000L;
-  match Quic.Transport.Packet_number.compose_ack_frame pn with
+  match
+    Quic.Transport.Packet_number.compose_ack_frame
+      pn
+      ~ack_delay_exponent:3
+      ~now_ms:0L
+  with
   | Frame.Ack { ranges; _ } ->
     Alcotest.(check (list (pair int int)))
       "old packet numbers are pruned from ack history"
@@ -225,7 +235,12 @@ let test_packet_number_ack_ranges_merge_bridged_gap () =
   List.iter
     (Quic.Transport.Packet_number.insert_for_acking pn)
     [ 10L; 11L; 13L; 12L ];
-  match Quic.Transport.Packet_number.compose_ack_frame pn with
+  match
+    Quic.Transport.Packet_number.compose_ack_frame
+      pn
+      ~ack_delay_exponent:3
+      ~now_ms:0L
+  with
   | Frame.Ack { ranges; _ } ->
     Alcotest.(check (list (pair int int)))
       "bridging packet merges adjacent ranges"
@@ -238,7 +253,12 @@ let test_packet_number_ack_ranges_trim_cutoff () =
   List.iter
     (Quic.Transport.Packet_number.insert_for_acking pn)
     [ 1L; 2L; 3L; 4099L ];
-  match Quic.Transport.Packet_number.compose_ack_frame pn with
+  match
+    Quic.Transport.Packet_number.compose_ack_frame
+      pn
+      ~ack_delay_exponent:3
+      ~now_ms:0L
+  with
   | Frame.Ack { ranges; _ } ->
     Alcotest.(check (list (pair int int)))
       "ranges crossing the cutoff are trimmed in place"

@@ -439,7 +439,7 @@ let default =
   ; (* From RFC<QUIC-RFC>§18.2:
      *   If this value is absent, a default value of 3 is assumed (indicating a
      *   multiplier of 8). Values above 20 are invalid. *)
-    ack_delay_exponent = 8 (* 2 ** 3 *)
+    ack_delay_exponent = 3
   ; (* From RFC<QUIC-RFC>§18.2:
      *   If this value is absent, a default of 25 milliseconds is assumed.
      *   Values of 2^14 or greater are invalid. *)
@@ -515,9 +515,7 @@ let decode_and_validate ~(perspective : Crypto.Mode.t) enc =
                 if exp > 20
                 then raise Local
                 else
-                  { acc with
-                    ack_delay_exponent = int_of_float (2. ** float_of_int exp)
-                  }
+                  { acc with ack_delay_exponent = exp }
               | Max_ack_delay max ->
                 (* From RFC<QUIC-RFC>§18.2:
                  *   Values of 2^14 or greater are invalid. *)
