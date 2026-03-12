@@ -167,6 +167,19 @@ let make_server_h3_stream stream : H3__Server_connection.stream =
   ; writer = H3__Serialize.Writer.create stream
   }
 
+let qpack_header name value : Qpack.header = { name; value; sensitive = false }
+
+let encode_with_connection_qpack_encoder encoder =
+  let encoder_buffer = Faraday.create 0x100 in
+  let block_buffer = Faraday.create 0x100 in
+  Qpack.Encoder.encode_headers
+    encoder
+    ~stream_id:0L
+    ~encoder_buffer
+    block_buffer
+    [ qpack_header "x-codex-settings" "enabled" ];
+  Faraday.serialize_to_string encoder_buffer
+
 let test_unknown_unidirectional_stream_type_is_ignored () =
   let payload = Bigstringaf.of_string ~off:0 ~len:1 "\x09" in
   match
@@ -279,6 +292,78 @@ let test_server_processes_goaway_monotonically () =
     "increasing GOAWAY push id closes the connection"
     [ H3__Error.Code.serialize H3__Error.Code.Id_error ]
     (List.rev !app_errors)
+
+let test_client_applies_peer_settings () =
+  let conn, _handler =
+    H3__Client_connection.create
+      ~error_handler:(fun _ -> Alcotest.fail "unexpected client H3 error")
+      ~cid:"client-settings"
+      ~start_stream:(make_start_stream `Client)
+  in
+  let app_errors = ref [] in
+  let stream =
+    make_peer_quic_stream `Server ~id:3L app_errors |> make_client_h3_stream
+  in
+  let settings =
+    { H3__Settings.default
+      with qpack_max_table_capacity = 128
+      ; qpack_blocked_streams = 17
+    }
+  in
+  Alcotest.(check bool)
+    "peer control stream is accepted"
+    true
+    (H3__Client_connection.register_peer_control_stream conn stream);
+  H3__Client_connection.process_settings_frame conn stream settings;
+  Alcotest.(check bool) "client saw control settings" true conn.saw_control_settings;
+  Alcotest.(check (option int))
+    "client stores peer qpack table capacity"
+    (Some 128)
+    (Option.map (fun s -> s.H3__Settings.qpack_max_table_capacity) conn.peer_settings);
+  Alcotest.(check int)
+    "client applies advertised local blocked stream budget to its decoder"
+    conn.local_settings.H3__Settings.qpack_blocked_streams
+    (Qpack.Decoder.Buffered.max_blocked_streams conn.qpack_decoder);
+  Alcotest.(check bool)
+    "client applies peer qpack capacity to its encoder"
+    false
+    (String.equal "" (encode_with_connection_qpack_encoder conn.qpack_encoder))
+
+let test_server_applies_peer_settings () =
+  let conn, _handler =
+    H3__Server_connection.create_connection
+      (fun _reqd -> Alcotest.fail "unexpected request")
+      ~cid:"server-settings"
+      ~start_stream:(make_start_stream `Server)
+  in
+  let app_errors = ref [] in
+  let stream =
+    make_peer_quic_stream `Client ~id:2L app_errors |> make_server_h3_stream
+  in
+  let settings =
+    { H3__Settings.default
+      with qpack_max_table_capacity = 128
+      ; qpack_blocked_streams = 19
+    }
+  in
+  Alcotest.(check bool)
+    "peer control stream is accepted"
+    true
+    (H3__Server_connection.register_peer_control_stream conn stream);
+  H3__Server_connection.process_settings_frame conn stream settings;
+  Alcotest.(check bool) "server saw control settings" true conn.saw_control_settings;
+  Alcotest.(check (option int))
+    "server stores peer qpack table capacity"
+    (Some 128)
+    (Option.map (fun s -> s.H3__Settings.qpack_max_table_capacity) conn.peer_settings);
+  Alcotest.(check int)
+    "server applies advertised local blocked stream budget to its decoder"
+    conn.local_settings.H3__Settings.qpack_blocked_streams
+    (Qpack.Decoder.Buffered.max_blocked_streams conn.qpack_decoder);
+  Alcotest.(check bool)
+    "server applies peer qpack capacity to its encoder"
+    false
+    (String.equal "" (encode_with_connection_qpack_encoder conn.qpack_encoder))
 
 let test_buffered_request_body_delivery () =
   let request_payload = String.init (256 * 1024) (fun i -> Char.chr (97 + (i mod 26))) in
@@ -479,6 +564,8 @@ let () =
         ; "server duplicate critical stream", `Quick, test_server_rejects_duplicate_critical_streams
         ; "client goaway", `Quick, test_client_processes_goaway_monotonically
         ; "server goaway", `Quick, test_server_processes_goaway_monotonically
+        ; "client peer settings", `Quick, test_client_applies_peer_settings
+        ; "server peer settings", `Quick, test_server_applies_peer_settings
         ; "buffered request body delivery", `Quick, test_buffered_request_body_delivery
         ; "buffered response body delivery", `Quick, test_buffered_response_body_delivery
         ; "bigstring response body write", `Quick, test_bigstring_response_body_write

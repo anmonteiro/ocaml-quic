@@ -70,7 +70,8 @@ type critical_streams =
   }
 
 type t =
-  { mutable settings : Settings.t
+  { local_settings : Settings.t
+  ; mutable peer_settings : Settings.t option
         (* ; writer : Writer.t *)
         (* ; config : Config.t *)
   ; mutable saw_control_settings : bool
@@ -140,26 +141,32 @@ let process_data_frame (_t : t) stream bs =
     then Faraday.schedule_bigstring faraday bs
   | Awaiting_response _ | Uninitialized | Closed -> assert false
 
-let process_settings_frame t stream _settings_list =
+let process_settings_frame t stream settings =
   match t.saw_control_settings with
   | false ->
     (match t.critical_streams.peer_control with
     | Some control_stream
       when Stream.id stream.stream = Stream.id control_stream.stream ->
-      t.saw_control_settings <- true;
-      () (* TODO: actually process settings *)
+      if settings.Settings.has_h2_forbidden
+      then close_with_h3_error stream Error.Code.Settings_error
+      else (
+        t.saw_control_settings <- true;
+        t.peer_settings <- Some settings;
+        Qpack.Encoder.set_capacity
+          t.qpack_encoder
+          settings.Settings.qpack_max_table_capacity)
     | _ ->
       (* From RFC9114§7.2.4:
        *   If an endpoint receives a SETTINGS frame on a different stream, the
        *   endpoint MUST respond with a connection error of type
        *   H3_FRAME_UNEXPECTED. *)
-      failwith "TODO: report error")
+      close_with_h3_error stream Error.Code.Frame_unexpected)
   | true ->
     (* From RFC9114§7.2.4:
      *   If an endpoint receives a second SETTINGS frame on the control stream,
      *   the endpoint MUST respond with a connection error of type
      *   H3_FRAME_UNEXPECTED. *)
-    failwith "TODO: report error"
+    close_with_h3_error stream Error.Code.Frame_unexpected
 
 let is_client_initiated_bidirectional_stream_id id = id >= 0 && id land 0x3 = 0
 
@@ -313,15 +320,19 @@ let bidirectional_frames t stream =
 
 (* ?(config = Config.default) *)
 let create ~error_handler ~cid:_ ~(start_stream : Quic.Transport.start_stream) =
-  let settings = Settings.default in
+  let local_settings = Settings.default in
   let t =
-    { settings (* ; config *)
+    { local_settings (* ; config *)
+    ; peer_settings = None
     ; saw_control_settings = false
     ; peer_goaway = None
     ; streams = Hashtbl.create ~random:true 1024
     ; error_handler
     ; qpack_encoder = Qpack.Encoder.create 0
-    ; qpack_decoder = Qdecoder.create ~max_size:0 ~max_blocked_streams:100
+    ; qpack_decoder =
+        Qdecoder.create
+          ~max_size:local_settings.qpack_max_table_capacity
+          ~max_blocked_streams:local_settings.qpack_blocked_streams
     ; critical_streams =
         { control = Some (start_control_stream ~start_stream)
         ; peer_control = None
@@ -339,7 +350,7 @@ let create ~error_handler ~cid:_ ~(start_stream : Quic.Transport.start_stream) =
    *   stream. *)
   Writer.write_settings
     (Option.get t.critical_streams.control).writer
-    Settings.default;
+    local_settings;
 
   ( t
   , Quic.Transport.F

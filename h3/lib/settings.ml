@@ -31,7 +31,9 @@
  *---------------------------------------------------------------------------*)
 
 module Type = struct
+  let qpack_max_table_capacity = 0x01
   let max_field_section_size = 0x06
+  let qpack_blocked_streams = 0x07
 
   (* From RFC<HTTP3-RFC>§7.2.4.1:
    *   Setting identifiers of the format 0x1f * N + 0x21 for non-negative
@@ -45,8 +47,15 @@ module Type = struct
 end
 
 type t =
-  { max_field_section_size : int
+  { qpack_max_table_capacity : int
+  ; max_field_section_size : int
+  ; qpack_blocked_streams : int
   ; has_h2_forbidden : bool
   }
 
-let default = { max_field_section_size = Int.max_int; has_h2_forbidden = false }
+let default =
+  { qpack_max_table_capacity = 0
+  ; max_field_section_size = Int.max_int
+  ; qpack_blocked_streams = 100
+  ; has_h2_forbidden = false
+  }
