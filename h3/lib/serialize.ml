@@ -99,9 +99,18 @@ let write_cancel_push_frame t id =
   write_variable_length_integer t (varint_encoding_length id);
   write_variable_length_integer t id
 
-let write_settings_frame t { Settings.max_field_section_size; _ } =
+let write_settings_frame
+      t
+      { Settings.qpack_max_table_capacity
+      ; max_field_section_size
+      ; qpack_blocked_streams
+      ; _
+      }
+  =
   let settings =
-    [ Settings.Type.max_field_section_size, max_field_section_size
+    [ Settings.Type.qpack_max_table_capacity, qpack_max_table_capacity
+    ; Settings.Type.max_field_section_size, max_field_section_size
+    ; Settings.Type.qpack_blocked_streams, qpack_blocked_streams
     ; (* From RFC<HTTP3-RFC>§7.2.4.1:
        *   Setting identifiers of the format 0x1f * N + 0x21 for non-negative
        *   integer values of N are reserved to exercise the requirement that

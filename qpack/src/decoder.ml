@@ -381,7 +381,7 @@ module Buffered = struct
     { decoder : t
     ; mutable blocked_blocks : Q.t
     ; mutable blocked_streams : StreamIdSet.t
-    ; max_blocked_streams : int
+    ; mutable max_blocked_streams : int
     }
 
   let create ~max_size ~max_blocked_streams =
@@ -391,6 +391,11 @@ module Buffered = struct
     ; blocked_streams = StreamIdSet.empty
     ; max_blocked_streams
     }
+
+  let set_max_blocked_streams t max_blocked_streams =
+    t.max_blocked_streams <- max_blocked_streams
+
+  let max_blocked_streams t = t.max_blocked_streams
 
   let rec process_blocked_streams t =
     match Q.pop t.blocked_blocks with
@@ -420,27 +425,36 @@ module Buffered = struct
     with
     | Ok (Ok (required_insertion_count, _base)) ->
       if required_insertion_count > t.decoder.insertion_count
-      then (
-        (* From RFC<QPACK-RFC>§2.1.2:
-         *   When the decoder receives an encoded field section with a Required
-         *   Insert Count greater than its own Insert Count, the stream cannot
-         *   be processed immediately, and is considered "blocked"; see Section
-         *   2.2.1. *)
-        t.blocked_streams <- StreamIdSet.add stream_id t.blocked_streams;
-        let q' =
-          Q.update
-            stream_id
-            (function
-              | None ->
-                Some { required_insertion_count; blocks = [ bs ]; callback = f }
-              | Some ({ required_insertion_count = ric; blocks; _ } as found) ->
-                assert (ric >= required_insertion_count);
-                Some { found with blocks = bs :: blocks })
-            t.blocked_blocks
-        in
-        t.blocked_blocks <- q')
-      else f bs;
-      ok
+      then
+        if
+          (not (StreamIdSet.mem stream_id t.blocked_streams))
+          && StreamIdSet.cardinal t.blocked_streams >= t.max_blocked_streams
+        then decompression_failed
+        else (
+          (* From RFC<QPACK-RFC>§2.1.2:
+           *   When the decoder receives an encoded field section with a Required
+           *   Insert Count greater than its own Insert Count, the stream cannot
+           *   be processed immediately, and is considered "blocked"; see Section
+           *   2.2.1. *)
+          t.blocked_streams <- StreamIdSet.add stream_id t.blocked_streams;
+          let q' =
+            Q.update
+              stream_id
+              (function
+                | None ->
+                  Some
+                    { required_insertion_count; blocks = [ bs ]; callback = f }
+                | Some ({ required_insertion_count = ric; blocks; _ } as found)
+                  ->
+                  assert (ric >= required_insertion_count);
+                  Some { found with blocks = bs :: blocks })
+              t.blocked_blocks
+          in
+          t.blocked_blocks <- q';
+          ok)
+      else (
+        f bs;
+        ok)
     | Ok (Error _ as e) -> e
     | Error _ -> decompression_failed
 end

@@ -63,7 +63,8 @@ type critical_streams =
   }
 
 type t =
-  { mutable settings : Settings.t
+  { local_settings : Settings.t
+  ; mutable peer_settings : Settings.t option
     (* ; writer : Writer.t *)
     (* ; config : Config.t *)
   ; mutable saw_control_settings : bool
@@ -189,7 +190,12 @@ let process_settings_frame t stream settings =
       when Stream.id stream.stream = Stream.id control_stream.stream ->
       if settings.Settings.has_h2_forbidden
       then close_with_h3_error stream Error.Code.Settings_error
-      else t.saw_control_settings <- true
+      else (
+        t.saw_control_settings <- true;
+        t.peer_settings <- Some settings;
+        Qpack.Encoder.set_capacity
+          t.qpack_encoder
+          settings.Settings.qpack_max_table_capacity)
     | _ ->
       (* From RFC9114§7.2.4:
        *   If an endpoint receives a SETTINGS frame on a different stream, the
@@ -383,16 +389,20 @@ let create_connection
       ~cid:_
       ~start_stream
   =
-  let settings = Settings.default in
+  let local_settings = Settings.default in
   let t =
-    { settings (* ; config *)
+    { local_settings (* ; config *)
+    ; peer_settings = None
     ; saw_control_settings = false
     ; peer_goaway = None
     ; streams = Hashtbl.create ~random:true 1024
     ; request_handler
     ; error_handler
     ; qpack_encoder = Qpack.Encoder.create 0
-    ; qpack_decoder = Qdecoder.create ~max_size:0 ~max_blocked_streams:100
+    ; qpack_decoder =
+        Qdecoder.create
+          ~max_size:local_settings.qpack_max_table_capacity
+          ~max_blocked_streams:local_settings.qpack_blocked_streams
     ; start_stream
     ; critical_streams =
         { control = start_unidirectional_stream ~start_stream Control
@@ -408,7 +418,7 @@ let create_connection
    *   Each side MUST initiate a single control stream at the beginning of
    *   the connection and send its SETTINGS frame as the first frame on this
    *   stream. *)
-  Writer.write_settings t.critical_streams.control.writer Settings.default;
+  Writer.write_settings t.critical_streams.control.writer local_settings;
   ( t
   , Quic.Transport.F
     (fun quic_stream ->

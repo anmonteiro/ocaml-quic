@@ -489,6 +489,41 @@ let test_decode_single_pass_encoded () =
   | Error e ->
     Alcotest.fail e
 
+let test_buffered_decoder_respects_max_blocked_streams () =
+  let encoder = Encoder.create 128 in
+  let encoder_buffer = Faraday.create 0x100 in
+  let block_buffer = Faraday.create 0x100 in
+  Encoder.set_capacity encoder 128;
+  Encoder.encode_headers
+    encoder
+    ~stream_id:1L
+    ~encoder_buffer
+    block_buffer
+    [ header "x-qpack-blocked" "value" ];
+  let encoded_block =
+    let s = Faraday.serialize_to_string block_buffer in
+    Bigstringaf.of_string ~off:0 ~len:(String.length s) s
+  in
+  let t = Decoder.Buffered.create ~max_size:128 ~max_blocked_streams:1 in
+  Decoder.Buffered.set_max_blocked_streams t 0;
+  let callback_called = ref false in
+  match
+    Decoder.Buffered.decode_header_block
+      t
+      ~stream_id:1L
+      encoded_block
+      (fun _ -> callback_called := true)
+  with
+  | Error QPACK_DECOMPRESSION_FAILED ->
+    Alcotest.(check bool)
+      "header block callback is not invoked when blocked stream budget is exhausted"
+      false
+      !callback_called
+  | Ok () ->
+    Alcotest.fail "expected blocked stream budget exhaustion to fail"
+  | Error _ ->
+    Alcotest.fail "expected QPACK_DECOMPRESSION_FAILED"
+
 let suite =
   [ ( "insert field with name reference"
     , `Quick
@@ -507,6 +542,9 @@ let suite =
     , `Quick
     , test_decode_literal_without_name_ref_header_field )
   ; "decode single pass", `Quick, test_decode_single_pass_encoded
+  ; ( "buffered decoder max blocked streams"
+    , `Quick
+    , test_buffered_decoder_respects_max_blocked_streams )
   ]
 
 (* Test invalid references *)

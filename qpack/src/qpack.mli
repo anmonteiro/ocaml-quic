@@ -121,6 +121,8 @@ module Decoder : sig
     type t
 
     val create : max_size:int -> max_blocked_streams:int -> t
+    val set_max_blocked_streams : t -> int -> unit
+    val max_blocked_streams : t -> int
 
     val parse_instructions : t -> Faraday.t -> (unit, error) result Angstrom.t
 

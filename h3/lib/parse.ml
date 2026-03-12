@@ -88,6 +88,14 @@ let apply_setting settings k v =
     (* From RFC9114§7.2.4.1:
      *   SETTINGS_MAX_FIELD_SECTION_SIZE (0x6). *)
     { settings with Settings.max_field_section_size = v }
+  | 0x1 ->
+    (* From RFC9204§4.2:
+     *   SETTINGS_QPACK_MAX_TABLE_CAPACITY (0x01). *)
+    { settings with Settings.qpack_max_table_capacity = v }
+  | 0x7 ->
+    (* From RFC9204§4.2:
+     *   SETTINGS_QPACK_BLOCKED_STREAMS (0x07). *)
+    { settings with Settings.qpack_blocked_streams = v }
   | _ ->
     if is_forbidden_h2_setting k
     then { settings with Settings.has_h2_forbidden = true }
