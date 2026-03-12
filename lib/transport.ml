@@ -1105,76 +1105,100 @@ module Connection = struct
       (* Track the latest peer-provided CID for outgoing packets. *)
       t.dest_cid <- cid)
 
+  let frame_allowed_at_encryption_level ~encryption_level frame =
+    match encryption_level with
+    | Encryption_level.Initial | Handshake ->
+      (match frame with
+      | Frame.Padding _ | Ping | Ack _ | Crypto _ | Connection_close_quic _ ->
+        true
+      | Unknown _ -> true
+      | _ -> false)
+    | Zero_RTT ->
+      (match frame with
+      | Frame.Padding _ | Ping | Reset_stream _ | Stop_sending _ | Stream _
+      | Max_data _ | Max_stream_data _ | Max_streams _ | Data_blocked _
+      | Stream_data_blocked _ | Streams_blocked _ | New_connection_id _
+      | Path_challenge _ | Connection_close_quic _ | Connection_close_app _ ->
+        true
+      | Ack _ | Crypto _ | New_token _ | Retire_connection_id _
+      | Path_response _ | Handshake_done ->
+        false
+      | Unknown _ -> true)
+    | Application_data -> true
+
   let frame_handler ~packet_info t frame =
-    (* TODO: validate that frame can appear at current encryption level. *)
-    if Frame.is_ack_eliciting frame
-    then packet_info.packet_has_ack_eliciting_frame <- true;
-    match frame with
-    | Frame.Padding _n ->
-      (* From RFC9000§19.1:
-       *   The PADDING frame (type=0x00) has no semantic value. PADDING frames
-       *   can be used to increase the size of a packet. *)
-      ()
-    | Ping ->
-      (* From RFC9000§19.2:
-       *   The receiver of a PING frame simply needs to acknowledge the packet
-       *   containing this frame. *)
-      ()
-    | Ack { delay; ranges; _ } ->
-      process_ack_frame t ~packet_info ~delay ~ranges
-    | Reset_stream { stream_id; application_protocol_error; final_size } ->
-      process_reset_stream_frame
+    if
+      not
+        (frame_allowed_at_encryption_level
+           ~encryption_level:packet_info.encryption_level
+           frame)
+    then
+      report_error
         t
-        ~stream_id
-        ~final_size
-        application_protocol_error
-    | Stop_sending { stream_id; application_protocol_error } ->
-      process_stop_sending_frame t ~stream_id application_protocol_error
-    | Crypto fragment -> process_crypto_frame t ~packet_info fragment
-    | New_token _ ->
-      (match t.mode with
-      | Server ->
-        report_error t ~frame_type:Frame.Type.New_token Protocol_violation
-      | Client -> ())
-    | Stream { id; fragment; is_fin } ->
-      process_stream_frame
-        t
+        ~frame_type:(Frame.to_frame_type frame)
         ~encryption_level:packet_info.encryption_level
-        ~id
-        ~fragment
-        ~is_fin
-    | Max_data max_data -> process_max_data_frame t max_data
-    | Max_stream_data { stream_id; max_data } ->
-      process_max_stream_data_frame t ~stream_id ~max_data
-    | Max_streams (direction, max_streams) ->
-      process_max_streams_frame t ~direction max_streams
-    | Data_blocked _ | Stream_data_blocked _ -> ()
-    | Streams_blocked (direction, max_streams) ->
-      process_streams_blocked_frame t ~direction max_streams
-    | New_connection_id { cid; retire_prior_to; sequence_no; _ } ->
-      process_new_connection_id_frame t ~cid ~retire_prior_to ~sequence_no
-    | Retire_connection_id _ -> ()
-    | Path_challenge buf ->
-      if packet_info.encryption_level <> Application_data
-      then
-        report_error
+        Protocol_violation
+    else (
+      if Frame.is_ack_eliciting frame
+      then packet_info.packet_has_ack_eliciting_frame <- true;
+      match frame with
+      | Frame.Padding _n ->
+        (* From RFC9000§19.1:
+         *   The PADDING frame (type=0x00) has no semantic value. PADDING frames
+         *   can be used to increase the size of a packet. *)
+        ()
+      | Ping ->
+        (* From RFC9000§19.2:
+         *   The receiver of a PING frame simply needs to acknowledge the packet
+         *   containing this frame. *)
+        ()
+      | Ack { delay; ranges; _ } ->
+        process_ack_frame t ~packet_info ~delay ~ranges
+      | Reset_stream { stream_id; application_protocol_error; final_size } ->
+        process_reset_stream_frame
           t
-          ~frame_type:Frame.Type.Path_challenge
+          ~stream_id
+          ~final_size
+          application_protocol_error
+      | Stop_sending { stream_id; application_protocol_error } ->
+        process_stop_sending_frame t ~stream_id application_protocol_error
+      | Crypto fragment -> process_crypto_frame t ~packet_info fragment
+      | New_token _ ->
+        (match t.mode with
+        | Server ->
+          report_error t ~frame_type:Frame.Type.New_token Protocol_violation
+        | Client -> ())
+      | Stream { id; fragment; is_fin } ->
+        process_stream_frame
+          t
           ~encryption_level:packet_info.encryption_level
-          Protocol_violation
-      else process_path_challenge_frame t buf
-    | Path_response _ -> ()
-    | Connection_close_quic { frame_type; reason_phrase; error_code } ->
-      process_connection_close_quic_frame
-        t
-        ~frame_type
-        ~error_code
-        reason_phrase
-    | Connection_close_app { reason_phrase; error_code } ->
-      process_connection_close_app_frame t ~error_code reason_phrase
-    | Handshake_done -> process_handshake_done_frame t
-    | Unknown x ->
-      report_error t ~frame_type:(Frame.Type.Unknown x) Frame_encoding_error
+          ~id
+          ~fragment
+          ~is_fin
+      | Max_data max_data -> process_max_data_frame t max_data
+      | Max_stream_data { stream_id; max_data } ->
+        process_max_stream_data_frame t ~stream_id ~max_data
+      | Max_streams (direction, max_streams) ->
+        process_max_streams_frame t ~direction max_streams
+      | Data_blocked _ | Stream_data_blocked _ -> ()
+      | Streams_blocked (direction, max_streams) ->
+        process_streams_blocked_frame t ~direction max_streams
+      | New_connection_id { cid; retire_prior_to; sequence_no; _ } ->
+        process_new_connection_id_frame t ~cid ~retire_prior_to ~sequence_no
+      | Retire_connection_id _ -> ()
+      | Path_challenge buf -> process_path_challenge_frame t buf
+      | Path_response _ -> ()
+      | Connection_close_quic { frame_type; reason_phrase; error_code } ->
+        process_connection_close_quic_frame
+          t
+          ~frame_type
+          ~error_code
+          reason_phrase
+      | Connection_close_app { reason_phrase; error_code } ->
+        process_connection_close_app_frame t ~error_code reason_phrase
+      | Handshake_done -> process_handshake_done_frame t
+      | Unknown x ->
+        report_error t ~frame_type:(Frame.Type.Unknown x) Frame_encoding_error)
 
   let next_unidirectional_stream_id t ~typ =
     let id = Stream.Type.gen_id ~typ t.next_unidirectional_stream_id in
