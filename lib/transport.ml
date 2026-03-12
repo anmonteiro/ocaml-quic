@@ -251,9 +251,9 @@ module Connection = struct
     Frame.is_any_ack_eliciting frames
     || List.exists (function Frame.Padding _ -> true | _ -> false) frames
 
-  let estimated_in_flight_bytes frames =
+  let estimated_in_flight_bytes t frames =
     if packet_is_in_flight frames
-    then Recovery.Constants.default_max_datagram_size
+    then t.recovery.max_datagram_size
     else 0
 
   let writer_pending_bytes writer =
@@ -281,7 +281,7 @@ module Connection = struct
       | Some
           ( ({ Writer.encryption_level; packet_number; _ } as header_info)
           , frames ) ->
-        let estimated_bytes = estimated_in_flight_bytes frames in
+        let estimated_bytes = estimated_in_flight_bytes t frames in
         if
           estimated_bytes > 0
           && not (Recovery.can_send t.recovery ~bytes:estimated_bytes)
@@ -1194,6 +1194,7 @@ module Connection = struct
         ~peer_address
         ~tls_state
         ~transport_parameters
+        ~max_datagram_size
         ~now_ms
         ~wakeup_writer
         ~shutdown
@@ -1243,7 +1244,7 @@ module Connection = struct
       ; peer_stream_max_data = Hashtbl.create ~random:true 1024
       ; sent_data_bytes = 0L
       ; sent_stream_highest_offsets = Hashtbl.create ~random:true 1024
-      ; recovery = Recovery.create ()
+      ; recovery = Recovery.create ~max_datagram_size ()
       ; queued_packets = Queue.create ()
       ; writer = Writer.create 0x1000
       ; streams = Hashtbl.create ~random:true 1024
@@ -1342,8 +1343,8 @@ module Connection = struct
       | `Data
       ]
 
-    let app_data_payload_budget =
-      max 1 (Recovery.Constants.default_max_datagram_size - 64)
+    let app_data_payload_budget t =
+      max 1 (t.recovery.max_datagram_size - 64)
 
     let stream_frame_overhead_budget ~stream_id ~fragment =
       let fragment : Frame.fragment = fragment in
@@ -1443,7 +1444,7 @@ module Connection = struct
       in
       inner
         []
-        ~remaining_payload:app_data_payload_budget
+        ~remaining_payload:(app_data_payload_budget t)
         ~stream_highest:prev_stream_highest
         ~sent_data_bytes:t.sent_data_bytes
     let flush t streams =
@@ -1469,7 +1470,7 @@ module Connection = struct
               Stream.Send.has_pending_output stream.send
               && Encryption_level.mem encryption_level t.encdec
             then (
-              let estimated_bytes = Recovery.Constants.default_max_datagram_size in
+              let estimated_bytes = t.recovery.max_datagram_size in
               if not (Recovery.can_send t.recovery ~bytes:estimated_bytes)
               then acc
               else
@@ -1778,6 +1779,7 @@ let create_new_connection
       ~peer_address
       ~tls_state
       ~transport_parameters:t.config.transport_parameters
+      ~max_datagram_size:t.config.max_datagram_size
       ~now_ms:t.now_ms
       ~wakeup_writer:(ready_to_write t)
       ~shutdown:(on_close t)

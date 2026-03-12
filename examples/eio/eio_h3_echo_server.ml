@@ -183,6 +183,7 @@ let () =
   let serve_file = ref None in
   let upload_out = ref None in
   let chunk_size = ref max_data_chunk_size in
+  let max_dgram_size = ref Quic.Config.default_max_datagram_size in
   let drop_recv_pct = ref 0.0 in
   let drop_send_pct = ref 0.0 in
   let drop_handshake = ref false in
@@ -200,6 +201,9 @@ let () =
       , Printf.sprintf
           " File transfer chunk size in bytes (max %d)"
           max_data_chunk_size )
+    ; ( "-max-dgram-size"
+      , Arg.Set_int max_dgram_size
+      , " Max QUIC datagram size override for benchmarking (default 1200)" )
     ; ( "-drop-recv-pct"
       , Arg.Set_float drop_recv_pct
       , " Drop percentage for received UDP datagrams (0.0-100.0, default 0.0)" )
@@ -225,6 +229,8 @@ let () =
   then failwith "-drop-recv-pct must be between 0.0 and 100.0";
   if !drop_send_pct < 0.0 || !drop_send_pct > 100.0
   then failwith "-drop-send-pct must be between 0.0 and 100.0";
+  if !max_dgram_size < Quic.Config.default_max_datagram_size
+  then failwith "-max-dgram-size must be >= 1200";
   let listen_address = `Udp (Eio.Net.Ipaddr.V4.any, !port) in
   let certificates =
     let cert = "./certificates/server.pem" in
@@ -245,6 +251,7 @@ let () =
     { Quic.Config.certificates
     ; alpn_protocols = [ "h3" ]
     ; transport_parameters
+    ; max_datagram_size = !max_dgram_size
     }
   in
   let rng = Random.State.make [| !drop_seed |] in

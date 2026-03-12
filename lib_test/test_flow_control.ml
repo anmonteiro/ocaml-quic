@@ -46,6 +46,7 @@ let make_config ~transport_parameters =
   { Quic.Config.certificates = server_certificates ()
   ; alpn_protocols = [ "h3" ]
   ; transport_parameters
+  ; max_datagram_size = Quic.Config.default_max_datagram_size
   }
 
 let pump_write ~src ~dst ~client_address =

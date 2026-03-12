@@ -106,6 +106,7 @@ type t =
   ; timer : timer
   ; congestion : congestion
   ; ecn : ecn
+  ; max_datagram_size : int
   ; mutable implicit_now_ms : int64
   }
 
@@ -174,8 +175,7 @@ let in_recovery_period t ~time_sent_ms =
 
 let collapse_to_min_window t =
   t.congestion.congestion_window <-
-    Constants.minimum_window
-      ~max_datagram_size:Constants.default_max_datagram_size
+    Constants.minimum_window ~max_datagram_size:t.max_datagram_size
 
 let on_packets_acked t ~bytes_acked =
   if bytes_acked <= 0
@@ -189,7 +189,7 @@ let on_packets_acked t ~bytes_acked =
     let incr =
       max
         1
-        ((Constants.default_max_datagram_size * bytes_acked) / denom)
+        ((t.max_datagram_size * bytes_acked) / denom)
     in
     t.congestion.congestion_window <- t.congestion.congestion_window + incr
 
@@ -270,8 +270,7 @@ let on_congestion_event t ~now_ms ~lost_packets =
       t.congestion.ssthresh <-
         max
           (t.congestion.congestion_window / 2)
-          (Constants.minimum_window
-             ~max_datagram_size:Constants.default_max_datagram_size);
+          (Constants.minimum_window ~max_datagram_size:t.max_datagram_size);
       t.congestion.congestion_window <- t.congestion.ssthresh);
     if maybe_persistent_congestion t lost_packets
     then collapse_to_min_window t
@@ -332,7 +331,7 @@ let detect_lost_packets t ~encryption_level ~now_ms ~largest_newly_acked =
     info.sent <- sent';
     List.rev !lost_packets_rev
 
-let create () =
+let create ?(max_datagram_size = Constants.default_max_datagram_size) () =
   let new_info () =
     { sent = Q.empty
     ; acked = Queue.create ()
@@ -359,13 +358,12 @@ let create () =
       }
   ; congestion =
       { bytes_in_flight = 0
-      ; congestion_window =
-          Constants.initial_window
-            ~max_datagram_size:Constants.default_max_datagram_size
+      ; congestion_window = Constants.initial_window ~max_datagram_size
       ; ssthresh = max_int
       ; recovery_start_time_ms = None
       }
   ; ecn = { validated = false; ect0 = 0; ect1 = 0; ce = 0 }
+  ; max_datagram_size
   ; implicit_now_ms = 0L
   }
 
@@ -407,11 +405,7 @@ let record_packet_sent
 
 let on_packet_sent t ~encryption_level ~packet_number frames =
   let time_sent_ms = next_implicit_now_ms t in
-  let bytes_sent =
-    if packet_is_in_flight frames
-    then Constants.default_max_datagram_size
-    else 0
-  in
+  let bytes_sent = if packet_is_in_flight frames then t.max_datagram_size else 0 in
   record_packet_sent
     t
     ~encryption_level
@@ -545,8 +539,7 @@ let process_ecn t ~newly_acked:_ ~ect0_count ~ect1_count ~ce_count =
     t.congestion.ssthresh <-
       max
         (t.congestion.congestion_window / 2)
-        (Constants.minimum_window
-           ~max_datagram_size:Constants.default_max_datagram_size);
+        (Constants.minimum_window ~max_datagram_size:t.max_datagram_size);
     t.congestion.congestion_window <- t.congestion.ssthresh);
   t.ecn.ect0 <- ect0_count;
   t.ecn.ect1 <- ect1_count;

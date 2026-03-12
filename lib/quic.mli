@@ -42,10 +42,13 @@ module Config : sig
 
   val default_transport_parameters : transport_parameters
 
+  val default_max_datagram_size : int
+
   type t =
     { certificates : Tls.Config.own_cert
     ; alpn_protocols : string list
     ; transport_parameters : transport_parameters
+    ; max_datagram_size : int
     }
 end
 

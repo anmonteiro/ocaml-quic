@@ -48,10 +48,13 @@ let default_transport_parameters =
   ; initial_max_streams_uni = 1 lsl 8
   }
 
+let default_max_datagram_size = 1200
+
 type t =
   { certificates : Tls.Config.own_cert
   ; alpn_protocols : string list (* ; authenticator : X509.Authenticator.t *)
   ; transport_parameters : transport_parameters
+  ; max_datagram_size : int
   }
 
 let null_auth ?ip:_ ~host:_ _certs = Ok None

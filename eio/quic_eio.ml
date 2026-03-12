@@ -373,7 +373,7 @@ module Server = struct
       connection
       ~sw
       ~clock
-      ~read_buffer_size:0x1000
+      ~read_buffer_size:(max 0x1000 config.max_datagram_size)
       ~cancel:None
       ~should_drop
       server_fd
@@ -411,7 +411,7 @@ module Client = struct
         ~sw
         ~clock
         ~cancel:None
-        ~read_buffer_size:0x1000
+        ~read_buffer_size:(max 0x1000 config.max_datagram_size)
         ~should_drop
         connection
         fd);

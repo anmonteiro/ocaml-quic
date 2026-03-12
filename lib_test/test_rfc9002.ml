@@ -959,6 +959,7 @@ let make_client_connection_for_congestion_tests () =
       ~peer_address:"127.0.0.1:4433"
       ~tls_state
       ~transport_parameters:Config.default_transport_parameters
+      ~max_datagram_size:Config.default_max_datagram_size
       ~now_ms:(fun () -> 0L)
       ~wakeup_writer:(fun () -> ())
       ~shutdown:(fun _ -> ())

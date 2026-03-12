@@ -114,6 +114,7 @@ let test_initial () =
       { Quic.Config.certificates = server_certificates ()
       ; alpn_protocols = [ "h3" ]
       ; transport_parameters = Quic.Config.default_transport_parameters
+      ; max_datagram_size = Quic.Config.default_max_datagram_size
       }
     in
     Transport.Server.create
