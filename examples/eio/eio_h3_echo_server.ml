@@ -1,7 +1,8 @@
 open H3
 
 let now_s () = Unix.gettimeofday ()
-let max_data_chunk_size = 16384
+let max_data_chunk_size = 1024
+let flush_batch_bytes = 256 * 1024
 
 let set_crypto_backend_from_env () =
   match Sys.getenv_opt "QUIC_CRYPTO_BACKEND" with
@@ -16,8 +17,8 @@ let set_crypto_backend_from_env () =
 
 let print_transfer_stats ~label ~bytes ~started_at =
   let duration_s = max 1e-6 (now_s () -. started_at) in
-  let mib_per_s = (Int64.to_float bytes /. (1024. *. 1024.)) /. duration_s in
-  let mbps = (Int64.to_float bytes *. 8. /. 1_000_000.) /. duration_s in
+  let mib_per_s = Int64.to_float bytes /. (1024. *. 1024.) /. duration_s in
+  let mbps = Int64.to_float bytes *. 8. /. 1_000_000. /. duration_s in
   Format.eprintf
     "%s: bytes=%Ld duration=%.3fs throughput=%.2f MiB/s (%.2f Mbit/s)@."
     label
@@ -44,19 +45,24 @@ let stream_in_channel_to_body ~label ~chunk_size ~ic body =
       print_transfer_stats ~label ~bytes:!transferred ~started_at)
   in
   let rec pump () =
-    match input ic buf 0 (Bytes.length buf) with
-    | 0 -> finalize ()
-    | n ->
-      Body.Writer.write_string
-        body
-        ~off:0
-        ~len:n
-        (Bytes.unsafe_to_string buf);
-      transferred := Int64.add !transferred (Int64.of_int n);
-      Body.Writer.flush body pump
-    | exception exn ->
-      finalize ();
-      raise exn
+    let rec fill_batch batched_bytes =
+      match input ic buf 0 (Bytes.length buf) with
+      | 0 -> `Eof batched_bytes
+      | n ->
+        Body.Writer.write_string body ~off:0 ~len:n (Bytes.unsafe_to_string buf);
+        transferred := Int64.add !transferred (Int64.of_int n);
+        let batched_bytes = batched_bytes + n in
+        if batched_bytes >= flush_batch_bytes
+        then `Flushed batched_bytes
+        else fill_batch batched_bytes
+      | exception exn ->
+        finalize ();
+        raise exn
+    in
+    match fill_batch 0 with
+    | `Eof 0 -> finalize ()
+    | `Eof _ -> Body.Writer.flush body finalize
+    | `Flushed _ -> Body.Writer.flush body pump
   in
   pump ()
 
@@ -106,7 +112,10 @@ let connection_handler clock ~serve_file ~upload_out ~chunk_size =
         match expected_len with
         | Some expected when expected > 0L ->
           let pct =
-            min 100 (Int64.to_int (Int64.div (Int64.mul !received_bytes 100L) expected))
+            min
+              100
+              (Int64.to_int
+                 (Int64.div (Int64.mul !received_bytes 100L) expected))
           in
           while !next_progress_pct <= pct do
             Format.eprintf
@@ -137,15 +146,13 @@ let connection_handler clock ~serve_file ~upload_out ~chunk_size =
       let rec read_body () =
         Body.Reader.schedule_read
           request_body
-          ~on_eof:(fun () ->
-            finalize ())
+          ~on_eof:(fun () -> finalize ())
           ~on_read:(fun bigstring ~off ~len ->
             (match oc with
             | Some oc ->
               output_string oc (Bigstringaf.substring bigstring ~off ~len)
             | None -> ());
-            received_bytes :=
-              Int64.add !received_bytes (Int64.of_int len);
+            received_bytes := Int64.add !received_bytes (Int64.of_int len);
             report_progress ();
             match expected_len with
             | Some expected when Int64.compare !received_bytes expected >= 0 ->
@@ -184,31 +191,27 @@ let () =
     [ "-p", Arg.Set_int port, " Listening port number (4433 by default)"
     ; ( "-serve-file"
       , Arg.String (fun path -> serve_file := Some path)
-      , " Serve this file on GET /file"
-      )
+      , " Serve this file on GET /file" )
     ; ( "-upload-out"
       , Arg.String (fun path -> upload_out := Some path)
-      , " Save uploaded bytes from POST /upload to this file"
-      )
+      , " Save uploaded bytes from POST /upload to this file" )
     ; ( "-chunk-size"
       , Arg.Set_int chunk_size
       , Printf.sprintf
           " File transfer chunk size in bytes (max %d)"
-          max_data_chunk_size
-      )
+          max_data_chunk_size )
     ; ( "-drop-recv-pct"
       , Arg.Set_float drop_recv_pct
-      , " Drop percentage for received UDP datagrams (0.0-100.0, default 0.0)"
-      )
+      , " Drop percentage for received UDP datagrams (0.0-100.0, default 0.0)" )
     ; ( "-drop-handshake"
       , Arg.Set drop_handshake
-      , " Also drop Initial/Handshake packets (default: false)"
-      )
+      , " Also drop Initial/Handshake packets (default: false)" )
     ; ( "-drop-send-pct"
       , Arg.Set_float drop_send_pct
-      , " Drop percentage for sent UDP datagrams (0.0-100.0, default 0.0)"
-      )
-    ; "-drop-seed", Arg.Set_int drop_seed, " RNG seed for drop decisions (default 42)"
+      , " Drop percentage for sent UDP datagrams (0.0-100.0, default 0.0)" )
+    ; ( "-drop-seed"
+      , Arg.Set_int drop_seed
+      , " RNG seed for drop decisions (default 42)" )
     ]
     ignore
     "Echo server + file benchmarking endpoints. Runs forever.";
@@ -257,7 +260,7 @@ let () =
       | _ -> true
     in
     let drop = can_drop && Random.State.float rng 100.0 < pct in
-    (match direction with
+    match direction with
     | `Receive ->
       if drop
       then
@@ -287,10 +290,11 @@ let () =
           | `Retry -> "retry"
           | `Short -> "short"
           | `Unknown -> "unknown");
-      drop)
+      drop
   in
   Format.eprintf
-    "listening on UDP %d (drop_recv_pct=%.2f drop_send_pct=%.2f drop_handshake=%b seed=%d serve_file=%s upload_out=%s chunk_size=%d)@."
+    "listening on UDP %d (drop_recv_pct=%.2f drop_send_pct=%.2f \
+     drop_handshake=%b seed=%d serve_file=%s upload_out=%s chunk_size=%d)@."
     !port
     !drop_recv_pct
     !drop_send_pct
@@ -327,5 +331,8 @@ let () =
                ~config
                listen_address_v6
                handler
-           with exn ->
-             Format.eprintf "IPv6 listener disabled: %s@." (Printexc.to_string exn))))
+           with
+           | exn ->
+             Format.eprintf
+               "IPv6 listener disabled: %s@."
+               (Printexc.to_string exn))))

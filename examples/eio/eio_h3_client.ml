@@ -3,6 +3,7 @@ open H3
 
 let now_s () = Unix.gettimeofday ()
 let max_data_chunk_size = 16384
+let flush_batch_bytes = 256 * 1024
 
 let print_transfer_stats ~label ~bytes ~started_at =
   let duration_s = max 1e-6 (now_s () -. started_at) in
@@ -30,19 +31,28 @@ let stream_in_channel_to_body ~label ~chunk_size ~ic body =
       print_transfer_stats ~label ~bytes:!transferred ~started_at)
   in
   let rec pump () =
-    match input ic buf 0 (Bytes.length buf) with
-    | 0 -> finalize ()
-    | n ->
-      Body.Writer.write_string
-        body
-        ~off:0
-        ~len:n
-        (Bytes.unsafe_to_string buf);
-      transferred := Int64.add !transferred (Int64.of_int n);
-      Body.Writer.flush body pump
-    | exception exn ->
-      finalize ();
-      raise exn
+    let rec fill_batch batched_bytes =
+      match input ic buf 0 (Bytes.length buf) with
+      | 0 -> `Eof batched_bytes
+      | n ->
+        Body.Writer.write_string
+          body
+          ~off:0
+          ~len:n
+          (Bytes.unsafe_to_string buf);
+        transferred := Int64.add !transferred (Int64.of_int n);
+        let batched_bytes = batched_bytes + n in
+        if batched_bytes >= flush_batch_bytes
+        then `Flushed batched_bytes
+        else fill_batch batched_bytes
+      | exception exn ->
+        finalize ();
+        raise exn
+    in
+    match fill_batch 0 with
+    | `Eof 0 -> finalize ()
+    | `Eof _ -> Body.Writer.flush body finalize
+    | `Flushed _ -> Body.Writer.flush body pump
   in
   pump ()
 
