@@ -1,9 +1,29 @@
-(tests
+(executables
  (names test_body)
- (libraries alcotest h3 quic tls mirage-crypto-rng.unix)
+ (modules test_body)
+ (libraries alcotest h3 quic tls mirage-crypto-rng.unix))
+
+(executables
+ (names test_body_batching)
+ (modules test_body_batching)
+ (libraries alcotest h3 quic tls mirage-crypto-rng.unix))
+
+(rule
+ (alias runtest)
  (deps
-  (source_tree ../../certificates))
+  (source_tree ../../certificates)
+  test_body.exe)
  (action
   (chdir
    ../..
-   (run %{test}))))
+   (run ./h3/test/test_body.exe))))
+
+(rule
+ (alias runtest)
+ (deps
+  (source_tree ../../certificates)
+  test_body_batching.exe)
+ (action
+  (chdir
+   ../..
+   (run ./h3/test/test_body_batching.exe))))

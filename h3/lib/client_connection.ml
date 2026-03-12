@@ -131,9 +131,7 @@ let process_data_frame (_t : t) stream bs =
   | Received_response (_response, response_body) ->
     let faraday = Body.Reader.unsafe_faraday response_body in
     if not (Faraday.is_closed faraday)
-    then (
-      Faraday.schedule_bigstring faraday bs;
-      flush_response_body response_body)
+    then Faraday.schedule_bigstring faraday bs
   | Awaiting_response _ | Uninitialized | Closed -> assert false
 
 let process_settings_frame t stream _settings_list =
@@ -163,6 +161,7 @@ let read_eof _t stream ~reader () =
   Reader.read_with_more reader Bigstringaf.empty Complete;
   match stream.state with
   | Received_response (_response, response_body) ->
+    flush_response_body response_body;
     Body.Reader.close response_body
   | Uninitialized -> ()
   | _ -> assert false
@@ -177,6 +176,10 @@ let parser_input bs ~off ~len =
 (* TODO: need to schedule read again. *)
 let rec read t stream ~reader bs ~off ~len =
   Reader.read_with_more reader (parser_input bs ~off ~len) Incomplete;
+  (match stream.state with
+  | Received_response (_response, response_body) ->
+    flush_response_body response_body
+  | Awaiting_response _ | Uninitialized | Closed -> ());
   Stream.schedule_read
     stream.stream
     ~on_eof:(read_eof t stream ~reader)

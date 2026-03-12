@@ -17,6 +17,10 @@ let sent_packet_numbers t ~encryption_level =
   let info = sent_info t ~encryption_level in
   Recovery.Q.to_list info.sent |> List.map fst
 
+let sent_packets t ~encryption_level =
+  let info = sent_info t ~encryption_level in
+  Recovery.Q.to_list info.sent |> List.map snd
+
 let sent_size t ~encryption_level =
   let info = sent_info t ~encryption_level in
   Recovery.Q.size info.sent
@@ -1039,18 +1043,20 @@ let test_rfc9002_7_2_sender_blocks_before_draining_queue () =
     true
     (writes < 64)
 
-let test_rfc9002_7_2_initial_window_upper_bound_for_1200_byte_packets () =
+let test_rfc9002_7_2_initial_window_upper_bound_is_enforced_in_bytes () =
   let connection = make_client_connection_for_congestion_tests () in
   let stream = create_data_stream connection in
   queue_stream_payloads stream ~payload_len:1200 ~count:64;
   let _writes = flush_stream_packets_until_pause connection in
   let snapshot = debug_snapshot connection.recovery in
+  let initial_window =
+    Recovery.Constants.initial_window
+      ~max_datagram_size:Recovery.Constants.default_max_datagram_size
+  in
   Alcotest.(check bool)
-    "bytes_in_flight stays within the initial congestion window"
+    "bytes_in_flight must not exceed initial congestion window"
     true
-    (snapshot.congestion.bytes_in_flight
-     <= Recovery.Constants.initial_window
-          ~max_datagram_size:Recovery.Constants.default_max_datagram_size)
+    (snapshot.congestion.bytes_in_flight <= initial_window)
 
 let test_rfc9002_7_2_acknowledgements_unblock_sender () =
   let connection = make_client_connection_for_congestion_tests () in
@@ -1089,6 +1095,103 @@ let test_rfc9002_7_2_ack_only_packets_do_not_reduce_send_budget () =
     "ACK-only packets should not consume congestion window"
     baseline_writes
     writes_with_ack_only
+
+let test_stream_flush_packs_multiple_small_writes_into_one_packet () =
+  let connection = make_client_connection_for_congestion_tests () in
+  let stream = create_data_stream connection in
+  queue_stream_payloads stream ~payload_len:200 ~count:4;
+  let writes = flush_stream_packets_until_pause connection in
+  Alcotest.(check int) "single packet write" 1 writes;
+  match sent_packets connection.recovery ~encryption_level:Application_data with
+  | [ packet ] ->
+    let stream_frames =
+      List.filter_map
+        (function
+          | Frame.Stream { fragment; _ } -> Some fragment.Frame.len
+          | _ -> None)
+        packet.Recovery.frames
+    in
+    Alcotest.(check (list int))
+      "all four writes packed into one packet"
+      [ 200; 200; 200; 200 ]
+      stream_frames
+  | packets ->
+    Alcotest.failf
+      "expected 1 sent packet, got %d"
+      (List.length packets)
+
+let test_stream_flush_preserves_fin_on_last_packed_frame () =
+  let connection = make_client_connection_for_congestion_tests () in
+  let stream = create_data_stream connection in
+  queue_stream_payloads stream ~payload_len:200 ~count:3;
+  Stream.close_writer stream;
+  let writes = flush_stream_packets_until_pause connection in
+  Alcotest.(check bool) "packed stream should finish in at most two packets" true
+    (writes <= 2);
+  let fin_bits =
+    sent_packets connection.recovery ~encryption_level:Application_data
+    |> List.concat_map (fun packet ->
+      List.filter_map
+        (function
+          | Frame.Stream { is_fin; _ } -> Some is_fin
+          | _ -> None)
+        packet.Recovery.frames)
+  in
+  Alcotest.(check (list bool))
+    "only last stream frame carries FIN"
+    [ false; false; false; true ]
+    fin_bits
+
+let test_stream_flush_respects_exact_frame_overhead_budget () =
+  let connection = make_client_connection_for_congestion_tests () in
+  let stream = create_data_stream connection in
+  queue_stream_payloads stream ~payload_len:1 ~count:400;
+  ignore (flush_stream_packets_until_pause connection : int);
+  let sent_packets =
+    sent_packets connection.recovery ~encryption_level:Application_data
+  in
+  Alcotest.(check bool)
+    "stream packing must not overrun the datagram budget"
+    true
+    (List.for_all
+       (fun packet ->
+          packet.Recovery.sent_bytes
+          <= Recovery.Constants.default_max_datagram_size)
+       sent_packets)
+
+let test_application_data_ack_is_delayed_until_second_packet_or_timeout () =
+  let pn = Transport.Packet_number.create () in
+  Transport.Packet_number.note_ack_eliciting_received
+    pn
+    ~encryption_level:Application_data
+    ~now_ms:0L;
+  Alcotest.(check bool) "first application-data packet does not force ACK" false
+    pn.ack_elicited;
+  Alcotest.(check (option int64))
+    "first application-data packet arms delayed ACK timer"
+    (Some 25L)
+    pn.ack_deadline_ms;
+  Transport.Packet_number.note_ack_eliciting_received
+    pn
+    ~encryption_level:Application_data
+    ~now_ms:5L;
+  Alcotest.(check bool) "second application-data packet forces ACK" true
+    pn.ack_elicited;
+  Alcotest.(check (option int64))
+    "forced ACK clears delayed timer"
+    None
+    pn.ack_deadline_ms
+
+let test_handshake_ack_remains_immediate () =
+  let pn = Transport.Packet_number.create () in
+  Transport.Packet_number.note_ack_eliciting_received
+    pn
+    ~encryption_level:Handshake
+    ~now_ms:0L;
+  Alcotest.(check bool) "handshake packet forces immediate ACK" true
+    pn.ack_elicited;
+  Alcotest.(check (option int64)) "no delayed timer for handshake" None
+    pn.ack_deadline_ms
 
 let constants_suite =
   [ "A.2 constants of interest", `Quick, test_rfc9002_a2_constants
@@ -1191,12 +1294,22 @@ let congestion_algorithm_suite =
 let congestion_control_suite =
   [ "§7.2 sender blocks before draining queue", `Quick
     , test_rfc9002_7_2_sender_blocks_before_draining_queue
-  ; "§7.2 initial window upper bound (1200-byte packets)", `Quick
-    , test_rfc9002_7_2_initial_window_upper_bound_for_1200_byte_packets
+  ; "§7.2 initial window upper bound is byte-based", `Quick
+    , test_rfc9002_7_2_initial_window_upper_bound_is_enforced_in_bytes
   ; "§7.2 acknowledgements unblock sender", `Quick
     , test_rfc9002_7_2_acknowledgements_unblock_sender
   ; "§7.2 ACK-only packets do not consume window", `Quick
     , test_rfc9002_7_2_ack_only_packets_do_not_reduce_send_budget
+  ; "stream flush packs multiple small writes into one packet", `Quick
+    , test_stream_flush_packs_multiple_small_writes_into_one_packet
+  ; "stream flush preserves FIN on last packed frame", `Quick
+    , test_stream_flush_preserves_fin_on_last_packed_frame
+  ; "stream flush respects exact frame overhead budget", `Quick
+    , test_stream_flush_respects_exact_frame_overhead_budget
+  ; "application-data ACK is delayed until threshold or timeout", `Quick
+    , test_application_data_ack_is_delayed_until_second_packet_or_timeout
+  ; "handshake ACK remains immediate", `Quick
+    , test_handshake_ack_remains_immediate
   ]
 
 let () =
