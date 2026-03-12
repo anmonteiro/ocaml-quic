@@ -64,6 +64,56 @@ let serialize_frame frame =
   Quic.Serialize.Frame.write_frame f frame;
   Faraday.serialize_to_string f
 
+let make_connection ?(transport_parameters = Quic.Config.default_transport_parameters) () =
+  let cid = Quic.CID.of_string "test-client-cid" in
+  let tls_state =
+    Quic.Qtls.client
+      ~authenticator:Quic.Config.null_auth
+      ~alpn_protocols:[ "h3" ]
+      ~host:"localhost"
+      (Quic.Transport_parameters.encode [])
+  in
+  let conn =
+    Quic.Transport.Connection.create
+      ~mode:Quic.Crypto.Mode.Client
+      ~peer_address:"peer-address"
+      ~tls_state
+      ~transport_parameters
+      ~now_ms:(fun () -> 0L)
+      ~wakeup_writer:ignore
+      ~shutdown:(fun _ -> ())
+      ~connection_handler:(fun ~cid:_ ~start_stream:_ ->
+        Quic.Transport.F (fun _ -> { Quic.Transport.on_error = ignore }))
+      cid
+  in
+  conn.dest_cid <- Quic.CID.of_string "test-server-cid";
+  Quic.Encryption_level.add
+    Quic.Encryption_level.Initial
+    { Quic.Crypto.encrypter =
+        Quic.Crypto.InitialAEAD.make
+          ~mode:Quic.Crypto.Mode.Client
+          conn.dest_cid
+    ; decrypter = None
+    }
+    conn.encdec;
+  Quic.Encryption_level.add
+    Quic.Encryption_level.Application_data
+    { Quic.Crypto.encrypter =
+        Quic.Crypto.InitialAEAD.make
+          ~mode:Quic.Crypto.Mode.Client
+          conn.dest_cid
+    ; decrypter = None
+    }
+    conn.encdec;
+  conn
+
+let take_queued_frames conn =
+  if Queue.is_empty conn.Quic.Transport.Connection.queued_packets
+  then []
+  else
+    let _header_info, frames = Queue.take conn.queued_packets in
+    frames
+
 let test_fast_frame_parser_roundtrips_payload () =
   let payload =
     let frames =
@@ -294,6 +344,71 @@ let test_frame_validity_by_encryption_level () =
         (frame_allowed_at_encryption_level ~encryption_level frame))
     cases
 
+let test_local_stream_ids_track_direction_separately () =
+  let conn = make_connection () in
+  Quic.Transport.Connection.process_max_streams_frame
+    conn
+    ~direction:Bidirectional
+    3;
+  Quic.Transport.Connection.process_max_streams_frame
+    conn
+    ~direction:Unidirectional
+    2;
+  let bidi1 = conn.start_stream Direction.Bidirectional in
+  let uni1 = conn.start_stream Direction.Unidirectional in
+  let bidi2 = conn.start_stream Direction.Bidirectional in
+  Alcotest.(check int64)
+    "first client bidi stream id"
+    0L
+    (Stream.id bidi1);
+  Alcotest.(check int64)
+    "first client uni stream id"
+    2L
+    (Stream.id uni1);
+  Alcotest.(check int64)
+    "second client bidi stream id"
+    4L
+    (Stream.id bidi2)
+
+let test_max_streams_updates_peer_limit_and_emits_streams_blocked () =
+  let conn = make_connection () in
+  Quic.Transport.Connection.process_max_streams_frame
+    conn
+    ~direction:Bidirectional
+    2;
+  Alcotest.(check int64)
+    "peer bidi stream limit is updated"
+    2L
+    conn.peer_max_streams_bidi;
+  ignore (conn.start_stream Direction.Bidirectional);
+  ignore (conn.start_stream Direction.Bidirectional);
+  Alcotest.check_raises
+    "opening past the peer limit raises"
+    (Invalid_argument "peer stream limit reached")
+    (fun () -> ignore (conn.start_stream Direction.Bidirectional));
+  Alcotest.(check (list string))
+    "peer stream exhaustion emits STREAMS_BLOCKED"
+    [ serialize_frame (Frame.Streams_blocked (Bidirectional, 2)) ]
+    (List.map serialize_frame (take_queued_frames conn))
+
+let test_streams_blocked_reissues_current_limit () =
+  let transport_parameters =
+    Quic.Config.
+      { default_transport_parameters with
+        initial_max_streams_bidi = 4
+      ; initial_max_streams_uni = 8
+      }
+  in
+  let conn = make_connection ~transport_parameters () in
+  Quic.Transport.Connection.process_streams_blocked_frame
+    conn
+    ~direction:Unidirectional
+    1;
+  Alcotest.(check (list string))
+    "receiving STREAMS_BLOCKED below the current limit reissues MAX_STREAMS"
+    [ serialize_frame (Frame.Max_streams (Unidirectional, 8)) ]
+    (List.map serialize_frame (take_queued_frames conn))
+
 let suite =
   [ "parser", `Quick, test_parser
   ; "fast frame roundtrip", `Quick, test_fast_frame_parser_roundtrips_payload
@@ -305,6 +420,13 @@ let suite =
   ; "packet number ack bridging", `Quick, test_packet_number_ack_ranges_merge_bridged_gap
   ; "packet number ack cutoff trim", `Quick, test_packet_number_ack_ranges_trim_cutoff
   ; "frame validity by encryption level", `Quick, test_frame_validity_by_encryption_level
+  ; "local stream ids by direction", `Quick, test_local_stream_ids_track_direction_separately
+  ; ( "max streams updates peer limit"
+    , `Quick
+    , test_max_streams_updates_peer_limit_and_emits_streams_blocked )
+  ; "streams blocked reissues limit", `Quick, test_streams_blocked_reissues_current_limit
   ]
 
-let () = Alcotest.run "parsing" [ "parser", suite ]
+let () =
+  Mirage_crypto_rng_unix.use_default ();
+  Alcotest.run "parsing" [ "parser", suite ]
