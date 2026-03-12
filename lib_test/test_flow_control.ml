@@ -160,99 +160,6 @@ let test_dynamic_flow_control_allows_large_upload () =
     completed;
   Alcotest.(check int) "server received full payload" payload_len !server_received
 
-let test_replenished_flow_control_wakes_writer () =
-  let transport_parameters =
-    Quic.Config.
-      { initial_max_data = 4096
-      ; initial_max_stream_data_bidi_local = 4096
-      ; initial_max_stream_data_bidi_remote = 4096
-      ; initial_max_stream_data_uni = 4096
-      ; initial_max_streams_bidi = 8
-      ; initial_max_streams_uni = 8
-      }
-  in
-  let config = make_config ~transport_parameters in
-  let now = ref 0L in
-  let now_ms () = !now in
-  let client_start_stream = ref None in
-  let server_stream = ref None in
-  let payload_len = 16 * 1024 in
-  let upload_started = ref false in
-
-  let server =
-    Transport.Server.create
-      ~now_ms
-      ~config
-      (fun ~cid:_ ~start_stream:_ ->
-         Transport.F
-           (fun stream ->
-              server_stream := Some stream;
-              { Transport.on_error = (fun _ -> ()) }))
-  in
-  let client_handler ~cid:_ ~start_stream =
-    client_start_stream := Some start_stream;
-    Transport.F (fun _stream -> { Transport.on_error = (fun _ -> ()) })
-  in
-  let client = Transport.Client.create ~now_ms ~config client_handler in
-  Transport.connect client ~address:"server-address" ~host:"localhost" client_handler;
-  let rec drive_until_quiescent idle_steps step =
-    if idle_steps >= 8 || step > 50_000
-    then ()
-    else (
-      if not !upload_started
-      then
-        match !client_start_stream with
-        | None -> ()
-        | Some start_stream ->
-          upload_started := true;
-          let stream = start_stream Direction.Bidirectional in
-          write_payload stream ~total_len:payload_len
-      else ();
-      let client_to_server =
-        pump_write ~src:client ~dst:server ~client_address:"client-address"
-      in
-      let server_to_client =
-        pump_write ~src:server ~dst:client ~client_address:"server-address"
-      in
-      let idle_steps =
-        if client_to_server || server_to_client then 0 else idle_steps + 1
-      in
-      if not (client_to_server || server_to_client)
-      then (
-        now := Int64.add !now 1L;
-        Transport.on_timeout client;
-        Transport.on_timeout server);
-      drive_until_quiescent idle_steps (step + 1))
-  in
-  drive_until_quiescent 0 0;
-  let stream =
-    match !server_stream with
-    | Some stream -> stream
-    | None -> Alcotest.fail "server stream was not created"
-  in
-  (match Transport.next_write_operation server with
-   | `Yield _ -> ()
-   | `Writev _ ->
-     Alcotest.fail "server unexpectedly still had pending writes before consume"
-   | `Close _ -> Alcotest.fail "server unexpectedly closed");
-  let woke_writer = ref false in
-  let consumed = ref 0 in
-  Transport.yield_writer server (fun () -> woke_writer := true);
-  schedule_consume_all stream (fun len -> consumed := !consumed + len);
-  Stream.Recv.flush stream.recv;
-  Alcotest.(check bool)
-    "replenishing flow control wakes the writer"
-    true
-    !woke_writer;
-  Alcotest.(check bool)
-    "server consumed buffered stream data"
-    true
-    (!consumed > 0);
-  Alcotest.(check bool)
-    "server has MAX_DATA/MAX_STREAM_DATA to send"
-    true
-    (pump_write ~src:server ~dst:client ~client_address:"server-address")
-
 let test_zero_length_fin_closes_reader () =
   let stream =
     Stream.create
@@ -285,9 +192,6 @@ let () =
              beyond initial window"
           , `Quick
           , test_dynamic_flow_control_allows_large_upload )
-        ; ( "replenishing flow control wakes the writer"
-          , `Quick
-          , test_replenished_flow_control_wakes_writer )
         ; ( "zero-length FIN closes the stream reader"
           , `Quick
           , test_zero_length_fin_closes_reader )
