@@ -284,7 +284,8 @@ end
 
 module Send = struct
   type t =
-    { mutable q : Q.t
+    { mutable deferred : Q.t
+    ; fresh : Frame.fragment Queue.t
     ; mutable offset : int (* TODO: int64? *)
     ; producer : Buffer.t
     ; mutable fin_offset : int option
@@ -303,21 +304,27 @@ module Send = struct
   let push payload t =
     let len = String.length payload in
     let fragment = { Frame.off = t.offset; len; payload; payload_off = 0 } in
-    let q' = Q.add t.offset fragment t.q in
-    t.q <- q';
+    Queue.add fragment t.fresh;
     t.offset <- t.offset + len;
     fragment
 
   let pop t =
-    match Q.pop t.q with
-    | Some ((_off, fragment), q') ->
-      t.q <- q';
+    let next_fragment () =
+      match Q.pop t.deferred with
+      | Some ((_off, fragment), q') ->
+        t.deferred <- q';
+        Some fragment
+      | None ->
+        if Queue.is_empty t.fresh then None else Some (Queue.take t.fresh)
+    in
+    match next_fragment () with
+    | Some fragment ->
       let is_fin =
         match t.fin_offset with
         | None -> false
         | Some fin_offset ->
           assert (fin_offset = t.offset);
-          Q.is_empty q'
+          Q.is_empty t.deferred && Queue.is_empty t.fresh
       in
       Some (fragment, is_fin)
     | None -> None
@@ -328,15 +335,16 @@ module Send = struct
     | None -> failwith "Quic.Stream.Send.pop_exn"
 
   let remove off t =
-    let q' = Q.remove off t.q in
-    t.q <- q'
+    let q' = Q.remove off t.deferred in
+    t.deferred <- q'
 
   let requeue fragment t =
-    let q' = Q.add fragment.Frame.off fragment t.q in
-    t.q <- q'
+    let q' = Q.add fragment.Frame.off fragment t.deferred in
+    t.deferred <- q'
 
   let create when_ready =
-    { q = Q.empty
+    { deferred = Q.empty
+    ; fresh = Queue.create ()
     ; offset = 0
     ; producer =
         (* TODO: configurable size? *)
@@ -347,7 +355,7 @@ module Send = struct
   let has_pending_output t =
     (* Force another write poll to make sure that a frame with the fin bit set
        is sent. *)
-    not (Q.is_empty t.q)
+    not (Q.is_empty t.deferred) || not (Queue.is_empty t.fresh)
 
   (* TODO: this is probably not needed? *)
   (* || Option.is_none t.fin_offset *)
