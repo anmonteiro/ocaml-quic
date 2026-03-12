@@ -234,6 +234,52 @@ let test_server_rejects_duplicate_critical_streams () =
     [ H3__Error.Code.serialize H3__Error.Code.Stream_creation_error ]
     (List.rev !app_errors)
 
+let test_client_processes_goaway_monotonically () =
+  let conn, _handler =
+    H3__Client_connection.create
+      ~error_handler:(fun _ -> Alcotest.fail "unexpected client H3 error")
+      ~cid:"client-goaway"
+      ~start_stream:(make_start_stream `Client)
+  in
+  let app_errors = ref [] in
+  let stream =
+    make_peer_quic_stream `Server ~id:3L app_errors |> make_client_h3_stream
+  in
+  H3__Client_connection.process_goaway_frame conn stream 8;
+  H3__Client_connection.process_goaway_frame conn stream 4;
+  Alcotest.(check (option int))
+    "client keeps the smallest received GOAWAY stream id"
+    (Some 4)
+    conn.peer_goaway;
+  H3__Client_connection.process_goaway_frame conn stream 2;
+  Alcotest.(check (list int))
+    "invalid GOAWAY id closes the connection"
+    [ H3__Error.Code.serialize H3__Error.Code.Id_error ]
+    (List.rev !app_errors)
+
+let test_server_processes_goaway_monotonically () =
+  let conn, _handler =
+    H3__Server_connection.create_connection
+      (fun _reqd -> Alcotest.fail "unexpected request")
+      ~cid:"server-goaway"
+      ~start_stream:(make_start_stream `Server)
+  in
+  let app_errors = ref [] in
+  let stream =
+    make_peer_quic_stream `Client ~id:2L app_errors |> make_server_h3_stream
+  in
+  H3__Server_connection.process_goaway_frame conn stream 10;
+  H3__Server_connection.process_goaway_frame conn stream 6;
+  Alcotest.(check (option int))
+    "server keeps the smallest received GOAWAY push id"
+    (Some 6)
+    conn.peer_goaway;
+  H3__Server_connection.process_goaway_frame conn stream 12;
+  Alcotest.(check (list int))
+    "increasing GOAWAY push id closes the connection"
+    [ H3__Error.Code.serialize H3__Error.Code.Id_error ]
+    (List.rev !app_errors)
+
 let test_buffered_request_body_delivery () =
   let request_payload = String.init (256 * 1024) (fun i -> Char.chr (97 + (i mod 26))) in
   let buffered_reqqd = ref None in
@@ -431,6 +477,8 @@ let () =
       , [ "unknown unidirectional stream type", `Quick, test_unknown_unidirectional_stream_type_is_ignored
         ; "client duplicate critical stream", `Quick, test_client_rejects_duplicate_critical_streams
         ; "server duplicate critical stream", `Quick, test_server_rejects_duplicate_critical_streams
+        ; "client goaway", `Quick, test_client_processes_goaway_monotonically
+        ; "server goaway", `Quick, test_server_processes_goaway_monotonically
         ; "buffered request body delivery", `Quick, test_buffered_request_body_delivery
         ; "buffered response body delivery", `Quick, test_buffered_response_body_delivery
         ; "bigstring response body write", `Quick, test_bigstring_response_body_write
