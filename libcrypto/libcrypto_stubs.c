@@ -641,6 +641,93 @@ fail:
   CAMLreturn(Val_int(0));
 }
 
+static value ocaml_quic_aead_decrypt_with_ctx_bytes_impl(
+    value vctx, const unsigned char *nonce, value vsrc, value vadata_len,
+    value vciphertext_off, value vciphertext_len) {
+  CAMLparam4(vctx, vsrc, vadata_len, vciphertext_len);
+  CAMLxparam1(vciphertext_off);
+  CAMLlocal2(result, some);
+  struct ocaml_quic_aead_ctx *ctx = Data_custom_val(vctx);
+  int adata_len = Int_val(vadata_len);
+  int ciphertext_off = Int_val(vciphertext_off);
+  int ciphertext_len = Int_val(vciphertext_len);
+  int plaintext_len = ciphertext_len - ctx->tag_len;
+  int out_len = 0;
+  int len = 0;
+  mlsize_t src_len = caml_string_length(vsrc);
+  const unsigned char *src;
+  const unsigned char *adata;
+  const unsigned char *ciphertext;
+
+  if (!ctx->encrypt)
+    ;
+  else
+    caml_invalid_argument("OpenSSL_crypto.aead_decrypt_with_ctx_pn_bytes");
+
+  if (adata_len < 0 || ciphertext_off < 0 || ciphertext_len < 0 ||
+      (uintnat)adata_len > src_len || (uintnat)ciphertext_off > src_len ||
+      (uintnat)ciphertext_len > src_len - (uintnat)ciphertext_off)
+    caml_invalid_argument("OpenSSL_crypto.aead_decrypt_with_ctx_pn_bytes");
+
+  if (plaintext_len < 0)
+    CAMLreturn(Val_int(0));
+
+  result = caml_alloc_string(plaintext_len);
+  ctx = Data_custom_val(vctx);
+  src = (const unsigned char *)Bytes_val(vsrc);
+  adata = src;
+  ciphertext = src + ciphertext_off;
+
+  if (EVP_DecryptInit_ex(ctx->ctx, NULL, NULL, NULL, nonce) <= 0)
+    goto fail;
+  if (adata_len > 0 &&
+      EVP_DecryptUpdate(ctx->ctx, NULL, &len, adata, adata_len) <= 0)
+    goto fail;
+  if (plaintext_len > 0 &&
+      EVP_DecryptUpdate(ctx->ctx, (unsigned char *)Bytes_val(result), &len,
+                        ciphertext, plaintext_len) <= 0)
+    goto fail;
+  out_len = len;
+  if (EVP_CIPHER_CTX_ctrl(ctx->ctx, EVP_CTRL_AEAD_SET_TAG, ctx->tag_len,
+                          (void *)(ciphertext + plaintext_len)) <= 0)
+    goto fail;
+  if (EVP_DecryptFinal_ex(ctx->ctx, (unsigned char *)Bytes_val(result) + out_len,
+                          &len) <= 0)
+    goto fail;
+  out_len += len;
+  if (out_len != plaintext_len)
+    goto fail;
+
+  some = ocaml_quic_some(result);
+  CAMLreturn(some);
+
+fail:
+  CAMLreturn(Val_int(0));
+}
+
+CAMLprim value ocaml_quic_openssl_aead_decrypt_with_ctx_pn_bytes(
+    value vctx, value viv, value vpacket_number, value vsrc, value vadata_len,
+    value vciphertext_off, value vciphertext_len) {
+  CAMLparam5(vctx, viv, vpacket_number, vsrc, vadata_len);
+  CAMLxparam2(vciphertext_off, vciphertext_len);
+  size_t nonce_len = caml_string_length(viv);
+  unsigned char nonce_buf[32];
+
+  if (nonce_len > sizeof(nonce_buf))
+    caml_invalid_argument("OpenSSL_crypto.aead_decrypt_with_ctx_pn_bytes");
+
+  ocaml_quic_make_nonce(nonce_buf, nonce_len, viv, vpacket_number);
+  CAMLreturn(ocaml_quic_aead_decrypt_with_ctx_bytes_impl(
+      vctx, nonce_buf, vsrc, vadata_len, vciphertext_off, vciphertext_len));
+}
+
+CAMLprim value ocaml_quic_openssl_aead_decrypt_with_ctx_pn_bytes_bytecode(
+    value *argv, int argn) {
+  (void)argn;
+  return ocaml_quic_openssl_aead_decrypt_with_ctx_pn_bytes(
+      argv[0], argv[1], argv[2], argv[3], argv[4], argv[5], argv[6]);
+}
+
 CAMLprim value ocaml_quic_openssl_aead_encrypt_with_ctx(value vctx,
                                                         value vnonce,
                                                         value vadata,
@@ -811,6 +898,92 @@ CAMLprim value ocaml_quic_openssl_hp_encrypt_header_aes_ecb(value vkey,
   CAMLreturn(result);
 }
 
+CAMLprim value ocaml_quic_openssl_hp_encrypt_header_aes_ecb_at(value vkey,
+                                                               value vsample_src,
+                                                               value vsample_off,
+                                                               value vheader) {
+  CAMLparam4(vkey, vsample_src, vsample_off, vheader);
+  CAMLlocal1(result);
+  AES_KEY aes_key;
+  unsigned char block[16];
+  int ok;
+  mlsize_t src_len = caml_string_length(vsample_src);
+  long sample_off = Long_val(vsample_off);
+  mlsize_t header_len = caml_string_length(vheader);
+  int first;
+  int pn_length;
+  int pn_offset;
+  int masked_bits;
+  int i;
+
+  if (sample_off < 0 || (uintnat)sample_off + 16 > src_len)
+    caml_invalid_argument("OpenSSL_crypto.hp_encrypt_header_aes_ecb_at");
+
+  switch (caml_string_length(vkey)) {
+  case 16:
+    ok = AES_set_encrypt_key((const unsigned char *)String_val(vkey), 128, &aes_key);
+    break;
+  case 32:
+    ok = AES_set_encrypt_key((const unsigned char *)String_val(vkey), 256, &aes_key);
+    break;
+  default:
+    caml_invalid_argument("OpenSSL_crypto.hp_encrypt_header_aes_ecb_at");
+  }
+  if (ok != 0)
+    ocaml_quic_fail_openssl("OpenSSL_crypto.hp_encrypt_header_aes_ecb_at");
+
+  AES_encrypt((const unsigned char *)Bytes_val(vsample_src) + sample_off, block,
+              &aes_key);
+  result = caml_alloc_string(header_len);
+  memcpy(Bytes_val(result), String_val(vheader), header_len);
+
+  first = Bytes_val(result)[0];
+  pn_length = (first & 0x03) + 1;
+  pn_offset = (int)header_len - pn_length;
+  masked_bits = (first & 0x80) ? 0x0f : 0x1f;
+  Bytes_val(result)[0] = first ^ (block[0] & masked_bits);
+  for (i = 0; i < pn_length; i++)
+    Bytes_val(result)[pn_offset + i] ^= block[i + 1];
+
+  CAMLreturn(result);
+}
+
+CAMLprim value ocaml_quic_openssl_hp_encrypt_header_aes_ecb_ctx_at(value vctx,
+                                                                   value vsample_src,
+                                                                   value vsample_off,
+                                                                   value vheader) {
+  CAMLparam4(vctx, vsample_src, vsample_off, vheader);
+  CAMLlocal1(result);
+  struct ocaml_quic_hp_aes_ctx *ctx = Data_custom_val(vctx);
+  unsigned char block[16];
+  mlsize_t src_len = caml_string_length(vsample_src);
+  long sample_off = Long_val(vsample_off);
+  mlsize_t header_len = caml_string_length(vheader);
+  int first;
+  int pn_length;
+  int pn_offset;
+  int masked_bits;
+  int i;
+
+  if (sample_off < 0 || (uintnat)sample_off + 16 > src_len)
+    caml_invalid_argument("OpenSSL_crypto.hp_encrypt_header_aes_ecb_ctx_at");
+
+  AES_encrypt((const unsigned char *)Bytes_val(vsample_src) + sample_off, block,
+              &ctx->aes_key);
+  result = caml_alloc_string(header_len);
+  memcpy(Bytes_val(result), String_val(vheader), header_len);
+
+  first = Bytes_val(result)[0];
+  pn_length = (first & 0x03) + 1;
+  pn_offset = (int)header_len - pn_length;
+  masked_bits = (first & 0x80) ? 0x0f : 0x1f;
+  Bytes_val(result)[0] = first ^ (block[0] & masked_bits);
+  for (i = 0; i < pn_length; i++)
+    Bytes_val(result)[pn_offset + i] ^= block[i + 1];
+
+  CAMLreturn(result);
+}
+
 CAMLprim value ocaml_quic_openssl_hp_decrypt_header_aes_ecb(value vkey,
                                                             value vsample,
                                                             value vpn_offset,
@@ -842,6 +1015,82 @@ CAMLprim value ocaml_quic_openssl_hp_decrypt_header_aes_ecb(value vkey,
     ocaml_quic_fail_openssl("OpenSSL_crypto.hp_decrypt_header_aes_ecb");
 
   AES_encrypt((const unsigned char *)String_val(vsample), block, &aes_key);
+  first = Bytes_val(vciphertext)[0];
+  masked_bits = (first & 0x80) ? 0x0f : 0x1f;
+  Bytes_val(vciphertext)[0] = first ^ (block[0] & masked_bits);
+  pn_length = (Bytes_val(vciphertext)[0] & 0x03) + 1;
+  for (i = 0; i < pn_length; i++)
+    Bytes_val(vciphertext)[pn_offset + i] ^= block[i + 1];
+
+  CAMLreturn(vciphertext);
+}
+
+CAMLprim value ocaml_quic_openssl_hp_decrypt_header_aes_ecb_at(value vkey,
+                                                               value vsample_src,
+                                                               value vsample_off,
+                                                               value vpn_offset,
+                                                               value vciphertext) {
+  CAMLparam5(vkey, vsample_src, vsample_off, vpn_offset, vciphertext);
+  AES_KEY aes_key;
+  unsigned char block[16];
+  int ok;
+  mlsize_t src_len = caml_string_length(vsample_src);
+  long sample_off = Long_val(vsample_off);
+  int first;
+  int pn_length;
+  int pn_offset = Int_val(vpn_offset);
+  int masked_bits;
+  int i;
+
+  if (sample_off < 0 || (uintnat)sample_off + 16 > src_len)
+    caml_invalid_argument("OpenSSL_crypto.hp_decrypt_header_aes_ecb_at");
+
+  switch (caml_string_length(vkey)) {
+  case 16:
+    ok = AES_set_encrypt_key((const unsigned char *)String_val(vkey), 128, &aes_key);
+    break;
+  case 32:
+    ok = AES_set_encrypt_key((const unsigned char *)String_val(vkey), 256, &aes_key);
+    break;
+  default:
+    caml_invalid_argument("OpenSSL_crypto.hp_decrypt_header_aes_ecb_at");
+  }
+  if (ok != 0)
+    ocaml_quic_fail_openssl("OpenSSL_crypto.hp_decrypt_header_aes_ecb_at");
+
+  AES_encrypt((const unsigned char *)Bytes_val(vsample_src) + sample_off, block,
+              &aes_key);
+  first = Bytes_val(vciphertext)[0];
+  masked_bits = (first & 0x80) ? 0x0f : 0x1f;
+  Bytes_val(vciphertext)[0] = first ^ (block[0] & masked_bits);
+  pn_length = (Bytes_val(vciphertext)[0] & 0x03) + 1;
+  for (i = 0; i < pn_length; i++)
+    Bytes_val(vciphertext)[pn_offset + i] ^= block[i + 1];
+
+  CAMLreturn(vciphertext);
+}
+
+CAMLprim value ocaml_quic_openssl_hp_decrypt_header_aes_ecb_ctx_at(value vctx,
+                                                                   value vsample_src,
+                                                                   value vsample_off,
+                                                                   value vpn_offset,
+                                                                   value vciphertext) {
+  CAMLparam5(vctx, vsample_src, vsample_off, vpn_offset, vciphertext);
+  struct ocaml_quic_hp_aes_ctx *ctx = Data_custom_val(vctx);
+  unsigned char block[16];
+  mlsize_t src_len = caml_string_length(vsample_src);
+  long sample_off = Long_val(vsample_off);
+  int first;
+  int pn_length;
+  int pn_offset = Int_val(vpn_offset);
+  int masked_bits;
+  int i;
+
+  if (sample_off < 0 || (uintnat)sample_off + 16 > src_len)
+    caml_invalid_argument("OpenSSL_crypto.hp_decrypt_header_aes_ecb_ctx_at");
+
+  AES_encrypt((const unsigned char *)Bytes_val(vsample_src) + sample_off, block,
+              &ctx->aes_key);
   first = Bytes_val(vciphertext)[0];
   masked_bits = (first & 0x80) ? 0x0f : 0x1f;
   Bytes_val(vciphertext)[0] = first ^ (block[0] & masked_bits);

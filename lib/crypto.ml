@@ -204,6 +204,7 @@ module AEAD = struct
     ; tag_len : int
     ; enc_ctx : Libcrypto.aead_ctx option
     ; dec_ctx : Libcrypto.aead_ctx option
+    ; hp_ctx : Libcrypto.hp_aes_ctx option
     }
 
   type cipher_st =
@@ -537,6 +538,26 @@ module AEAD = struct
       apply_header_mask ~mask header
     | `OpenSSL -> Libcrypto.hp_encrypt_header_aes_ecb ~key:t.hp_key ~sample ~header
 
+  let encrypt_header_ecb_at t ~sample_src ~sample_off header =
+    match !backend with
+    | `Legacy ->
+      let sample = Bytes.sub_string sample_src sample_off 16 in
+      encrypt_header_ecb t ~sample header
+    | `OpenSSL ->
+      (match t.cipher with
+       | OpenSSL { hp_ctx = Some hp_ctx; _ } ->
+         Libcrypto.hp_encrypt_header_aes_ecb_ctx_at
+           hp_ctx
+           ~sample_src
+           ~sample_off
+           ~header
+       | _ ->
+         Libcrypto.hp_encrypt_header_aes_ecb_at
+           ~key:t.hp_key
+           ~sample_src
+           ~sample_off
+           ~header)
+
   let decrypt_header_ecb_in_place t ~sample ciphertext =
     match !backend with
     | `Legacy ->
@@ -553,6 +574,29 @@ module AEAD = struct
         ~sample
         ~pn_offset
         ~ciphertext
+
+  let decrypt_header_ecb_in_place_at t ~sample_src ~sample_off ciphertext =
+    match !backend with
+    | `Legacy ->
+      let sample = Bytes.sub_string sample_src sample_off 16 in
+      decrypt_header_ecb_in_place t ~sample ciphertext
+    | `OpenSSL ->
+      let pn_offset = sample_offset ~conn_id_len:t.conn_id_len ciphertext - 4 in
+      (match t.cipher with
+       | OpenSSL { hp_ctx = Some hp_ctx; _ } ->
+         Libcrypto.hp_decrypt_header_aes_ecb_ctx_at
+           hp_ctx
+           ~sample_src
+           ~sample_off
+           ~pn_offset
+           ~ciphertext
+       | _ ->
+         Libcrypto.hp_decrypt_header_aes_ecb_at
+           ~key:t.hp_key
+           ~sample_src
+           ~sample_off
+           ~pn_offset
+           ~ciphertext)
 
   let encrypt_or_decrypt_header_chacha20 t f ~sample header =
     let mask =
@@ -613,8 +657,14 @@ module AEAD = struct
        *  of frames for a 2-byte packet number encoding. *)
       4 - packet_number_length_str header
     in
-    let sample = Bytes.sub_string sealed_payload offset 16 in
-    let encrypted_header = encrypt_header t ~sample header in
+    let encrypted_header =
+      match t.ciphersuite with
+      | Tls.Ciphersuite.AES_128_GCM | AES_256_GCM | AES_128_CCM | AES_256_CCM ->
+        encrypt_header_ecb_at t ~sample_src:sealed_payload ~sample_off:offset header
+      | CHACHA20_POLY1305 ->
+        let sample = Bytes.sub_string sealed_payload offset 16 in
+        encrypt_header t ~sample header
+    in
     Bytes.unsafe_to_string encrypted_header, Bytes.unsafe_to_string sealed_payload
 
   let encrypt_packet t ~packet_number ~header data =
@@ -632,8 +682,18 @@ module AEAD = struct
 
   let decrypt_packet_bytes t ~payload_length ~largest_pn ciphertext =
     let offset = sample_offset ~conn_id_len:t.conn_id_len ciphertext in
-    let sample = Bytes.sub_string ciphertext offset 16 in
-    let header = decrypt_header_in_place t ~sample ciphertext in
+    let header =
+      match t.ciphersuite with
+      | Tls.Ciphersuite.AES_128_GCM | AES_256_GCM | AES_128_CCM | AES_256_CCM ->
+        decrypt_header_ecb_in_place_at
+          t
+          ~sample_src:ciphertext
+          ~sample_off:offset
+          ciphertext
+      | CHACHA20_POLY1305 ->
+        let sample = Bytes.sub_string ciphertext offset 16 in
+        decrypt_header_in_place t ~sample ciphertext
+    in
     let pn_length = packet_number_length header in
     let off = offset - 4 in
     let truncated_pn =
@@ -663,17 +723,31 @@ module AEAD = struct
     let pn =
       decode_packet_number ~largest_pn ~pn_nbits:(8 * pn_length) ~truncated_pn
     in
-    let header, ciphertext =
-      ( Bytes.sub ciphertext 0 (off + pn_length) |> Bytes.unsafe_to_string
-      , (* This cstruct can have coalesced packets. we just want to decrypt the
-           ciphertext of `payload_length - packet_number_length`. *)
-        Bytes.sub ciphertext (off + pn_length) (payload_length - pn_length)
-        |> Bytes.unsafe_to_string )
+    let header_len = off + pn_length in
+    let header = Bytes.sub ciphertext 0 header_len |> Bytes.unsafe_to_string in
+    let ciphertext_len = payload_length - pn_length in
+    let plaintext =
+      match t.cipher with
+      | OpenSSL { dec_ctx = Some ctx; _ } when ciphertext_len >= 1024 ->
+        Libcrypto.aead_decrypt_with_ctx_pn_bytes
+          ctx
+          ~iv:t.iv
+          ~packet_number:pn
+          ~src:ciphertext
+          ~adata_len:header_len
+          ~ciphertext_off:header_len
+          ~ciphertext_len
+      | _ ->
+        let ciphertext =
+          (* This cstruct can have coalesced packets. we just want to decrypt
+             the ciphertext of `payload_length - packet_number_length`. *)
+          Bytes.sub ciphertext header_len ciphertext_len
+          |> Bytes.unsafe_to_string
+        in
+        decrypt_payload_into t ~packet_number:pn ~header ciphertext
     in
-
-    match decrypt_payload_into t ~packet_number:pn ~header ciphertext with
-    | Some plaintext ->
-      Some { pn_length; packet_number = pn; header; plaintext }
+    match plaintext with
+    | Some plaintext -> Some { pn_length; packet_number = pn; header; plaintext }
     | None -> None
 
   (* Ciphertext includes header + payload *)
@@ -746,6 +820,11 @@ module AEAD = struct
               (if use_ctx
                then Some (Libcrypto.aead_decrypt_ctx cipher ~key ~nonce_len:ivn)
                else None)
+          ; hp_ctx =
+              (match ciphersuite13 with
+               | Tls.Ciphersuite.AES_128_GCM | AES_256_GCM | AES_128_CCM
+               | AES_256_CCM -> Some (Libcrypto.hp_aes_ctx ~key:hp_key)
+               | CHACHA20_POLY1305 -> None)
           }
     in
     { conn_id_len = CID.src_length
