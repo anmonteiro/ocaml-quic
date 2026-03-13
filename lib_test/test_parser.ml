@@ -4,6 +4,26 @@ open Quic
 let hex = Alcotest.of_pp Hex.pp
 let expected_dest_cid = `Hex "cb6241dbbc172d3ebf33a83a2271cd0c559293c9"
 
+let read_file path =
+  In_channel.with_open_bin path (fun ic ->
+    let n = in_channel_length ic in
+    really_input_string ic n)
+
+let server_certificates () =
+  let certchain =
+    let pem = read_file "./certificates/server.pem" in
+    match X509.Certificate.decode_pem_multiple pem with
+    | Ok certchain -> certchain
+    | Error (`Msg m) -> failwith m
+  in
+  let priv_key =
+    let pem = read_file "./certificates/server.key" in
+    match X509.Private_key.decode_pem pem with
+    | Ok x -> x
+    | Error (`Msg m) -> failwith m
+  in
+  `Single (certchain, priv_key)
+
 let plaintext =
   Hex.to_string
     (`Hex
@@ -64,18 +84,27 @@ let serialize_frame frame =
   Quic.Serialize.Frame.write_frame f frame;
   Faraday.serialize_to_string f
 
-let make_connection ?(transport_parameters = Quic.Config.default_transport_parameters) () =
+let make_connection
+      ?(mode = Quic.Crypto.Mode.Client)
+      ?(remember_new_token = ignore)
+      ?(transport_parameters = Quic.Config.default_transport_parameters)
+      ()
+  =
   let cid = Quic.CID.of_string "test-client-cid" in
   let tls_state =
-    Quic.Qtls.client
-      ~authenticator:Quic.Config.null_auth
-      ~alpn_protocols:[ "h3" ]
-      ~host:"localhost"
-      (Quic.Transport_parameters.encode [])
+    match mode with
+    | Quic.Crypto.Mode.Client ->
+      Quic.Qtls.client
+        ~authenticator:Quic.Config.null_auth
+        ~alpn_protocols:[ "h3" ]
+        ~host:"localhost"
+        (Quic.Transport_parameters.encode [])
+    | Server ->
+      Quic.Qtls.server ~certificates:(server_certificates ()) ~alpn_protocols:[ "h3" ]
   in
   let conn =
     Quic.Transport.Connection.create
-      ~mode:Quic.Crypto.Mode.Client
+      ~mode
       ~peer_address:"peer-address"
       ~tls_state
       ~transport_parameters
@@ -84,14 +113,19 @@ let make_connection ?(transport_parameters = Quic.Config.default_transport_param
       ~shutdown:(fun _ -> ())
       ~connection_handler:(fun ~cid:_ ~start_stream:_ ->
         Quic.Transport.F (fun _ -> { Quic.Transport.on_error = ignore }))
+      ~remember_new_token
       cid
   in
-  conn.dest_cid <- Quic.CID.of_string "test-server-cid";
+  conn.dest_cid <-
+    Quic.CID.of_string
+      (match mode with
+      | Quic.Crypto.Mode.Client -> "test-server-cid"
+      | Server -> "test-client-cid");
   Quic.Encryption_level.add
     Quic.Encryption_level.Initial
     { Quic.Crypto.encrypter =
         Quic.Crypto.InitialAEAD.make
-          ~mode:Quic.Crypto.Mode.Client
+          ~mode
           conn.dest_cid
     ; decrypter = None
     }
@@ -100,19 +134,22 @@ let make_connection ?(transport_parameters = Quic.Config.default_transport_param
     Quic.Encryption_level.Application_data
     { Quic.Crypto.encrypter =
         Quic.Crypto.InitialAEAD.make
-          ~mode:Quic.Crypto.Mode.Client
+          ~mode
           conn.dest_cid
     ; decrypter = None
     }
     conn.encdec;
   conn
 
-let take_queued_frames conn =
+let take_queued_packet conn =
   if Queue.is_empty conn.Quic.Transport.Connection.queued_packets
-  then []
-  else
-    let _header_info, frames = Queue.take conn.queued_packets in
-    frames
+  then None
+  else Some (Queue.take conn.queued_packets)
+
+let take_queued_frames conn =
+  match take_queued_packet conn with
+  | None -> []
+  | Some (_header_info, frames) -> frames
 
 let test_fast_frame_parser_roundtrips_payload () =
   let payload =
@@ -440,6 +477,79 @@ let test_stream_data_blocked_reissues_current_limit () =
     [ serialize_frame (Frame.Max_stream_data { stream_id = 1L; max_data = 2048 }) ]
     (List.map serialize_frame (take_queued_frames conn))
 
+let test_new_token_is_remembered_on_client () =
+  let remembered = ref None in
+  let conn =
+    make_connection
+      ~remember_new_token:(fun token -> remembered := Some token)
+      ()
+  in
+  let token = "fresh-token" in
+  let data = Bigstringaf.of_string ~off:0 ~len:(String.length token) token in
+  let packet_info =
+    { Quic.Transport.packet_number = 0L
+    ; header =
+        Packet.Header.Short
+          { dest_cid = Quic.CID.of_string "test-server-cid" }
+    ; encryption_level = Encryption_level.Application_data
+    ; connection = conn
+    ; packet_has_ack_eliciting_frame = false
+    }
+  in
+  Quic.Transport.Connection.frame_handler
+    ~packet_info
+    conn
+    (Frame.New_token { length = String.length token; data });
+  Alcotest.(check (option string))
+    "client remembers NEW_TOKEN payload"
+    (Some token)
+    !remembered
+
+let test_connect_uses_remembered_new_token () =
+  let config =
+    Quic.Config.
+      { certificates = server_certificates ()
+      ; alpn_protocols = [ "h3" ]
+      ; transport_parameters = default_transport_parameters
+      }
+  in
+  let transport =
+    Quic.Transport.Client.create
+      ~now_ms:(fun () -> 0L)
+      ~config
+      (fun ~cid:_ ~start_stream:_ ->
+         Quic.Transport.F (fun _ -> { Quic.Transport.on_error = ignore }))
+  in
+  transport.remembered_new_token <- Some "cached-token";
+  Quic.Transport.connect
+    transport
+    ~address:"peer-address"
+    ~host:"localhost"
+    (fun ~cid:_ ~start_stream:_ ->
+       Quic.Transport.F (fun _ -> { Quic.Transport.on_error = ignore }));
+  let connection =
+    Quic.Transport.Connection.Table.to_seq_values transport.connections
+    |> List.of_seq
+    |> List.hd
+  in
+  Alcotest.(check string)
+    "cached NEW_TOKEN is copied into the next client connection"
+    "cached-token"
+    connection.token_value
+
+let test_server_issues_new_token_frame () =
+  let conn = make_connection ~mode:Quic.Crypto.Mode.Server () in
+  conn.encdec.current <- Encryption_level.Application_data;
+  Quic.Transport.Connection.issue_new_token conn;
+  match take_queued_frames conn with
+  | [ Frame.New_token { length; data } ] ->
+    Alcotest.(check bool) "issued token is not empty" true (length > 0);
+    Alcotest.(check int)
+      "NEW_TOKEN length matches payload"
+      length
+      (Bigstringaf.length data)
+  | _ -> Alcotest.fail "expected a single NEW_TOKEN frame"
+
 let suite =
   [ "parser", `Quick, test_parser
   ; "fast frame roundtrip", `Quick, test_fast_frame_parser_roundtrips_payload
@@ -460,6 +570,9 @@ let suite =
   ; ( "stream data blocked reissues limit"
     , `Quick
     , test_stream_data_blocked_reissues_current_limit )
+  ; "client remembers NEW_TOKEN", `Quick, test_new_token_is_remembered_on_client
+  ; "connect uses remembered NEW_TOKEN", `Quick, test_connect_uses_remembered_new_token
+  ; "server issues NEW_TOKEN", `Quick, test_server_issues_new_token_frame
   ]
 
 let () =
