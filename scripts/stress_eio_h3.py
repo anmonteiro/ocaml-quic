@@ -14,6 +14,7 @@ import time
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SERVER = ROOT / "_build/default/examples/eio/eio_h3_echo_server.exe"
 CLIENT = ROOT / "_build/default/examples/eio/eio_h3_client.exe"
+CURL = os.environ.get("CURL", "curl")
 
 
 def ensure_file(path: pathlib.Path, size_mib: int) -> pathlib.Path:
@@ -55,6 +56,20 @@ def run_client(args, stderr_path: pathlib.Path, timeout_s: float) -> str:
     return stderr_path.read_text(errors="replace")
 
 
+def run_command(args, log_path: pathlib.Path, timeout_s: float) -> str:
+    with open(log_path, "wb") as log:
+        proc = subprocess.Popen(args, stdout=log, stderr=log, cwd=ROOT)
+        try:
+            rc = proc.wait(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            raise RuntimeError(f"command timed out: {' '.join(args)}")
+    if rc != 0:
+        raise RuntimeError(f"command exited with {rc}: {' '.join(args)}\n{log_path.read_text(errors='replace')}")
+    return log_path.read_text(errors="replace")
+
+
 def cancel_client(args, stderr_path: pathlib.Path, cancel_after_s: float, timeout_s: float) -> str:
     with open(os.devnull, "wb") as stdout, open(stderr_path, "wb") as stderr:
         proc = subprocess.Popen(args, stdout=stdout, stderr=stderr, cwd=ROOT)
@@ -67,6 +82,20 @@ def cancel_client(args, stderr_path: pathlib.Path, cancel_after_s: float, timeou
             proc.wait()
             raise RuntimeError(f"cancelled client did not exit: {' '.join(args)}")
     return stderr_path.read_text(errors="replace")
+
+
+def cancel_command(args, log_path: pathlib.Path, cancel_after_s: float, timeout_s: float) -> str:
+    with open(log_path, "wb") as log:
+        proc = subprocess.Popen(args, stdout=log, stderr=log, cwd=ROOT)
+        time.sleep(cancel_after_s)
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            raise RuntimeError(f"cancelled command did not exit: {' '.join(args)}")
+    return log_path.read_text(errors="replace")
 
 
 class ServerProcess:
@@ -89,6 +118,30 @@ class ServerProcess:
 
 def client_args(port: int, host: str, extra):
     return [str(CLIENT), "-p", str(port), *extra, host]
+
+
+def curl_download_args(port: int, host: str):
+    return [
+        CURL,
+        "--http3-only",
+        "-k",
+        "--output",
+        "/dev/null",
+        f"https://{host}:{port}/file",
+    ]
+
+
+def curl_upload_args(port: int, host: str, file_path: pathlib.Path):
+    return [
+        CURL,
+        "--http3-only",
+        "-k",
+        "-X",
+        "POST",
+        "--data-binary",
+        f"@{file_path}",
+        f"https://{host}:{port}/upload",
+    ]
 
 
 def run_download_phase(workdir: pathlib.Path, port: int, host: str, udp_connect: bool, iterations: int,
@@ -166,6 +219,72 @@ def run_cancel_phase(workdir: pathlib.Path, port: int, host: str, udp_connect: b
         server.stop()
 
 
+def run_curl_download_phase(workdir: pathlib.Path, port: int, host: str, iterations: int,
+                            file_path: pathlib.Path, timeout_s: float,
+                            drop_recv_pct: float, drop_send_pct: float) -> None:
+    extra_server = [str(SERVER), "-p", str(port), "-serve-file", str(file_path)]
+    if drop_recv_pct:
+        extra_server += ["-drop-recv-pct", str(drop_recv_pct)]
+    if drop_send_pct:
+        extra_server += ["-drop-send-pct", str(drop_send_pct)]
+    server = ServerProcess(port, extra_server, workdir)
+    try:
+        for i in range(iterations):
+            run_command(
+                curl_download_args(port, host),
+                workdir / f"curl-download-{host}-{i}.log",
+                timeout_s,
+            )
+    finally:
+        server.stop()
+
+
+def run_curl_upload_phase(workdir: pathlib.Path, port: int, host: str, iterations: int,
+                          file_path: pathlib.Path, timeout_s: float,
+                          drop_recv_pct: float, drop_send_pct: float) -> None:
+    extra_server = [str(SERVER), "-p", str(port), "-upload-out", "/dev/null"]
+    if drop_recv_pct:
+        extra_server += ["-drop-recv-pct", str(drop_recv_pct)]
+    if drop_send_pct:
+        extra_server += ["-drop-send-pct", str(drop_send_pct)]
+    server = ServerProcess(port, extra_server, workdir)
+    try:
+        for i in range(iterations):
+            run_command(
+                curl_upload_args(port, host, file_path),
+                workdir / f"curl-upload-{host}-{i}.log",
+                timeout_s,
+            )
+    finally:
+        server.stop()
+
+
+def run_curl_cancel_phase(workdir: pathlib.Path, port: int, host: str, iterations: int,
+                          file_path: pathlib.Path, timeout_s: float, cancel_after_s: float,
+                          drop_recv_pct: float, drop_send_pct: float) -> None:
+    extra_server = [str(SERVER), "-p", str(port), "-upload-out", "/dev/null"]
+    if drop_recv_pct:
+        extra_server += ["-drop-recv-pct", str(drop_recv_pct)]
+    if drop_send_pct:
+        extra_server += ["-drop-send-pct", str(drop_send_pct)]
+    server = ServerProcess(port, extra_server, workdir)
+    try:
+        for i in range(iterations):
+            cancel_command(
+                curl_upload_args(port, host, file_path),
+                workdir / f"curl-cancel-{host}-{i}.log",
+                cancel_after_s,
+                timeout_s,
+            )
+            run_command(
+                curl_upload_args(port, host, file_path),
+                workdir / f"curl-cancel-followup-{host}-{i}.log",
+                timeout_s,
+            )
+    finally:
+        server.stop()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--iterations", type=int, default=20)
@@ -197,6 +316,12 @@ def main() -> int:
         ("cancel", run_cancel_phase, "127.0.0.1", False, cancel_payload, 5606),
         ("cancel", run_cancel_phase, "127.0.0.1", True, cancel_payload, 5607),
         ("cancel", run_cancel_phase, "localhost", True, cancel_payload, 5608),
+        ("curl-download", run_curl_download_phase, "127.0.0.1", None, payload, 5609),
+        ("curl-download", run_curl_download_phase, "localhost", None, payload, 5610),
+        ("curl-upload", run_curl_upload_phase, "127.0.0.1", None, payload, 5611),
+        ("curl-upload", run_curl_upload_phase, "localhost", None, payload, 5612),
+        ("curl-cancel", run_curl_cancel_phase, "127.0.0.1", None, cancel_payload, 5613),
+        ("curl-cancel", run_curl_cancel_phase, "localhost", None, cancel_payload, 5614),
     ]
 
     try:
@@ -216,6 +341,29 @@ def main() -> int:
                     file_path,
                     args.timeout,
                     args.cancel_after,
+                    args.drop_recv_pct,
+                    args.drop_send_pct,
+                )
+            elif name == "curl-cancel":
+                fn(
+                    workdir,
+                    port,
+                    host,
+                    args.iterations,
+                    file_path,
+                    args.timeout,
+                    args.cancel_after,
+                    args.drop_recv_pct,
+                    args.drop_send_pct,
+                )
+            elif name.startswith("curl-"):
+                fn(
+                    workdir,
+                    port,
+                    host,
+                    args.iterations,
+                    file_path,
+                    args.timeout,
                     args.drop_recv_pct,
                     args.drop_send_pct,
                 )
