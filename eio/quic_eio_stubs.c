@@ -21,6 +21,42 @@
 #define IOVEC_OFF(v) Long_val(Field((v), 1))
 #define IOVEC_LEN(v) Long_val(Field((v), 2))
 
+static struct iovec *ocaml_quic_fill_iovecs(value viovecs,
+                                            struct iovec *small_iov,
+                                            size_t small_cap,
+                                            mlsize_t *count_out) {
+  struct iovec *iov = small_iov;
+  size_t cap = small_cap;
+  mlsize_t count = 0;
+  value cur = viovecs;
+
+  while (cur != Val_emptylist) {
+    if ((size_t)count == cap) {
+      size_t new_cap = cap * 2;
+      struct iovec *new_iov = caml_stat_alloc_noexc(new_cap * sizeof(struct iovec));
+      if (new_iov == NULL) {
+        if (iov != small_iov) caml_stat_free(iov);
+        caml_raise_out_of_memory();
+      }
+      memcpy(new_iov, iov, count * sizeof(struct iovec));
+      if (iov != small_iov) caml_stat_free(iov);
+      iov = new_iov;
+      cap = new_cap;
+    }
+
+    value viov = Field(cur, 0);
+    struct caml_ba_array *ba = Caml_ba_array_val(IOVEC_BUFFER(viov));
+    char *base = (char *)ba->data + IOVEC_OFF(viov);
+    iov[count].iov_base = base;
+    iov[count].iov_len = IOVEC_LEN(viov);
+    count++;
+    cur = Field(cur, 1);
+  }
+
+  *count_out = count;
+  return iov;
+}
+
 CAMLprim value ocaml_quic_eio_send_msg_iovecs(value vfd, value vaddr,
                                               value viovecs) {
   CAMLparam3(vfd, vaddr, viovecs);
@@ -28,30 +64,11 @@ CAMLprim value ocaml_quic_eio_send_msg_iovecs(value vfd, value vaddr,
   socklen_param_type addr_len;
   struct msghdr msg;
   struct iovec small_iov[16];
-  struct iovec *iov = small_iov;
+  struct iovec *iov;
   mlsize_t count = 0;
-  value cur = viovecs;
   int ret;
-
-  while (cur != Val_emptylist) {
-    count++;
-    cur = Field(cur, 1);
-  }
-
-  if (count > sizeof(small_iov) / sizeof(small_iov[0])) {
-    iov = caml_stat_alloc_noexc(count * sizeof(struct iovec));
-    if (iov == NULL) caml_raise_out_of_memory();
-  }
-
-  cur = viovecs;
-  for (mlsize_t i = 0; i < count; i++) {
-    value viov = Field(cur, 0);
-    struct caml_ba_array *ba = Caml_ba_array_val(IOVEC_BUFFER(viov));
-    char *base = (char *)ba->data + IOVEC_OFF(viov);
-    iov[i].iov_base = base;
-    iov[i].iov_len = IOVEC_LEN(viov);
-    cur = Field(cur, 1);
-  }
+  iov = ocaml_quic_fill_iovecs(viovecs, small_iov,
+                               sizeof(small_iov) / sizeof(small_iov[0]), &count);
 
   get_sockaddr(vaddr, &addr, &addr_len);
   memset(&msg, 0, sizeof(msg));
@@ -77,30 +94,11 @@ CAMLprim value ocaml_quic_eio_send_msg_iovecs_nb(value vfd, value vaddr,
   socklen_param_type addr_len;
   struct msghdr msg;
   struct iovec small_iov[16];
-  struct iovec *iov = small_iov;
+  struct iovec *iov;
   mlsize_t count = 0;
-  value cur = viovecs;
   int ret;
-
-  while (cur != Val_emptylist) {
-    count++;
-    cur = Field(cur, 1);
-  }
-
-  if (count > sizeof(small_iov) / sizeof(small_iov[0])) {
-    iov = caml_stat_alloc_noexc(count * sizeof(struct iovec));
-    if (iov == NULL) caml_raise_out_of_memory();
-  }
-
-  cur = viovecs;
-  for (mlsize_t i = 0; i < count; i++) {
-    value viov = Field(cur, 0);
-    struct caml_ba_array *ba = Caml_ba_array_val(IOVEC_BUFFER(viov));
-    char *base = (char *)ba->data + IOVEC_OFF(viov);
-    iov[i].iov_base = base;
-    iov[i].iov_len = IOVEC_LEN(viov);
-    cur = Field(cur, 1);
-  }
+  iov = ocaml_quic_fill_iovecs(viovecs, small_iov,
+                               sizeof(small_iov) / sizeof(small_iov[0]), &count);
 
   get_sockaddr(vaddr, &addr, &addr_len);
   memset(&msg, 0, sizeof(msg));

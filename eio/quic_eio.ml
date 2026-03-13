@@ -197,6 +197,11 @@ module IO_loop = struct
       | None -> 256
       | Some v -> int_of_string v
 
+    let send_msg_blocking_fallback_threshold =
+      match Sys.getenv_opt "QUIC_EIO_SEND_BLOCKING_FALLBACK_THRESHOLD" with
+      | None -> max_int
+      | Some v -> int_of_string v
+
     type read_result =
       [ `Read of int * string
       | `Would_block
@@ -326,8 +331,15 @@ module IO_loop = struct
                then (
                  try Some (`Ok (send_msg_iovecs_nb fd sockaddr iovecs))
                  with
-                 | Unix.Unix_error (Unix.EAGAIN, _, _) -> Some `Would_block)
-               else Some (`Ok (send_msg_iovecs fd sockaddr iovecs)))
+                 | Unix.Unix_error (Unix.EAGAIN, _, _) ->
+                   if lenv >= send_msg_blocking_fallback_threshold
+                   then Some (`Ok (send_msg_iovecs fd sockaddr iovecs))
+                   else Some `Would_block)
+               else
+                 try Some (`Ok (send_msg_iovecs_nb fd sockaddr iovecs))
+                 with
+                 | Unix.Unix_error (Unix.EAGAIN, _, _) ->
+                   Some (`Ok (send_msg_iovecs fd sockaddr iovecs)))
            with
            | Some (`Ok _) -> `Ok lenv
            | Some `Would_block -> `Would_block
