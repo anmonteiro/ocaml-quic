@@ -84,6 +84,11 @@ let serialize_frame frame =
   Quic.Serialize.Frame.write_frame f frame;
   Faraday.serialize_to_string f
 
+let serialize_packet packet =
+  let f = Faraday.create 256 in
+  Quic.Serialize.Pkt.write_packet f packet;
+  Faraday.serialize_to_string f
+
 let make_connection
       ?(mode = Quic.Crypto.Mode.Client)
       ?(remember_new_token = ignore)
@@ -803,6 +808,87 @@ let test_retire_connection_id_reissues_replacement_cid () =
   | [ [ Frame.New_connection_id { sequence_no = 2; _ } ] ] -> ()
   | _ -> Alcotest.fail "expected replacement NEW_CONNECTION_ID to be queued"
 
+let test_client_restarts_with_negotiated_version () =
+  let config =
+    Quic.Config.
+      { certificates = server_certificates ()
+      ; alpn_protocols = [ "h3" ]
+      ; transport_parameters = default_transport_parameters
+      }
+  in
+  let transport =
+    Quic.Transport.Client.create
+      ~now_ms:(fun () -> 0L)
+      ~config
+      (fun ~cid:_ ~start_stream:_ ->
+         Quic.Transport.F (fun _ -> { Quic.Transport.on_error = ignore }))
+  in
+  Quic.Transport.connect
+    transport
+    ~address:"peer-address"
+    ~host:"localhost"
+    (fun ~cid:_ ~start_stream:_ ->
+       Quic.Transport.F (fun _ -> { Quic.Transport.on_error = ignore }));
+  let source_cid, dest_cid =
+    match Quic.Transport.next_write_operation transport with
+    | `Writev (iovecs, _, _) ->
+      let packet =
+        iovecs
+        |> List.map (fun { Quic.IOVec.buffer; off; len } ->
+          Bigstringaf.substring buffer ~off ~len)
+        |> String.concat ""
+      in
+      let { Quic.Fast_parse.Packet_parser.header; _ } =
+        Quic.Fast_parse.Packet_parser.parse_protected_header
+          (Bigstringaf.of_string ~off:0 ~len:(String.length packet) packet)
+          ~off:0
+          ~len:(String.length packet)
+      in
+      (match header with
+      | Packet.Header.Initial { source_cid; dest_cid; _ } -> source_cid, dest_cid
+      | _ -> Alcotest.fail "expected client Initial")
+    | `Yield _ | `Close _ -> Alcotest.fail "expected client to write Initial"
+  in
+  let vn =
+    serialize_packet
+      (Packet.VersionNegotiation
+         { source_cid = dest_cid
+         ; dest_cid = source_cid
+         ; versions = [ Packet.Version.v2 ]
+         })
+  in
+  let vn_bs = Bigstringaf.of_string ~off:0 ~len:(String.length vn) vn in
+  ignore
+    (Quic.Transport.read
+       transport
+       ~client_address:"peer-address"
+       vn_bs
+       ~off:0
+       ~len:(Bigstringaf.length vn_bs));
+  let connection =
+    Quic.Transport.Connection.Table.to_seq_values transport.connections
+    |> List.of_seq
+    |> List.hd
+  in
+  Alcotest.(check int32)
+    "client connection restarts with the negotiated version"
+    Packet.Version.v2
+    connection.version;
+  match Quic.Transport.next_write_operation transport with
+  | `Writev (iovecs, _, _) ->
+    let packet =
+      iovecs
+      |> List.map (fun { Quic.IOVec.buffer; off; len } ->
+        Bigstringaf.substring buffer ~off ~len)
+      |> String.concat ""
+    in
+    Alcotest.(check int32)
+      "next Initial uses v2"
+      Packet.Version.v2
+      (Bytes.get_int32_be (Bytes.of_string packet) 1)
+  | `Yield _ | `Close _ ->
+    Alcotest.fail "expected restarted client to write a v2 Initial"
+
 let suite =
   [ "parser", `Quick, test_parser
   ; "fast frame roundtrip", `Quick, test_fast_frame_parser_roundtrips_payload
@@ -844,6 +930,8 @@ let suite =
     , test_path_response_clears_pending_validation
   ; "retire connection id reissues replacement", `Quick
     , test_retire_connection_id_reissues_replacement_cid
+  ; "client restarts with negotiated version", `Quick
+    , test_client_restarts_with_negotiated_version
   ]
 
 let () =

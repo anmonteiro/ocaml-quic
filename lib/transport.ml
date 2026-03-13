@@ -176,6 +176,7 @@ module Connection = struct
 
   type t =
     { encdec : Crypto.encdec Encryption_level.t
+    ; version : int32
     ; mode : Crypto.Mode.t
     ; mutable tls_state : Qtls.t
     ; packet_number_spaces : Packet_number.t Spaces.t
@@ -217,6 +218,8 @@ module Connection = struct
     ; queued_packets : (Writer.header_info * Frame.t list) Queue.t
     ; writer : Writer.t
     ; streams : (Stream_id.t, Stream.t) Hashtbl.t
+    ; connection_handler :
+        cid:string -> start_stream:start_stream -> stream_handler
     ; mutable handler : handler
     ; start_stream : start_stream
     ; wakeup_writer : unit -> unit
@@ -235,7 +238,9 @@ module Connection = struct
     ; register_connection_id : CID.t -> unit
     ; deregister_connection_id : CID.t -> unit
     ; mutable pending_path_validation : pending_path_validation option
+    ; mutable received_authenticated_packet : bool
     ; remember_new_token : string -> unit
+    ; restart_with_version : int32 -> unit
     ; now_ms : unit -> int64
     }
 
@@ -387,6 +392,7 @@ module Connection = struct
         ~encrypter
         ~packet_number
         ~encryption_level
+        ~version:t.version
         ~source_cid:t.source_cid
         ~token:t.token_value
         t.dest_cid
@@ -681,10 +687,14 @@ module Connection = struct
           Encryption_level.add
             next
             { Crypto.encrypter =
-                Crypto.AEAD.make ~ciphersuite:current_cipher enc.traffic_secret
+                Crypto.AEAD.make
+                  ~version:t.version
+                  ~ciphersuite:current_cipher
+                  enc.traffic_secret
             ; decrypter =
                 Some
                   (Crypto.AEAD.make
+                     ~version:t.version
                      ~ciphersuite:current_cipher
                      dec.traffic_secret)
             }
@@ -702,7 +712,10 @@ module Connection = struct
           Encryption_level.add
             next
             { Crypto.encrypter =
-                Crypto.AEAD.make ~ciphersuite:current_cipher enc.traffic_secret
+                Crypto.AEAD.make
+                  ~version:t.version
+                  ~ciphersuite:current_cipher
+                  enc.traffic_secret
             ; decrypter = None
             }
             t.encdec;
@@ -718,6 +731,7 @@ module Connection = struct
                   Crypto.decrypter =
                     Some
                       (Crypto.AEAD.make
+                         ~version:t.version
                          ~ciphersuite:current_cipher
                          dec.traffic_secret)
                 })
@@ -1534,6 +1548,7 @@ module Connection = struct
 
   let create
         ~mode
+        ?(version = Packet.Version.v1)
         ~peer_address
         ~tls_state
         ~transport_parameters
@@ -1544,6 +1559,7 @@ module Connection = struct
         ~deregister_connection_id
         ~connection_handler
         ~remember_new_token
+        ?(restart_with_version = ignore)
         connection_id
     =
     let crypto_streams = initialize_crypto_streams () in
@@ -1551,6 +1567,7 @@ module Connection = struct
     then failwith "invalid source cid";
     let rec t =
       { encdec = Encryption_level.create ~current:Initial
+      ; version
       ; mode
       ; packet_number_spaces =
           Spaces.create
@@ -1605,6 +1622,7 @@ module Connection = struct
       ; queued_packets = Queue.create ()
       ; writer = Writer.create 0x1000
       ; streams = Hashtbl.create ~random:true 1024
+      ; connection_handler
       ; handler = Uninitialized connection_handler
       ; wakeup_writer
       ; shutdown
@@ -1637,7 +1655,9 @@ module Connection = struct
       ; register_connection_id
       ; deregister_connection_id
       ; pending_path_validation = None
+      ; received_authenticated_packet = false
       ; remember_new_token
+      ; restart_with_version
       ; now_ms
       }
     in
@@ -1877,6 +1897,7 @@ module Connection = struct
                     ~encrypter
                     ~packet_number
                     ~encryption_level
+                    ~version:t.version
                     ~source_cid:t.source_cid
                     ~token:t.token_value
                     t.dest_cid
@@ -1965,6 +1986,8 @@ type t =
   ; mode : Crypto.Mode.t
   ; config : Config.t
   ; connections : Connection.t Connection.Table.t
+  ; stateless_writes : (string * string) Queue.t
+  ; stateless_writers : (string, Writer.t) Hashtbl.t
   ; now_ms : unit -> int64
   ; mutable current_peer_address : string option
   ; mutable remembered_new_token : string option
@@ -1989,6 +2012,55 @@ let shutdown t =
   shutdown_reader t;
   (* shutdown_writer t *)
   t.closed <- true
+
+let supported_versions = [ Packet.Version.v1; Packet.Version.v2 ]
+
+let queue_stateless_packet t ~client_address packet =
+  let writer = Writer.create 0x400 in
+  Serialize.Pkt.write_packet (Writer.faraday writer) packet;
+  Writer.close writer;
+  let id =
+    let (`Hex hex) = Hex.of_string (CID.to_string (CID.generate ())) in
+    "stateless-" ^ hex
+  in
+  Queue.add (id, client_address) t.stateless_writes;
+  Hashtbl.replace t.stateless_writers id writer;
+  wakeup_writer t
+
+let parse_unsupported_version_packet bs ~off ~len =
+  if len < 7
+  then None
+  else
+    let first_byte = Char.code (Bigstringaf.unsafe_get bs off) in
+    if (not (Bits.test first_byte 7)) || not (Bits.test first_byte 6)
+    then None
+    else
+      let version = Bigstringaf.unsafe_get_int32_be bs (off + 1) in
+      if
+        Int32.equal version 0l
+        || List.exists (Int32.equal version) supported_versions
+      then None
+      else
+        let dest_cid_len = Char.code (Bigstringaf.unsafe_get bs (off + 5)) in
+        let src_cid_len_offset = off + 6 + dest_cid_len in
+        if src_cid_len_offset >= off + len
+        then None
+        else
+          let src_cid_len =
+            Char.code (Bigstringaf.unsafe_get bs src_cid_len_offset)
+          in
+          let dest_cid_start = off + 6 in
+          let src_cid_start = src_cid_len_offset + 1 in
+          if src_cid_start + src_cid_len > off + len
+          then None
+          else
+            let dest_cid =
+              Bigstringaf.substring bs ~off:dest_cid_start ~len:dest_cid_len
+            in
+            let src_cid =
+              Bigstringaf.substring bs ~off:src_cid_start ~len:src_cid_len
+            in
+            Some (version, dest_cid, src_cid)
 
 let register_connection_id t ~cid ~(connection : Connection.t) =
   match Connection.Table.find_opt t.connections cid with
@@ -2156,11 +2228,21 @@ let send_packets t ~packet_info =
 let on_close t (connection : Connection.t) =
   deregister_connection_ids t ~connection
 
+let version_of_header = function
+  | Packet.Header.Initial { version; _ } | Long { version; _ } -> Some version
+  | Short _ -> None
+
+let version_of_packet = function
+  | Packet.Frames { header; _ } | Retry { header; _ } -> version_of_header header
+  | VersionNegotiation _ -> None
+
 let create_new_connection
       ?src_cid
+      ~version
       ~peer_address
       ~tls_state
       ~connection_handler
+      ~restart_with_version
       ~encdec
       t
   =
@@ -2180,6 +2262,7 @@ let create_new_connection
   let connection =
     Connection.create
       ~mode:t.mode
+      ~version
       ~peer_address
       ~tls_state
       ~transport_parameters:t.config.transport_parameters
@@ -2194,6 +2277,7 @@ let create_new_connection
         Connection.Table.remove t.connections cid)
       ~connection_handler
       ~remember_new_token:(fun token -> t.remembered_new_token <- Some token)
+      ~restart_with_version
       src_cid
   in
   connection_ref := Some connection;
@@ -2221,7 +2305,7 @@ let process_retry_packet
     ()
   | false ->
     (match header with
-    | Long { source_cid = pkt_src_cid; _ } ->
+    | Long { version; source_cid = pkt_src_cid; _ } ->
       if CID.equal pkt_src_cid c.dest_cid
       then
         (* From RFC9000§7.3:
@@ -2229,10 +2313,12 @@ let process_retry_packet
          *   Connection ID field that is identical to the Destination Connection
          *   ID field of its Initial packet. *)
         ()
+      else if not (Int32.equal version c.version)
+      then ()
       else
         let connection_id = c.dest_cid in
         let retry_identity_tag =
-          Crypto.Retry.calculate_integrity_tag connection_id pseudo
+          Crypto.Retry.calculate_integrity_tag ~version:c.version connection_id pseudo
         in
         (match String.equal retry_identity_tag (Bigstringaf.to_string tag) with
         | false ->
@@ -2267,16 +2353,21 @@ let process_retry_packet
                *   Changing the Destination Connection ID field also results in
                *   a change to the keys used to protect the Initial packet. *)
               { Crypto.encrypter =
-                  Crypto.InitialAEAD.make ~mode:t.mode c.dest_cid
+                  Crypto.InitialAEAD.make
+                    ~version:c.version
+                    ~mode:t.mode
+                    c.dest_cid
               ; decrypter =
                   Some
                     (Crypto.InitialAEAD.make
+                       ~version:c.version
                        ~mode:(Crypto.Mode.peer t.mode)
                        c.dest_cid)
               }
             in
             Encryption_level.add Initial encdec c.encdec;
             c.processed_retry_packet <- true;
+            c.received_authenticated_packet <- true;
             Connection.send_handshake_bytes c;
             wakeup_writer t))
     | Initial _ | Short _ -> assert false)
@@ -2291,12 +2382,19 @@ let packet_handler t ?error packet =
       (* Has to be a new connection. TODO: assert that. *)
       assert (t.mode = Server);
       let { Config.certificates; alpn_protocols; _ } = t.config in
+      let version =
+        match version_of_packet packet with
+        | Some version -> version
+        | None -> Packet.Version.v1
+      in
 
       let encdec =
-        { Crypto.encrypter = Crypto.InitialAEAD.make ~mode:t.mode connection_id
+        { Crypto.encrypter =
+            Crypto.InitialAEAD.make ~version ~mode:t.mode connection_id
         ; decrypter =
             Some
               (Crypto.InitialAEAD.make
+                 ~version
                  ~mode:(Crypto.Mode.peer t.mode)
                  connection_id)
         }
@@ -2308,9 +2406,11 @@ let packet_handler t ?error packet =
         let connection =
           create_new_connection
             t
+            ~version
             ~peer_address
             ~tls_state
             ~connection_handler:t.connection_handler
+            ~restart_with_version:ignore
             ~encdec
         in
         (* Keep routing the client's original DCID until it switches to our
@@ -2341,9 +2441,28 @@ let packet_handler t ?error packet =
          *   Initial packet it received from the client in the
          *   original_destination_connection_id transport parameter [...]. *)
         c.original_dest_cid <- Packet.destination_cid packet;
-
-      (match packet with
-      | Packet.VersionNegotiation _ -> ()
+      let version_mismatch =
+        match version_of_packet packet with
+        | Some version -> not (Int32.equal version c.version)
+        | None -> false
+      in
+      if version_mismatch
+      then ()
+      else
+        (match packet with
+      | Packet.VersionNegotiation { source_cid; dest_cid; versions } ->
+        if
+          t.mode = Client
+          && not c.received_authenticated_packet
+          && CID.equal dest_cid c.source_cid
+          && CID.equal source_cid c.dest_cid
+          && not (List.exists (Int32.equal c.version) versions)
+        then
+          match List.find_opt Packet.Version.is_supported versions with
+          | Some version when not (Int32.equal version c.version) ->
+            c.restart_with_version version
+          | Some _ | None -> deregister_connection_ids t ~connection:c
+        else ()
       | Frames { header; payload; packet_number; _ } ->
         let encryption_level = Encryption_level.of_header header in
 
@@ -2419,6 +2538,7 @@ let packet_handler t ?error packet =
 	          in
 	          match parse_result with
 	          | Ok () ->
+              c.received_authenticated_packet <- true;
 	            (* process streams for packets that have been acknowledged. *)
 	            let acked_frames =
 	              Recovery.drain_acknowledged
@@ -2509,8 +2629,14 @@ let create ~mode ~now_ms ~config connection_handler =
       | None ->
         if encryption_level = Initial
         then
+          let version =
+            match header with
+            | Packet.Header.Initial { version; _ } | Long { version; _ } -> version
+            | Short _ -> Packet.Version.v1
+          in
           let decrypter =
             Crypto.InitialAEAD.make
+              ~version
               ~mode:(Crypto.Mode.peer t.mode)
               connection_id
           in
@@ -2529,6 +2655,8 @@ let create ~mode ~now_ms ~config connection_handler =
       ; mode
       ; config
       ; connections = Connection.Table.create ~random:true 1024
+      ; stateless_writes = Queue.create ()
+      ; stateless_writers = Hashtbl.create ~random:true 16
       ; now_ms
       ; current_peer_address = None
       ; remembered_new_token = None
@@ -2550,20 +2678,10 @@ module Client = struct
     create ~mode:Client ~now_ms ~config connection_handler
 end
 
-let connect t ~address ~host connection_handler =
+let connect ?(version = Packet.Version.v1) t ~address ~host connection_handler =
   let { Config.alpn_protocols; transport_parameters; _ } = t.config in
   let dest_cid = CID.generate () in
   let src_cid = CID.generate () in
-  let encdec =
-    (* From RFC9001§5.2:
-     *   Initial packets apply the packet protection process, but use a secret
-     *   derived from the Destination Connection ID field from the client's
-     *   first Initial packet. *)
-    { Crypto.encrypter = Crypto.InitialAEAD.make ~mode:t.mode dest_cid
-    ; decrypter =
-        Some (Crypto.InitialAEAD.make ~mode:(Crypto.Mode.peer t.mode) dest_cid)
-    }
-  in
   Format.eprintf
     "client IDs: %s -> %s@."
     (let (`Hex x) = Hex.of_string (CID.to_string src_cid) in
@@ -2592,31 +2710,58 @@ let connect t ~address ~host connection_handler =
         ])
   in
 
-  let tls_state =
-    Qtls.client
-      ~authenticator:Config.null_auth
-      ~alpn_protocols
-      ~host
-      transport_params
-  in
-  let new_connection =
-    create_new_connection
-      t
-      ~peer_address:address
-      ~tls_state
-      ~src_cid
-      ~connection_handler
-      ~encdec
-  in
-  new_connection.dest_cid <- dest_cid;
-  Hashtbl.replace new_connection.peer_connection_ids 0 dest_cid;
-  new_connection.token_value <-
-    Option.value ~default:"" t.remembered_new_token;
-  Connection.initialize_handler
+  let rec establish version =
+    let connection_ref = ref None in
+    let restart_with_version next_version =
+      if not (Int32.equal next_version version)
+      then (
+        Option.iter
+          (fun connection -> deregister_connection_ids t ~connection)
+          !connection_ref;
+        ignore (establish next_version))
+    in
+    let encdec =
+      { Crypto.encrypter =
+          Crypto.InitialAEAD.make ~version ~mode:t.mode dest_cid
+      ; decrypter =
+          Some
+            (Crypto.InitialAEAD.make
+               ~version
+               ~mode:(Crypto.Mode.peer t.mode)
+               dest_cid)
+      }
+    in
+    let tls_state =
+      Qtls.client
+        ~authenticator:Config.null_auth
+        ~alpn_protocols
+        ~host
+        transport_params
+    in
+    let new_connection =
+      create_new_connection
+        t
+        ~version
+        ~peer_address:address
+        ~tls_state
+        ~src_cid
+        ~connection_handler
+        ~restart_with_version
+        ~encdec
+    in
+    connection_ref := Some new_connection;
+    new_connection.dest_cid <- dest_cid;
+    Hashtbl.replace new_connection.peer_connection_ids 0 dest_cid;
+    new_connection.token_value <-
+      Option.value ~default:"" t.remembered_new_token;
+    Connection.initialize_handler
+      new_connection
+      ~cid:(CID.to_string new_connection.source_cid)
+      ~start_stream:new_connection.start_stream;
+    Connection.establish_connection new_connection;
     new_connection
-    ~cid:(CID.to_string new_connection.source_cid)
-    ~start_stream:new_connection.start_stream;
-  Connection.establish_connection new_connection
+  in
+  ignore (establish version)
 
 let report_exn _t exn =
   let bt = Printexc.get_raw_backtrace () in
@@ -2659,24 +2804,48 @@ let flush_pending_packets t =
             Some (connection.writer, connection.peer_address, CID.to_string cid)));
   !result
 
+let rec next_stateless_write t =
+  match Queue.take_opt t.stateless_writes with
+  | None -> None
+  | Some (id, client_address) ->
+    (match Hashtbl.find_opt t.stateless_writers id with
+    | None -> next_stateless_write t
+    | Some writer ->
+      match Writer.next writer with
+      | `Write iovecs ->
+        Queue.add (id, client_address) t.stateless_writes;
+        Some (`Writev (iovecs, client_address, id))
+      | `Yield ->
+        Queue.add (id, client_address) t.stateless_writes;
+        None
+      | `Close _ ->
+        Hashtbl.remove t.stateless_writers id;
+        next_stateless_write t)
+
 let next_write_operation (t : t) =
   if t.closed
   then `Close 0
   else
-    match flush_pending_packets t with
-    | Some (writer, client_address, cid) ->
-      (match Writer.next writer with
-      | `Write iovecs -> `Writev (iovecs, client_address, cid)
-      | `Yield -> `Yield (next_timeout_ms t)
-      | `Close n -> `Close n)
-    | None -> `Yield (next_timeout_ms t)
+    match next_stateless_write t with
+    | Some writev -> writev
+    | None ->
+      (match flush_pending_packets t with
+      | Some (writer, client_address, cid) ->
+        (match Writer.next writer with
+        | `Write iovecs -> `Writev (iovecs, client_address, cid)
+        | `Yield -> `Yield (next_timeout_ms t)
+        | `Close n -> `Close n)
+      | None -> `Yield (next_timeout_ms t))
 
 let report_write_result t ~cid result =
   match Connection.Table.find_opt t.connections (CID.of_string cid) with
   | Some conn -> Writer.report_result conn.writer result
   | None ->
-    Format.eprintf "connection not found: probably already retired?@.";
-    ()
+    (match Hashtbl.find_opt t.stateless_writers cid with
+    | Some writer -> Writer.report_result writer result
+    | None ->
+      Format.eprintf "connection not found: probably already retired?@.";
+      ())
 
 let yield_writer t k =
   if t.closed
@@ -2698,7 +2867,18 @@ let read t ~client_address bs ~off ~len =
   (* let hex = Hex.of_string (Bigstringaf.substring bs ~off ~len) in *)
   (* Format.eprintf "wtf(%d): %a@." len Hex.pp hex; *)
   t.current_peer_address <- Some client_address;
-  read_with_more t bs ~off ~len ~eof:false
+  match t.mode, parse_unsupported_version_packet bs ~off ~len with
+  | Server, Some (_version, packet_dest_cid, packet_source_cid) ->
+    let packet =
+      Packet.VersionNegotiation
+        { source_cid = CID.of_string packet_dest_cid
+        ; dest_cid = CID.of_string packet_source_cid
+        ; versions = supported_versions
+        }
+    in
+    queue_stateless_packet t ~client_address packet;
+    len
+  | _ -> read_with_more t bs ~off ~len ~eof:false
 
 let read_eof t bs ~off ~len = read_with_more t bs ~off ~len ~eof:true
 

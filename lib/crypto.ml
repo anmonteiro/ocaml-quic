@@ -45,9 +45,14 @@ type backend =
 
 let backend : backend ref = ref `OpenSSL
 
-(* initial_salt: 0x38762cf7f55934b34d179ae6a4c80cadccbb7f0a *)
-let initial_salt =
-  "\x38\x76\x2c\xf7\xf5\x59\x34\xb3\x4d\x17\x9a\xe6\xa4\xc8\x0c\xad\xcc\xbb\x7f\x0a"
+let initial_salt_of_version version =
+  if Packet.Version.is_v2 version
+  then
+    "\x0d\xed\xe3\xde\xf7\x00\xa6\xdb\x81\x93\x81\xbe\x6e\x26\x9d\xcb\xf9\xbd\x2e\xd9"
+  else if Packet.Version.is_v1 version
+  then
+    "\x38\x76\x2c\xf7\xf5\x59\x34\xb3\x4d\x17\x9a\xe6\xa4\xc8\x0c\xad\xcc\xbb\x7f\x0a"
+  else invalid_arg "unsupported QUIC version for initial salt"
 
 module Legacy_hkdf = Hkdf
 
@@ -102,21 +107,31 @@ module Hkdf = struct
 end
 
 module Kdf = struct
+  let labels version =
+    if Packet.Version.is_v2 version
+    then "quicv2 key", "quicv2 iv", "quicv2 hp", "quicv2 ku"
+    else if Packet.Version.is_v1 version
+    then "quic key", "quic iv", "quic hp", "quic ku"
+    else invalid_arg "unsupported QUIC version for key derivation labels"
+
   (* From RFC<QUIC-TLS-RFC>§5.1:
    *   The keys used for packet protection are computed from the TLS secrets
    *   using the KDF provided by TLS. In TLS 1.3, the HKDF-Expand-Label
    *   function described in Section 7.1 of [TLS13] is used, using the hash
    *   function from the negotiated cipher suite. *)
-  let get_key_and_iv ~hash ~kn ~ivn secret =
-    let key = Hkdf.expand_label ~hash ~prk:secret ~length:kn "quic key" in
-    let iv = Hkdf.expand_label ~hash ~prk:secret ~length:ivn "quic iv" in
+  let get_key_and_iv ?(version = Packet.Version.v1) ~hash ~kn ~ivn secret =
+    let key_label, iv_label, _, _ = labels version in
+    let key = Hkdf.expand_label ~hash ~prk:secret ~length:kn key_label in
+    let iv = Hkdf.expand_label ~hash ~prk:secret ~length:ivn iv_label in
     key, iv
 
-  let get_header_protection_key ~hash ~kn secret =
-    Hkdf.expand_label ~hash ~prk:secret ~length:kn "quic hp"
+  let get_header_protection_key ?(version = Packet.Version.v1) ~hash ~kn secret =
+    let _, _, hp_label, _ = labels version in
+    Hkdf.expand_label ~hash ~prk:secret ~length:kn hp_label
 
-  let get_ku ~hash ~kn secret =
-    Hkdf.expand_label ~hash ~prk:secret ~length:kn "quic ku"
+  let get_ku ?(version = Packet.Version.v1) ~hash ~kn secret =
+    let _, _, _, ku_label = labels version in
+    Hkdf.expand_label ~hash ~prk:secret ~length:kn ku_label
 end
 
 let[@inline] is_long header =
@@ -210,6 +225,7 @@ module AEAD = struct
 
   type t =
     { conn_id_len : int
+    ; version : int32
     ; cipher : cipher_st
     ; ciphersuite : Tls.Ciphersuite.aead_cipher
     ; hp_key : string
@@ -416,14 +432,15 @@ module AEAD = struct
      *)
     let dest_cid_len = Bytes.get_uint8 header 5 in
     let src_cid_len = Bytes.get_uint8 header (6 + dest_cid_len) in
+    let version = Bytes.get_int32_be header 1 in
     let token_length =
-      match Packet.parse_type (Bytes.get_uint8 header 0) with
-      | Initial ->
+      match Packet.parse_type_opt ~version (Bytes.get_uint8 header 0) with
+      | Some Initial ->
         let varint_len, token_len =
           variable_length_integer header ~off:(7 + src_cid_len + dest_cid_len)
         in
         varint_len + token_len
-      | _ -> 0
+      | Some (Zero_RTT | Handshake | Retry) | None -> 0
     in
     let payload_varint_len, _payload_len =
       variable_length_integer
@@ -658,11 +675,11 @@ module AEAD = struct
     | AES_256_CCM -> AES_256_CCM
     | CHACHA20_POLY1305 -> CHACHA20_POLY1305
 
-  let make ~ciphersuite secret =
+  let make ?(version = Packet.Version.v1) ~ciphersuite secret =
     let ciphersuite13 = Tls.Ciphersuite.privprot13 ciphersuite in
     let hash = Tls.Ciphersuite.hash13 ciphersuite in
     let kn, ivn = Tls.Ciphersuite.kn_13 ciphersuite13 in
-    let key, iv = Kdf.get_key_and_iv ~hash ~kn ~ivn secret in
+    let key, iv = Kdf.get_key_and_iv ~version ~hash ~kn ~ivn secret in
     let cipher =
       match !backend with
       | `Legacy -> Legacy (get_legacy_cipher_st ciphersuite13 key)
@@ -670,21 +687,25 @@ module AEAD = struct
         OpenSSL { cipher = openssl_cipher ciphersuite13; key; tag_len = 16 }
     in
     { conn_id_len = CID.src_length
+    ; version
     ; cipher
     ; ciphersuite = ciphersuite13
     ; iv
-    ; hp_key = Kdf.get_header_protection_key ~hash ~kn secret
+    ; hp_key = Kdf.get_header_protection_key ~version ~hash ~kn secret
     }
 end
 
 module InitialAEAD = struct
-  let get_initial_secret dest_connection_id =
+  let get_initial_secret ?(version = Packet.Version.v1) dest_connection_id =
     (* From RFC<QUIC-TLS-RFC>§A.1:
      * initial_secret = HKDF-Extract(initial_salt, client_dst_connection_id) *)
-    Hkdf.extract ~hash:`SHA256 ~salt:initial_salt dest_connection_id
+    Hkdf.extract
+      ~hash:`SHA256
+      ~salt:(initial_salt_of_version version)
+      dest_connection_id
 
-  let get_secret ~mode dest_connection_id =
-    let initial_secret = get_initial_secret dest_connection_id in
+  let get_secret ?(version = Packet.Version.v1) ~mode dest_connection_id =
+    let initial_secret = get_initial_secret ~version dest_connection_id in
     match mode with
     | Mode.Client ->
       (* From RFC<QUIC-TLS-RFC>§A.1:
@@ -719,9 +740,9 @@ module InitialAEAD = struct
    *   Prior to establishing a shared secret, packets are protected with
    *   AEAD_AES_128_GCM and a key derived from the Destination Connection ID in
    *   the client's first Initial packet (see Section 5.2). *)
-  let make ~mode dest_cid =
-    let secret = get_secret ~mode (CID.to_string dest_cid) in
-    AEAD.make ~ciphersuite:`AES_128_GCM_SHA256 secret
+  let make ?(version = Packet.Version.v1) ~mode dest_cid =
+    let secret = get_secret ~version ~mode (CID.to_string dest_cid) in
+    AEAD.make ~version ~ciphersuite:`AES_128_GCM_SHA256 secret
 end
 
 module Retry = struct
@@ -737,13 +758,19 @@ module Retry = struct
    *
    *   The associated data, A, is the contents of the Retry Pseudo-Packet [...].
    *)
-  let key =
-    AES_GCM.of_secret
-      "\xbe\x0c\x69\x0b\x9f\x66\x57\x5a\x1d\x76\x6b\x54\xe3\x68\xc8\x4e"
+  let key_and_nonce_of_version version =
+    if Packet.Version.is_v2 version
+    then
+      ( "\x8f\xb4\xb0\x1b\x56\xac\x48\xe2\x60\xfb\xcb\xce\xad\x7c\xcc\x92"
+      , "\xd8\x69\x69\xbc\x2d\x7c\x6d\x99\x90\xef\xb0\x4a" )
+    else if Packet.Version.is_v1 version
+    then
+      ( "\xbe\x0c\x69\x0b\x9f\x66\x57\x5a\x1d\x76\x6b\x54\xe3\x68\xc8\x4e"
+      , "\x46\x15\x99\xd3\x5d\x63\x2b\xf2\x23\x98\x25\xbb" )
+    else invalid_arg "unsupported QUIC version for retry integrity"
 
-  let nonce = "\x46\x15\x99\xd3\x5d\x63\x2b\xf2\x23\x98\x25\xbb"
-
-  let calculate_integrity_tag cid pseudo0 =
+  let calculate_integrity_tag ?(version = Packet.Version.v1) cid pseudo0 =
+    let key, nonce = key_and_nonce_of_version version in
     let cid_len = CID.length cid in
     let cid = CID.to_string cid in
     let pseudo_len = cid_len + Bigstringaf.length pseudo0 + 1 in
@@ -761,13 +788,13 @@ module Retry = struct
     match !backend with
     | `Legacy ->
       AES_GCM.authenticate_encrypt
-        ~key
+        ~key:(AES_GCM.of_secret key)
         ~nonce
         ~adata:(Cstruct.to_string pseudo)
         ""
     | `OpenSSL ->
       Libcrypto.aes_128_gcm_auth_tag
-        ~key:"\xbe\x0c\x69\x0b\x9f\x66\x57\x5a\x1d\x76\x6b\x54\xe3\x68\xc8\x4e"
+        ~key
         ~nonce
         ~adata:(Cstruct.to_string pseudo)
 end
