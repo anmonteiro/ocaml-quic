@@ -212,6 +212,7 @@ module Connection = struct
     ; (* TODO: should be retry or initial? *)
       mutable processed_retry_packet : bool
     ; mutable token_value : string
+    ; remember_new_token : string -> unit
     ; now_ms : unit -> int64
     }
 
@@ -341,6 +342,14 @@ module Connection = struct
         t.dest_cid
     in
     Queue.add (header_info, frames) t.queued_packets
+
+  let send_new_token_frame t token =
+    let data = Bigstringaf.of_string ~off:0 ~len:(String.length token) token in
+    send_frames t [ Frame.New_token { length = String.length token; data } ]
+
+  let issue_new_token t =
+    if t.mode = Server
+    then send_new_token_frame t (Mirage_crypto_rng.generate 16)
 
   let process_ack_frame t ~packet_info ~delay ~ranges =
     let { encryption_level; _ } = packet_info in
@@ -615,6 +624,7 @@ module Connection = struct
        *   confirmation of the handshake to the client. *)
       assert (t.encdec.current = Application_data);
       send_frames t [ Frame.Handshake_done ];
+      issue_new_token t;
       (* From RFC9001§4.9.2:
        *   "An endpoint MUST discard its Handshake keys when the TLS handshake
        *   is confirmed" (and Initial keys at the same time). Per RFC9001§4.1.2,
@@ -1241,11 +1251,20 @@ module Connection = struct
       | Stop_sending { stream_id; application_protocol_error } ->
         process_stop_sending_frame t ~stream_id application_protocol_error
       | Crypto fragment -> process_crypto_frame t ~packet_info fragment
-      | New_token _ ->
+      | New_token { length; data } ->
         (match t.mode with
         | Server ->
           report_error t ~frame_type:Frame.Type.New_token Protocol_violation
-        | Client -> ())
+        | Client ->
+          if length = 0
+          then
+            report_error
+              t
+              ~frame_type:Frame.Type.New_token
+              Frame_encoding_error
+          else
+            let token = Bigstringaf.substring data ~off:0 ~len:length in
+            t.remember_new_token token)
       | Stream { id; fragment; is_fin } ->
         process_stream_frame
           t
@@ -1326,6 +1345,7 @@ module Connection = struct
         ~wakeup_writer
         ~shutdown
         ~connection_handler
+        ~remember_new_token
         connection_id
     =
     let crypto_streams = initialize_crypto_streams () in
@@ -1402,6 +1422,7 @@ module Connection = struct
       ; did_send_connection_close = false
       ; processed_retry_packet = false
       ; token_value = ""
+      ; remember_new_token
       ; now_ms
       }
     in
@@ -1731,6 +1752,7 @@ type t =
   ; connections : Connection.t Connection.Table.t
   ; now_ms : unit -> int64
   ; mutable current_peer_address : string option
+  ; mutable remembered_new_token : string option
   ; mutable wakeup_writer : Optional_thunk.t
   ; mutable writer_wakeup_pending : bool
   ; mutable closed : bool
@@ -1936,6 +1958,7 @@ let create_new_connection
       ~wakeup_writer:(ready_to_write t)
       ~shutdown:(on_close t)
       ~connection_handler
+      ~remember_new_token:(fun token -> t.remembered_new_token <- Some token)
       src_cid
   in
   Encryption_level.add Initial encdec connection.encdec;
@@ -2253,6 +2276,7 @@ let create ~mode ~now_ms ~config connection_handler =
       ; connections = Connection.Table.create ~random:true 1024
       ; now_ms
       ; current_peer_address = None
+      ; remembered_new_token = None
       ; wakeup_writer = Optional_thunk.none
       ; writer_wakeup_pending = false
       ; closed = false
@@ -2330,6 +2354,8 @@ let connect t ~address ~host connection_handler =
       ~encdec
   in
   new_connection.dest_cid <- dest_cid;
+  new_connection.token_value <-
+    Option.value ~default:"" t.remembered_new_token;
   Connection.initialize_handler
     new_connection
     ~cid:(CID.to_string new_connection.source_cid)

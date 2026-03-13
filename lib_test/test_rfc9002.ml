@@ -963,6 +963,7 @@ let make_client_connection_for_congestion_tests () =
       ~wakeup_writer:(fun () -> ())
       ~shutdown:(fun _ -> ())
       ~connection_handler
+      ~remember_new_token:ignore
       source_cid
   in
   connection.peer_transport_params <-
