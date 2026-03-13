@@ -87,6 +87,8 @@ let serialize_frame frame =
 let make_connection
       ?(mode = Quic.Crypto.Mode.Client)
       ?(remember_new_token = ignore)
+      ?(register_connection_id = ignore)
+      ?(deregister_connection_id = ignore)
       ?(transport_parameters = Quic.Config.default_transport_parameters)
       ()
   =
@@ -111,6 +113,8 @@ let make_connection
       ~now_ms:(fun () -> 0L)
       ~wakeup_writer:ignore
       ~shutdown:(fun _ -> ())
+      ~register_connection_id
+      ~deregister_connection_id
       ~connection_handler:(fun ~cid:_ ~start_stream:_ ->
         Quic.Transport.F (fun _ -> { Quic.Transport.on_error = ignore }))
       ~remember_new_token
@@ -150,6 +154,11 @@ let take_queued_frames conn =
   match take_queued_packet conn with
   | None -> []
   | Some (_header_info, frames) -> frames
+
+let rec take_all_queued_frames conn =
+  match take_queued_packet conn with
+  | None -> []
+  | Some (_header_info, frames) -> frames :: take_all_queued_frames conn
 
 let test_fast_frame_parser_roundtrips_payload () =
   let payload =
@@ -707,6 +716,93 @@ let test_stop_sending_missing_local_stream_is_stream_state_error () =
     ()
   | _ -> Alcotest.fail "expected STREAM_STATE_ERROR for missing local stream"
 
+let test_new_connection_id_tracks_inventory_and_starts_path_validation () =
+  let conn = make_connection () in
+  conn.encdec.current <- Encryption_level.Application_data;
+  let original = Quic.CID.of_string "test-server-cid" in
+  let rotated = Quic.CID.of_string "rotated-peer-cid" in
+  conn.dest_cid <- original;
+  Hashtbl.replace conn.peer_connection_ids 0 original;
+  let packet_info =
+    { Quic.Transport.packet_number = 0L
+    ; header =
+        Packet.Header.Short
+          { dest_cid = Quic.CID.of_string "test-server-cid" }
+    ; encryption_level = Encryption_level.Application_data
+    ; connection = conn
+    ; packet_has_ack_eliciting_frame = false
+    }
+  in
+  Quic.Transport.Connection.process_new_connection_id_frame
+    conn
+    ~cid:rotated
+    ~retire_prior_to:1
+    ~sequence_no:1
+    ~packet_info;
+  Alcotest.(check bool)
+    "retired peer CID is removed from inventory"
+    false
+    (Hashtbl.mem conn.peer_connection_ids 0);
+  Alcotest.(check bool)
+    "new peer CID is tracked"
+    true
+    (Hashtbl.mem conn.peer_connection_ids 1);
+  (match conn.pending_path_validation with
+  | Some { dest_cid; sequence_no; _ } ->
+    Alcotest.(check string)
+      "path validation targets the rotated CID"
+      (Quic.CID.to_string rotated)
+      (Quic.CID.to_string dest_cid);
+    Alcotest.(check int) "path validation uses the new CID sequence" 1 sequence_no
+  | None -> Alcotest.fail "expected pending path validation");
+  match take_all_queued_frames conn with
+  | [ [ Frame.Retire_connection_id 0 ]; [ Frame.Path_challenge _ ] ] -> ()
+  | _ -> Alcotest.fail "expected RETIRE_CONNECTION_ID followed by PATH_CHALLENGE"
+
+let test_path_response_clears_pending_validation () =
+  let conn = make_connection () in
+  conn.encdec.current <- Encryption_level.Application_data;
+  Quic.Transport.Connection.start_path_validation
+    conn
+    ~peer_address:"peer-address-2"
+    ~cid:(Quic.CID.of_string "rotated-peer-cid")
+    ~sequence_no:1;
+  match conn.pending_path_validation with
+  | None -> Alcotest.fail "expected pending path validation"
+  | Some { challenge; _ } ->
+    Quic.Transport.Connection.process_path_response_frame conn challenge;
+    Alcotest.(check bool)
+      "matching PATH_RESPONSE clears pending validation"
+      true
+      (Option.is_none conn.pending_path_validation)
+
+let test_retire_connection_id_reissues_replacement_cid () =
+  let retired = ref [] in
+  let conn =
+    make_connection ~deregister_connection_id:(fun cid -> retired := cid :: !retired) ()
+  in
+  conn.encdec.current <- Encryption_level.Application_data;
+  conn.peer_transport_params <-
+    Quic.Transport_parameters.
+      { default with
+        active_connection_id_limit = 2
+      };
+  Quic.Transport.Connection.ensure_local_connection_id_budget conn;
+  ignore (take_all_queued_frames conn);
+  let retired_cid = Hashtbl.find conn.local_connection_ids 1 in
+  Quic.Transport.Connection.process_retire_connection_id_frame conn 1;
+  Alcotest.(check bool)
+    "retired CID is deregistered"
+    true
+    (List.mem retired_cid !retired);
+  Alcotest.(check int)
+    "a replacement CID keeps the inventory at the peer limit"
+    2
+    (Hashtbl.length conn.local_connection_ids);
+  match take_all_queued_frames conn with
+  | [ [ Frame.New_connection_id { sequence_no = 2; _ } ] ] -> ()
+  | _ -> Alcotest.fail "expected replacement NEW_CONNECTION_ID to be queued"
+
 let suite =
   [ "parser", `Quick, test_parser
   ; "fast frame roundtrip", `Quick, test_fast_frame_parser_roundtrips_payload
@@ -742,6 +838,12 @@ let suite =
     , test_stop_sending_aborts_send_side_without_dropping_stream
   ; "missing local stop sending is error", `Quick
     , test_stop_sending_missing_local_stream_is_stream_state_error
+  ; "new connection id starts path validation", `Quick
+    , test_new_connection_id_tracks_inventory_and_starts_path_validation
+  ; "path response clears pending validation", `Quick
+    , test_path_response_clears_pending_validation
+  ; "retire connection id reissues replacement", `Quick
+    , test_retire_connection_id_reissues_replacement_cid
   ]
 
 let () =
