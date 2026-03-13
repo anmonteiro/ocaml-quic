@@ -43,9 +43,14 @@ external send_msg_iovecs_nb :
   Unix.file_descr -> Unix.sockaddr -> 'a Faraday.iovec list -> int
   = "ocaml_quic_eio_send_msg_iovecs_nb"
 
-external recvfrom_into :
-  Unix.file_descr -> Bigstringaf.t -> int -> int -> int * string
-  = "ocaml_quic_eio_recvfrom_into"
+external recvfrom_into_nb :
+  Unix.file_descr ->
+  Bigstringaf.t ->
+  int ->
+  int ->
+  string option ->
+  (int * string) option
+  = "ocaml_quic_eio_recvfrom_into_nb"
 
 type drop_direction =
   [ `Receive
@@ -192,47 +197,56 @@ module IO_loop = struct
       | None -> 256
       | Some v -> int_of_string v
 
-    let read_once dsock buffer =
-      let p, u = Promise.create () in
-      let addr_p, addr_u = Promise.create () in
-      Buffer.put
-        ~f:(fun buf ~off ~len k ->
-          match Eio_unix.Resource.fd_opt dsock with
-          | Some fd ->
-            (match
-               Eio_unix.Fd.use fd ~if_closed:(fun () -> None) (fun fd ->
-                 Some (recvfrom_into fd buf off len))
-             with
-             | Some (n, addr) ->
-               Promise.resolve addr_u addr;
-               k n
-             | None ->
-               Promise.resolve u (`Exn End_of_file);
-               raise End_of_file)
-          | None ->
-            let cstruct = Cstruct.of_bigarray buf ~off ~len in
-            match Eio.Net.recv dsock cstruct with
-            | addr, n ->
-              Promise.resolve addr_u (Addr.serialize addr);
-              k n
-            | exception exn ->
-              Promise.resolve u (`Exn exn);
-              raise exn)
-        buffer
-        (fun read -> Promise.resolve u (`Ok read));
-      match Promise.await p with
-      | `Ok n -> n, Promise.await addr_p
-      | `Exn exn -> raise exn
+    type read_result =
+      [ `Read of int * string
+      | `Would_block
+      | `Exn of exn
+      ]
 
-    let read_datagram flow buffer =
-      match read_once flow buffer with
-      | r -> r
-      | exception
-          ( Unix.Unix_error (ENOTCONN, _, _)
-          | Eio.Io (Eio.Exn.X (Eio_unix.Unix_error (ENOTCONN, _, _)), _)
-          | Eio.Io (Eio.Net.E (Connection_reset _), _) ) ->
-        (* TODO(anmonteiro): logging? *)
-        raise End_of_file
+    let read_once dsock buffer last_client_address =
+      let p, u = Promise.create () in
+      (try
+         Buffer.put
+           ~f:(fun buf ~off ~len k ->
+             match Eio_unix.Resource.fd_opt dsock with
+             | Some fd ->
+               (match
+                  Eio_unix.Fd.use fd ~if_closed:(fun () -> None) (fun fd ->
+                    Some
+                      (recvfrom_into_nb
+                         fd
+                         buf
+                         off
+                         len
+                         !last_client_address))
+                with
+                | Some (Some (n, addr)) ->
+                  last_client_address := Some addr;
+                  Promise.resolve u (`Read (n, addr));
+                  k n
+                | Some None ->
+                  Promise.resolve u `Would_block;
+                  raise_notrace Exit
+                | None ->
+                  Promise.resolve u (`Exn End_of_file);
+                  raise End_of_file)
+             | None ->
+               let cstruct = Cstruct.of_bigarray buf ~off ~len in
+               match Eio.Net.recv dsock cstruct with
+               | addr, n ->
+                 Promise.resolve u (`Read (n, Addr.serialize addr));
+                 k n
+               | exception exn ->
+                 Promise.resolve u (`Exn exn);
+                 raise exn)
+           buffer
+           (fun _read -> ())
+       with
+       | Exit -> ());
+      match Promise.await p with
+      | `Read result -> result
+      | `Would_block -> raise_notrace Exit
+      | `Exn exn -> raise exn
 
     (* let close socket = *)
     (* match Lwt_unix.state socket with *)
@@ -265,12 +279,27 @@ module IO_loop = struct
     (* | `Eof -> `Eof *)
     (* | `Ok n -> `Ok (n, Promise.await addr_p) *)
 
-    let rec read flow buffer =
-      match read_datagram flow buffer with
-      | r -> r
-      | exception Unix.Unix_error (Unix.EAGAIN, _, _) ->
-        Fiber.yield ();
-        read flow buffer
+    let read =
+      let last_client_address = ref None in
+      let read_datagram flow buffer =
+        match read_once flow buffer last_client_address with
+        | r -> r
+        | exception Exit -> raise_notrace Exit
+        | exception
+            ( Unix.Unix_error (ENOTCONN, _, _)
+            | Eio.Io (Eio.Exn.X (Eio_unix.Unix_error (ENOTCONN, _, _)), _)
+            | Eio.Io (Eio.Net.E (Connection_reset _), _) ) ->
+          (* TODO(anmonteiro): logging? *)
+          raise End_of_file
+      in
+      let rec read flow buffer =
+        match read_datagram flow buffer with
+        | r -> r
+        | exception Exit ->
+          Fiber.yield ();
+          read flow buffer
+      in
+      read
 
     let writev dsock ~client_address iovecs =
       let lenv =

@@ -1,4 +1,5 @@
 #include <string.h>
+#include <errno.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/uio.h>
@@ -156,10 +157,37 @@ static value ocaml_quic_alloc_encoded_sockaddr(union sock_addr_union *addr,
   }
 }
 
-CAMLprim value ocaml_quic_eio_recvfrom_into(value vfd, value vbuf, value voff,
-                                            value vlen) {
-  CAMLparam4(vfd, vbuf, voff, vlen);
-  CAMLlocal3(vpair, vaddr, vn);
+static int ocaml_quic_encoded_sockaddr_matches(value vaddr,
+                                               union sock_addr_union *addr,
+                                               socklen_param_type addr_len) {
+  mlsize_t len = caml_string_length(vaddr);
+  const unsigned char *src = (const unsigned char *)String_val(vaddr);
+  (void)addr_len;
+
+  switch (addr->s_gen.sa_family) {
+  case AF_INET:
+    return len == 7 && src[0] == 4 && memcmp(src + 1, &addr->s_inet.sin_addr, 4) == 0 &&
+           memcmp(src + 5, &addr->s_inet.sin_port, 2) == 0;
+#ifdef HAS_IPV6
+  case AF_INET6:
+    return len == 19 && src[0] == 6 &&
+           memcmp(src + 1, &addr->s_inet6.sin6_addr, 16) == 0 &&
+           memcmp(src + 17, &addr->s_inet6.sin6_port, 2) == 0;
+#endif
+  case AF_UNIX: {
+    size_t path_len = strnlen(addr->s_unix.sun_path, sizeof(addr->s_unix.sun_path));
+    return len == path_len + 1 && src[0] == 0 &&
+           memcmp(src + 1, addr->s_unix.sun_path, path_len) == 0;
+  }
+  default:
+    return 0;
+  }
+}
+
+CAMLprim value ocaml_quic_eio_recvfrom_into_nb(value vfd, value vbuf, value voff,
+                                               value vlen, value vlast_addr_opt) {
+  CAMLparam5(vfd, vbuf, voff, vlen, vlast_addr_opt);
+  CAMLlocal4(vpair, vaddr, vn, vsome);
   struct caml_ba_array *ba = Caml_ba_array_val(vbuf);
   char *dst = (char *)ba->data + Long_val(voff);
   union sock_addr_union addr;
@@ -168,12 +196,21 @@ CAMLprim value ocaml_quic_eio_recvfrom_into(value vfd, value vbuf, value voff,
 
   ret = recvfrom(Int_val(vfd), dst, Long_val(vlen), 0, &addr.s_gen, &addr_len);
 
-  if (ret == -1) uerror("recvfrom", Nothing);
+  if (ret == -1) {
+    if (errno == EAGAIN || errno == EWOULDBLOCK) CAMLreturn(Val_int(0));
+    uerror("recvfrom", Nothing);
+  }
 
   vn = Val_int(ret);
-  vaddr = ocaml_quic_alloc_encoded_sockaddr(&addr, addr_len);
+  if (vlast_addr_opt != Val_int(0) &&
+      ocaml_quic_encoded_sockaddr_matches(Field(vlast_addr_opt, 0), &addr, addr_len))
+    vaddr = Field(vlast_addr_opt, 0);
+  else
+    vaddr = ocaml_quic_alloc_encoded_sockaddr(&addr, addr_len);
   vpair = caml_alloc(2, 0);
   Store_field(vpair, 0, vn);
   Store_field(vpair, 1, vaddr);
-  CAMLreturn(vpair);
+  vsome = caml_alloc(1, 0);
+  Store_field(vsome, 0, vpair);
+  CAMLreturn(vsome);
 }
