@@ -1139,6 +1139,35 @@ module Connection = struct
           t
           [ Frame.Max_streams (direction, int_of_int64_clamped current) ]
 
+  let process_data_blocked_frame t max_data =
+    let max_data = int64_of_nonnegative max_data in
+    if Int64.compare t.max_recv_data max_data > 0
+    then send_frames t [ Frame.Max_data (int_of_int64_clamped t.max_recv_data) ]
+
+  let process_stream_data_blocked_frame t ~stream_id ~max_data =
+    let max_data = int64_of_nonnegative max_data in
+    let is_locally_initiated = is_locally_initiated t stream_id in
+    let is_receive_only_stream =
+      Stream_id.is_uni stream_id && not is_locally_initiated
+    in
+    if is_receive_only_stream
+    then
+      report_error
+        t
+        ~frame_type:Frame.Type.Stream_data_blocked
+        Stream_state_error
+    else
+      match current_recv_stream_max_data t stream_id with
+      | None -> ()
+      | Some current ->
+        if Int64.compare current max_data > 0
+        then
+          send_frames
+            t
+            [ Frame.Max_stream_data
+                { stream_id; max_data = int_of_int64_clamped current }
+            ]
+
   let process_new_connection_id_frame t ~cid ~retire_prior_to ~sequence_no =
     if CID.length cid = 0 || retire_prior_to > sequence_no
     then
@@ -1229,7 +1258,9 @@ module Connection = struct
         process_max_stream_data_frame t ~stream_id ~max_data
       | Max_streams (direction, max_streams) ->
         process_max_streams_frame t ~direction max_streams
-      | Data_blocked _ | Stream_data_blocked _ -> ()
+      | Data_blocked max_data -> process_data_blocked_frame t max_data
+      | Stream_data_blocked { id; max_data } ->
+        process_stream_data_blocked_frame t ~stream_id:id ~max_data
       | Streams_blocked (direction, max_streams) ->
         process_streams_blocked_frame t ~direction max_streams
       | New_connection_id { cid; retire_prior_to; sequence_no; _ } ->
