@@ -115,6 +115,53 @@ CAMLprim value ocaml_quic_eio_send_msg_iovecs_nb(value vfd, value vaddr,
   CAMLreturn(Val_int(ret));
 }
 
+CAMLprim value ocaml_quic_eio_send_msg_iovecs_connected(value vfd, value viovecs) {
+  CAMLparam2(vfd, viovecs);
+  struct msghdr msg;
+  struct iovec small_iov[16];
+  struct iovec *iov;
+  mlsize_t count = 0;
+  int ret;
+  iov = ocaml_quic_fill_iovecs(viovecs, small_iov,
+                               sizeof(small_iov) / sizeof(small_iov[0]), &count);
+
+  memset(&msg, 0, sizeof(msg));
+  msg.msg_iov = iov;
+  msg.msg_iovlen = count;
+
+  caml_enter_blocking_section();
+  ret = sendmsg(Int_val(vfd), &msg, 0);
+  caml_leave_blocking_section();
+
+  if (iov != small_iov) caml_stat_free(iov);
+
+  if (ret == -1) uerror("sendmsg", Nothing);
+  CAMLreturn(Val_int(ret));
+}
+
+CAMLprim value ocaml_quic_eio_send_msg_iovecs_connected_nb(value vfd,
+                                                           value viovecs) {
+  CAMLparam2(vfd, viovecs);
+  struct msghdr msg;
+  struct iovec small_iov[16];
+  struct iovec *iov;
+  mlsize_t count = 0;
+  int ret;
+  iov = ocaml_quic_fill_iovecs(viovecs, small_iov,
+                               sizeof(small_iov) / sizeof(small_iov[0]), &count);
+
+  memset(&msg, 0, sizeof(msg));
+  msg.msg_iov = iov;
+  msg.msg_iovlen = count;
+
+  ret = sendmsg(Int_val(vfd), &msg, 0);
+
+  if (iov != small_iov) caml_stat_free(iov);
+
+  if (ret == -1) uerror("sendmsg", Nothing);
+  CAMLreturn(Val_int(ret));
+}
+
 static value ocaml_quic_alloc_encoded_sockaddr(union sock_addr_union *addr,
                                                socklen_param_type addr_len) {
   CAMLparam0();
@@ -212,4 +259,25 @@ CAMLprim value ocaml_quic_eio_recvfrom_into_nb(value vfd, value vbuf, value voff
   Store_field(vresult, 0, vn);
   Store_field(vresult, 1, vaddr);
   CAMLreturn(vresult);
+}
+
+CAMLprim value ocaml_quic_eio_recv_into_nb(value vfd, value vbuf, value voff,
+                                           value vlen) {
+  CAMLparam4(vfd, vbuf, voff, vlen);
+  CAMLlocal2(vn, vsome);
+  struct caml_ba_array *ba = Caml_ba_array_val(vbuf);
+  char *dst = (char *)ba->data + Long_val(voff);
+  int ret;
+
+  ret = recv(Int_val(vfd), dst, Long_val(vlen), 0);
+
+  if (ret == -1) {
+    if (errno == EAGAIN || errno == EWOULDBLOCK) CAMLreturn(Val_int(0));
+    uerror("recv", Nothing);
+  }
+
+  vn = Val_int(ret);
+  vsome = caml_alloc(1, 0);
+  Store_field(vsome, 0, vn);
+  CAMLreturn(vsome);
 }

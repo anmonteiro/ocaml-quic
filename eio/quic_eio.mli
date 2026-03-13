@@ -75,6 +75,7 @@ module Client : sig
      Eio_unix.Stdenv.base
     -> sw:Eio.Switch.t
     -> ?should_drop:should_drop
+    -> ?udp_connect:bool
     -> config:Config.t
     -> (cid:
           (* Unix.sockaddr -> *)

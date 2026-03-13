@@ -43,6 +43,14 @@ external send_msg_iovecs_nb :
   Unix.file_descr -> Unix.sockaddr -> 'a Faraday.iovec list -> int
   = "ocaml_quic_eio_send_msg_iovecs_nb"
 
+external send_msg_iovecs_connected :
+  Unix.file_descr -> 'a Faraday.iovec list -> int
+  = "ocaml_quic_eio_send_msg_iovecs_connected"
+
+external send_msg_iovecs_connected_nb :
+  Unix.file_descr -> 'a Faraday.iovec list -> int
+  = "ocaml_quic_eio_send_msg_iovecs_connected_nb"
+
 type recvfrom_into_nb_result =
   | No_data
   | Same_addr of int
@@ -56,6 +64,9 @@ external recvfrom_into_nb :
   string option ->
   recvfrom_into_nb_result
   = "ocaml_quic_eio_recvfrom_into_nb"
+
+external recv_into_nb : Unix.file_descr -> Bigstringaf.t -> int -> int -> int option
+  = "ocaml_quic_eio_recv_into_nb"
 
 type drop_direction =
   [ `Receive
@@ -213,7 +224,7 @@ module IO_loop = struct
       | `Exn of exn
       ]
 
-    let read_once dsock buffer last_client_address =
+    let read_once dsock buffer last_client_address connected_peer =
       let p, u = Promise.create () in
       (try
          Buffer.put
@@ -222,13 +233,20 @@ module IO_loop = struct
              | Some fd ->
                 (match
                    Eio_unix.Fd.use fd ~if_closed:(fun () -> None) (fun fd ->
-                    Some
-                      (recvfrom_into_nb
-                         fd
-                         buf
-                         off
-                         len
-                         !last_client_address))
+                     match !connected_peer with
+                     | Some peer ->
+                       Some
+                         (match recv_into_nb fd buf off len with
+                          | Some n -> New_addr (n, peer)
+                          | None -> No_data)
+                     | None ->
+                       Some
+                         (recvfrom_into_nb
+                            fd
+                            buf
+                            off
+                            len
+                            !last_client_address))
                 with
                 | Some (New_addr (n, addr)) ->
                   last_client_address := Some addr;
@@ -292,10 +310,10 @@ module IO_loop = struct
     (* | `Eof -> `Eof *)
     (* | `Ok n -> `Ok (n, Promise.await addr_p) *)
 
-    let read =
+    let read ?(connected_peer = ref None) =
       let last_client_address = ref None in
       let read_datagram flow buffer =
-        match read_once flow buffer last_client_address with
+        match read_once flow buffer last_client_address connected_peer with
         | r -> r
         | exception Exit -> raise_notrace Exit
         | exception
@@ -360,18 +378,27 @@ module IO_loop = struct
 
   exception Cancelled
 
-  let start ~sw:_ ~clock ~read_buffer_size ~cancel ~should_drop t socket =
+  let start
+        ~sw:_
+        ~clock
+        ~read_buffer_size
+        ~cancel
+        ~should_drop
+        ~connected_peer
+        t
+        socket
+    =
     let read_buffer = Buffer.create read_buffer_size in
     let recv_seq_no = ref 0 in
     let send_seq_no = ref 0 in
     let write_burst_limit = 64 in
     let read_once =
       match cancel with
-      | None -> (fun () -> Io.read socket read_buffer)
+      | None -> (fun () -> Io.read ~connected_peer socket read_buffer)
       | Some cancel ->
         (fun () ->
            Fiber.first
-             (fun () -> Io.read socket read_buffer)
+             (fun () -> Io.read ~connected_peer socket read_buffer)
              (fun () ->
                 Promise.await cancel;
                 raise Cancelled))
@@ -443,10 +470,23 @@ module IO_loop = struct
                 ~len:sent_len
             then `Ok sent_len
             else
-              Io.writev
-                ~client_address
-                socket
-                io_vectors
+              (match !connected_peer with
+               | Some peer when String.equal peer client_address ->
+                 (match Eio_unix.Resource.fd_opt socket with
+                  | Some fd ->
+                    Eio_unix.Fd.use fd ~if_closed:(fun () -> `Closed) (fun fd ->
+                      if sent_len <= Io.send_msg_nb_threshold
+                      then (
+                        try `Ok (send_msg_iovecs_connected_nb fd io_vectors)
+                        with
+                        | Unix.Unix_error (Unix.EAGAIN, _, _) -> `Would_block)
+                      else
+                        try `Ok (send_msg_iovecs_connected_nb fd io_vectors)
+                        with
+                        | Unix.Unix_error (Unix.EAGAIN, _, _) ->
+                          `Ok (send_msg_iovecs_connected fd io_vectors))
+                  | None -> Io.writev ~client_address socket io_vectors)
+               | _ -> Io.writev ~client_address socket io_vectors)
           in
           (match write_result with
           | `Would_block ->
@@ -535,16 +575,25 @@ module Server = struct
       ~read_buffer_size:(max 0x1000 config.max_datagram_size)
       ~cancel:None
       ~should_drop
+      ~connected_peer:(ref None)
       server_fd
 end
 
 type t =
   { transport : Quic.Transport.t
   ; shutdown_io : unit -> unit
+  ; connect_udp : string -> unit
   }
 
 module Client = struct
-  let create env ~sw ?(should_drop = IO_loop.never_drop) ~config handler =
+  let create
+        env
+        ~sw
+        ?(should_drop = IO_loop.never_drop)
+        ?(udp_connect = false)
+        ~config
+        handler
+    =
     let fd =
       Eio.Net.datagram_socket
         ~reuse_addr:true
@@ -560,10 +609,21 @@ module Client = struct
         ~config
         handler
     in
+    let connected_peer = ref None in
     let shutdown_io () =
       Quic.Transport.shutdown connection;
       Quic.Transport.ready_to_write connection ();
       try Eio.Resource.close fd with _ -> ()
+    in
+    let connect_udp address =
+      if udp_connect
+      then
+        match Eio_unix.Resource.fd_opt fd with
+        | Some file_descr ->
+          Eio_unix.Fd.use file_descr ~if_closed:(fun () -> ()) (fun fd ->
+            Unix.connect fd (Addr.parse_unix address);
+            connected_peer := Some address)
+        | None -> ()
     in
     Fiber.fork ~sw (fun () ->
       IO_loop.start
@@ -572,13 +632,15 @@ module Client = struct
         ~cancel:None
         ~read_buffer_size:(max 0x1000 config.max_datagram_size)
         ~should_drop
+        ~connected_peer
         connection
         fd);
-    { transport = connection; shutdown_io }
+    { transport = connection; shutdown_io; connect_udp }
 end
 
 let connect t ~address ~host f =
   let address = Addr.serialize address in
+  t.connect_udp address;
   Quic.Transport.connect t.transport ~address ~host f
 
 let shutdown t =
