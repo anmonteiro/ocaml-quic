@@ -460,6 +460,9 @@ module Connection = struct
     t.peer_max_streams_uni <-
       nonnegative_int64 transport_params.initial_max_streams_uni
 
+  let maybe_remove_closed_stream t stream =
+    if Stream.is_closed stream then Hashtbl.remove t.streams stream.id
+
   let process_reset_stream_frame
         t
         ~stream_id
@@ -488,15 +491,14 @@ module Connection = struct
            *)
           report_error t ~frame_type:Reset_stream Stream_state_error
         | _, _ ->
-          (* TODO: stream state transitions 3.1 / 3.2 *)
           stream.error_handler application_error;
+          Stream.close_reader stream;
+          maybe_remove_closed_stream t stream)
+      | None ->
+        if is_locally_initiated
+        then report_error t ~frame_type:Reset_stream Stream_state_error
+        else ()
 
-          Hashtbl.remove t.streams stream_id)
-      | None -> ()
-
-  (* TODO: Receiving a STOP_SENDING frame for a locally initiated stream that *)
-  (* has not yet been created MUST be treated as a connection error of type *)
-  (* STREAM_STATE_ERROR. *)
   let process_stop_sending_frame t ~stream_id application_protocol_error =
     let is_locally_initiated =
       match t.mode with
@@ -544,6 +546,9 @@ module Connection = struct
                 ; final_size
                 }
             ])
+          ;
+          Stream.abort_send stream;
+          maybe_remove_closed_stream t stream
       | None ->
         if is_locally_initiated
         then

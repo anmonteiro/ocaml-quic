@@ -391,6 +391,12 @@ module Send = struct
       Faraday.shift faraday writev_len;
       writev_len
 
+  let abort t =
+    t.deferred <- Q.empty;
+    Queue.clear t.fresh;
+    t.fin_offset <- None;
+    Buffer.close_writer t.producer
+
   let final_size t =
     (* From RFC9000§4.5:
      *   More generally, this is one higher than the offset of the byte with
@@ -450,6 +456,8 @@ let schedule_bigstring t ?off ?len (b : Bigstringaf.t) =
 let unsafe_faraday t = Buffer.unsafe_faraday t.send.producer
 let flush t k = Buffer.flush t.send.producer k
 let close_writer t = Buffer.close_writer t.send.producer
+
+let abort_send t = Send.abort t.send
 
 let schedule_read t ~on_eof ~on_read =
   Buffer.schedule_read t.recv.consumer ~on_eof ~on_read

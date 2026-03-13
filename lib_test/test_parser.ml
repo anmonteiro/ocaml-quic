@@ -636,6 +636,77 @@ let test_close_timeout_deregisters_connection () =
     0
     (Quic.Transport.Connection.Table.length transport.connections)
 
+let test_reset_stream_keeps_send_side_open () =
+  let conn = make_connection () in
+  Quic.Transport.Connection.process_max_streams_frame
+    conn
+    ~direction:Bidirectional
+    1;
+  let stream = conn.start_stream Direction.Bidirectional in
+  Quic.Transport.Connection.process_reset_stream_frame
+    conn
+    ~stream_id:(Stream.id stream)
+    ~final_size:0
+    42;
+  let stream =
+    Hashtbl.find conn.Quic.Transport.Connection.streams (Stream.id stream)
+  in
+  Alcotest.(check bool)
+    "RESET_STREAM closes only the receive side"
+    true
+    (Quic.Stream.Buffer.is_closed stream.recv.consumer);
+  Alcotest.(check bool)
+    "RESET_STREAM preserves the send side of a bidi stream"
+    false
+    (Quic.Stream.Buffer.is_closed stream.send.producer)
+
+let test_stop_sending_aborts_send_side_without_dropping_stream () =
+  let conn = make_connection () in
+  Quic.Transport.Connection.process_max_streams_frame
+    conn
+    ~direction:Bidirectional
+    1;
+  let stream = conn.start_stream Direction.Bidirectional in
+  Quic.Stream.write_string stream "pending-data";
+  Quic.Transport.Connection.process_stop_sending_frame
+    conn
+    ~stream_id:(Stream.id stream)
+    7;
+  let stream =
+    Hashtbl.find conn.Quic.Transport.Connection.streams (Stream.id stream)
+  in
+  Alcotest.(check bool)
+    "STOP_SENDING closes the send side"
+    true
+    (Quic.Stream.Buffer.is_closed stream.send.producer);
+  Alcotest.(check bool)
+    "STOP_SENDING keeps the receive side available"
+    false
+    (Quic.Stream.Buffer.is_closed stream.recv.consumer);
+  Alcotest.(check (list string))
+    "STOP_SENDING queues RESET_STREAM"
+    [ serialize_frame
+        (Frame.Reset_stream
+           { stream_id = Stream.id stream
+           ; application_protocol_error = 7
+           ; final_size = 0
+           }) ]
+    (List.map serialize_frame (take_queued_frames conn))
+
+let test_stop_sending_missing_local_stream_is_stream_state_error () =
+  let conn = make_connection () in
+  conn.encdec.current <- Encryption_level.Application_data;
+  Quic.Transport.Connection.process_stop_sending_frame
+    conn
+    ~stream_id:0L
+    7;
+  match conn.closing_frame with
+  | Some
+      (Frame.Connection_close_quic
+        { error_code = Error.Stream_state_error; frame_type = Frame.Type.Stop_sending; _ }) ->
+    ()
+  | _ -> Alcotest.fail "expected STREAM_STATE_ERROR for missing local stream"
+
 let suite =
   [ "parser", `Quick, test_parser
   ; "fast frame roundtrip", `Quick, test_fast_frame_parser_roundtrips_payload
@@ -665,6 +736,12 @@ let suite =
     , test_remote_connection_close_enters_draining
   ; "close timeout deregisters connection", `Quick
     , test_close_timeout_deregisters_connection
+  ; "reset stream keeps send side open", `Quick
+    , test_reset_stream_keeps_send_side_open
+  ; "stop sending aborts send side", `Quick
+    , test_stop_sending_aborts_send_side_without_dropping_stream
+  ; "missing local stop sending is error", `Quick
+    , test_stop_sending_missing_local_stream_is_stream_state_error
   ]
 
 let () =
