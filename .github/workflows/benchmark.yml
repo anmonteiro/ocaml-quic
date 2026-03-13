@@ -49,7 +49,7 @@ jobs:
       - name: Run loopback benchmarks
         run: |
           mkdir -p benchmark-output
-          nix develop .#release -c bash ./scripts/bench/run_h3_loopback_benchmarks.sh > benchmark-output/results.jsonl
+          nix develop .#benchmark -c bash ./scripts/bench/run_h3_loopback_benchmarks.sh > benchmark-output/results.jsonl
         env:
           BENCH_OUTPUT_DIR: benchmark-output/raw
 

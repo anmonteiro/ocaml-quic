@@ -20,7 +20,7 @@ Each record carries the fixed benchmark profile `large-1536mib`.
 ## How it works
 
 1. `.github/workflows/benchmark.yml` runs on pushes to `master`.
-2. It enters the Nix `release` shell and runs:
+2. It enters the Nix `benchmark` shell and runs:
    - `scripts/bench/run_h3_loopback_benchmarks.sh`
 3. That script builds a fixed-size payload, runs the local HTTP/3 echo server,
    benchmarks upload and download with `curl --http3-only`, and prints JSONL.

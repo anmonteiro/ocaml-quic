@@ -2,6 +2,7 @@
   packages,
   ocamlPackages,
   release-mode ? false,
+  benchmark-mode ? false,
   stdenv,
   lib,
   mkShell,
@@ -14,26 +15,40 @@ in
 mkShell {
   inputsFrom = [ packages.default ];
   buildInputs =
-    (
-      if release-mode then
-        with pkgs;
-        [
-          cacert
-          curl
-          ocamlPackages.dune-release
-          git
-          opam
-        ]
-      else
-        [ ]
-    )
-    ++ (with ocamlPackages; [
-      merlin
-      ocamlformat
-      ocaml-lsp
-      utop
-    ])
-    ++ (with hsPkgs; [
-      h3spec
-    ]);
+    (with pkgs;
+     if benchmark-mode then
+       [
+         cacert
+         curl
+         git
+       ]
+     else if release-mode then
+       [
+         cacert
+         curl
+         ocamlPackages.dune-release
+         git
+         opam
+       ]
+     else
+       [ ])
+    ++
+      (if benchmark-mode then
+         [ ]
+       else
+         with ocamlPackages;
+         [
+           merlin
+           ocamlformat
+           ocaml-lsp
+           utop
+         ])
+    ++
+      (if benchmark-mode then
+         [ ]
+       else
+         with hsPkgs;
+         [
+           h3spec
+         ]);
 }

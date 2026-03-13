@@ -47,6 +47,10 @@
         default = pkgs.callPackage ./nix/shell.nix {
           packages = self.packages.${pkgs.stdenv.hostPlatform.system};
         };
+        benchmark = pkgs.callPackage ./nix/shell.nix {
+          packages = self.packages.${pkgs.stdenv.hostPlatform.system};
+          benchmark-mode = true;
+        };
         release = pkgs.callPackage ./nix/shell.nix {
           packages = self.packages.${pkgs.stdenv.hostPlatform.system};
           release-mode = true;
