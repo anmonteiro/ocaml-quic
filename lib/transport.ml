@@ -200,6 +200,8 @@ module Connection = struct
     ; queued_packets : (Writer.header_info * Frame.t list) Queue.t
     ; writer : Writer.t
     ; streams : (Stream_id.t, Stream.t) Hashtbl.t
+    ; ready_streams : Stream_id.t Queue.t
+    ; ready_streams_set : (Stream_id.t, unit) Hashtbl.t
     ; mutable handler : handler
     ; start_stream : start_stream
     ; wakeup_writer : unit -> unit
@@ -249,6 +251,12 @@ module Connection = struct
   let wakeup_writer t = t.wakeup_writer ()
   let next_recovery_time_ms t = t.now_ms ()
   let note_activity t = t.last_activity_ms <- t.now_ms ()
+
+  let enqueue_ready_stream t stream_id =
+    if not (Hashtbl.mem t.ready_streams_set stream_id)
+    then (
+      Hashtbl.add t.ready_streams_set stream_id ();
+      Queue.add stream_id t.ready_streams)
 
   let effective_idle_timeout_ms t =
     let peer_timeout =
@@ -900,7 +908,9 @@ module Connection = struct
         ~report_application_error:(report_application_error c)
         ~on_bytes_read:(fun bytes_read ->
           maybe_replenish_recv_credit c ~stream_id:id ~bytes_read)
-        c.wakeup_writer
+        (fun () ->
+          enqueue_ready_stream c id;
+          c.wakeup_writer ())
     in
     Hashtbl.add c.streams id stream;
     stream
@@ -1282,6 +1292,8 @@ module Connection = struct
       ; queued_packets = Queue.create ()
       ; writer = Writer.create 0x1000
       ; streams = Hashtbl.create ~random:true 1024
+      ; ready_streams = Queue.create ()
+      ; ready_streams_set = Hashtbl.create ~random:true 128
       ; handler = Uninitialized connection_handler
       ; wakeup_writer
       ; shutdown
@@ -1574,12 +1586,29 @@ module Connection = struct
         if !acc <> Wrote_app_data
         then acc := process_stream !acc encryption_level stream_type stream
       in
+      let process_all_streams () =
+        Hashtbl.iter
+          (fun _ stream -> process Application_data `Data stream)
+          streams
+      in
       process Encryption_level.Initial `Crypto t.crypto_streams.initial;
       process Handshake `Crypto t.crypto_streams.handshake;
       process Application_data `Crypto t.crypto_streams.application_data;
-      Hashtbl.iter
-        (fun _ stream -> process Application_data `Data stream)
-        streams;
+      let ready_stream_count = Queue.length t.ready_streams in
+      for _ = 1 to ready_stream_count do
+        if !acc <> Wrote_app_data && not (Queue.is_empty t.ready_streams)
+        then (
+          let stream_id = Queue.take t.ready_streams in
+          Hashtbl.remove t.ready_streams_set stream_id;
+          match Hashtbl.find_opt streams stream_id with
+          | None -> ()
+          | Some stream ->
+            process Application_data `Data stream;
+            if Stream.Send.has_pending_output stream.send
+            then enqueue_ready_stream t stream_id)
+      done;
+      if !acc = Didnt_write
+      then process_all_streams ();
       !acc
   end
 end

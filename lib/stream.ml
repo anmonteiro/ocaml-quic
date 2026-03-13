@@ -370,7 +370,9 @@ module Send = struct
   let has_pending_output t =
     (* Force another write poll to make sure that a frame with the fin bit set
        is sent. *)
-    not (Q.is_empty t.deferred) || not (Queue.is_empty t.fresh)
+    not (Q.is_empty t.deferred)
+    || not (Queue.is_empty t.fresh)
+    || Buffer.has_pending_output t.producer
 
   (* TODO: this is probably not needed? *)
   (* || Option.is_none t.fin_offset *)
