@@ -62,6 +62,7 @@ rec {
           ../lib
           ../libcrypto
           ../lib_test
+          ../qtls
           ../vendor
           ../quic.opam
         ];
@@ -95,8 +96,6 @@ rec {
       dune-configurator
       fmt
       ptime
-      # hacl_x25519
-      # fiat-p256
       logs
       kdf
       ke

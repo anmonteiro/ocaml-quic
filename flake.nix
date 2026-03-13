@@ -19,8 +19,8 @@
                       src = super.fetchFromGitHub {
                         owner = "savonet";
                         repo = "ocaml-ssl";
-                        rev = "844d0675f4f76e34442cab8f1d3329770bede208";
-                        hash = "sha256-UJTBaGiUDRyzeU4aL+WcRm0/mYAvyMhhdM1ybi3K2Ow=";
+                        rev = "a3ec4b6d6883a6a73e59f6756eceb1b7cbf45183";
+                        hash = "sha256-zXk5cV6lz5q6XX/CVk8ymt/o+J8DCgAqWMULJLPzenk=";
                       };
                     });
                   }

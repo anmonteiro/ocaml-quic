@@ -1,0 +1,6 @@
+(library
+ (name qtls_ocaml_tls)
+ (public_name quic.qtls-ocaml-tls)
+ (implements qtls)
+ (modules qtls)
+ (libraries tls x509))

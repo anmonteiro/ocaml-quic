@@ -389,13 +389,6 @@ module Connection = struct
       shutdown t;
       wakeup_writer t)
 
-  let report_tls_failure t failure =
-    let _level, alert = Tls.Engine.alert_of_failure failure in
-    report_error
-      t
-      ~frame_type:Frame.Type.Crypto
-      (Crypto_error (Tls.Packet.alert_type_to_int alert))
-
   let apply_peer_transport_params t transport_params =
     t.peer_transport_params <- transport_params;
     t.peer_max_data <-
@@ -496,7 +489,19 @@ module Connection = struct
             Error.Stream_state_error
         else ()
 
-  let process_tls_result t ~new_tls_state ~tls_packets =
+  let report_tls_failure t failure =
+    report_error
+      t
+      ~frame_type:Frame.Type.Crypto
+      (Crypto_error (Qtls.alert_of_failure t.tls_state failure))
+
+  let process_tls_result t ~was_handshake_in_progress ~new_tls_state ~tls_packets =
+    let encryption_level_of_qtls = function
+      | Qtls.State.Initial -> Encryption_level.Initial
+      | Zero_RTT -> Zero_RTT
+      | Handshake -> Handshake
+      | Application_data -> Application_data
+    in
     let drop_initial_and_handshake_keys t =
       Encryption_level.remove Initial t.encdec;
       Encryption_level.remove Handshake t.encdec;
@@ -516,8 +521,9 @@ module Connection = struct
       =
       match packets with
       | (`Change_enc _ :: _ | `Change_dec _ :: _)
+      | (`Level_change_enc _ :: _ | `Level_change_dec _ :: _)
         when cur_encryption_level = Encryption_level.Application_data
-             && not (Tls.Engine.handshake_in_progress t.tls_state) ->
+             && not was_handshake_in_progress ->
         report_unexpected_tls_message ();
         cur_encryption_level
       | `Change_enc enc :: `Change_dec dec :: xs
@@ -575,11 +581,52 @@ module Connection = struct
                 })
           t.encdec;
         process_packets cur_encryption_level xs
+      | `Level_change_enc (level, enc) :: xs ->
+        let level = encryption_level_of_qtls level in
+        if level = Encryption_level.Initial || level = Encryption_level.Zero_RTT
+        then (
+          report_unexpected_tls_message ();
+          cur_encryption_level)
+        else
+          let current_cipher = Qtls.current_cipher new_tls_state in
+          t.encdec.current <- level;
+          Encryption_level.add
+            level
+            { Crypto.encrypter =
+                Crypto.AEAD.make ~ciphersuite:current_cipher enc.traffic_secret
+            ; decrypter =
+                (match Encryption_level.find level t.encdec with
+                | Some { decrypter; _ } -> decrypter
+                | None -> None)
+            }
+            t.encdec;
+          process_packets level xs
+      | `Level_change_dec (level, dec) :: xs ->
+        let level = encryption_level_of_qtls level in
+        let current_cipher = Qtls.current_cipher new_tls_state in
+        Encryption_level.update_exn
+          level
+          (fun encdec ->
+            Some
+              { encdec with
+                Crypto.decrypter =
+                  Some
+                    (Crypto.AEAD.make
+                       ~ciphersuite:current_cipher
+                       dec.traffic_secret)
+              })
+          t.encdec;
+        process_packets cur_encryption_level xs
       | `Record ((ct : Tls.Packet.content_type), cs) :: xs ->
         assert (ct = HANDSHAKE);
         let crypto_stream =
           Spaces.of_encryption_level t.crypto_streams cur_encryption_level
         in
+        let _fragment = Stream.Send.push cs crypto_stream.send in
+        process_packets cur_encryption_level xs
+      | `Level_record (level, cs) :: xs ->
+        let level = encryption_level_of_qtls level in
+        let crypto_stream = Spaces.of_encryption_level t.crypto_streams level in
         let _fragment = Stream.Send.push cs crypto_stream.send in
         (* Encryption_level.update_exn *)
         (* cur_encryption_level *)
@@ -592,8 +639,8 @@ module Connection = struct
       process_packets t.encdec.current tls_packets
     in
     let is_handshake_done =
-      Tls.Engine.handshake_in_progress t.tls_state
-      && not (Tls.Engine.handshake_in_progress new_tls_state)
+      was_handshake_in_progress
+      && not (Qtls.handshake_in_progress new_tls_state)
     in
     if is_handshake_done && t.mode = Server
     then (
@@ -612,6 +659,37 @@ module Connection = struct
       drop_initial_and_handshake_keys t);
     t.tls_state <- new_tls_state
 
+  let apply_peer_transport_params_if_available t tls_state frame_type =
+    match Qtls.transport_params tls_state with
+    | None -> ()
+    | Some quic_transport_params ->
+      (match
+         Transport_parameters.decode_and_validate
+           ~perspective:t.mode
+           quic_transport_params
+       with
+      | Ok transport_params ->
+        apply_peer_transport_params t transport_params;
+        t.recovery.rtt.max_ack_delay_ms <-
+          Int64.of_int transport_params.max_ack_delay
+      | Error err -> report_error t ~frame_type err)
+
+  let handle_crypto_record t ~frame_type ?embed_quic_transport_params fragment_cstruct =
+    match
+      Qtls.handle_raw_record
+        ?embed_quic_transport_params
+        t.tls_state
+        fragment_cstruct
+    with
+    | Error e -> report_tls_failure t e
+    | Ok { Qtls.tls_state; tls_packets; was_handshake_in_progress } ->
+      apply_peer_transport_params_if_available t tls_state frame_type;
+      process_tls_result
+        t
+        ~was_handshake_in_progress
+        ~new_tls_state:tls_state
+        ~tls_packets
+
   let rec exhaust_crypto_stream t ~packet_info ~(stream : Stream.t) =
     let { encryption_level; _ } = packet_info in
     match Stream.Recv.pop stream.recv with
@@ -621,113 +699,33 @@ module Connection = struct
         then payload
         else String.sub payload payload_off len
       in
-      (match t.tls_state.handshake.machina with
-      | Server Tls.State.AwaitClientHello | Server13 AwaitClientHelloHRR13 ->
-        if encryption_level <> Initial
-        then ()
-        else (
-          match
-            Qtls.handle_raw_record
-              ~embed_quic_transport_params:(fun _raw_transport_params ->
-                (* From RFC9000§7.3:
-                 *   When the handshake does not include a Retry (Figure 6), the
-                 *   server sets original_destination_connection_id to S1 and
-                 *   initial_source_connection_id to S3. In this case, the server
-                 *   does not include a retry_source_connection_id transport
-                 *   parameter. *)
-                Some
-                  Transport_parameters.(
-                    encode
-                      [ Encoding.Original_destination_connection_id
-                          t.original_dest_cid
-                      ; Initial_source_connection_id t.source_cid
-                      ; Initial_max_data (Int64.to_int t.local_initial_max_data)
-                      ; Initial_max_stream_data_bidi_local
-                          (Int64.to_int
-                             t.local_initial_max_stream_data_bidi_local)
-                      ; Initial_max_stream_data_bidi_remote
-                          (Int64.to_int
-                             t.local_initial_max_stream_data_bidi_remote)
-                      ; Initial_max_stream_data_uni
-                          (Int64.to_int t.local_initial_max_stream_data_uni)
-                      ; Initial_max_streams_bidi
-                          (Int64.to_int t.local_initial_max_streams_bidi)
-                      ; Initial_max_streams_uni
-                          (Int64.to_int t.local_initial_max_streams_uni)
-                      ]))
-              t.tls_state
-              fragment_cstruct
-          with
-          | Error e -> report_tls_failure t e
-          | Ok (tls_state', tls_packets, (None | Some _)) ->
-            (* TODO: send alerts as quic error *)
-            (match tls_packets with
-            | [] -> t.tls_state <- tls_state'
-            | tls_packets ->
-              (match Qtls.transport_params tls_state' with
-              | Some quic_transport_params ->
-                (match
-                   Transport_parameters.decode_and_validate
-                     ~perspective:Server
-                     quic_transport_params
-                 with
-                | Ok transport_params ->
-                  apply_peer_transport_params t transport_params;
-                  t.recovery.rtt.max_ack_delay_ms <-
-                    Int64.of_int transport_params.max_ack_delay;
-                  process_tls_result t ~new_tls_state:tls_state' ~tls_packets
-                | Error e -> report_error t ~frame_type:Crypto e)
-              | None -> report_error t ~frame_type:Crypto (Crypto_error 0x6d))))
-      | Server13
-          ( AwaitClientCertificate13 _ | AwaitClientCertificateVerify13 _
-          | AwaitClientFinished13 _ ) ->
-        if encryption_level <> Handshake
-        then ()
-        else (
-          match Qtls.handle_raw_record t.tls_state fragment_cstruct with
-          | Error e -> report_tls_failure t e
-          | Ok (tls_state', tls_packets, (None | Some _)) ->
-            (* TODO: send alerts as quic error *)
-            process_tls_result t ~new_tls_state:tls_state' ~tls_packets)
-      | Server13 Established13 ->
-        report_error
+      (match encryption_level with
+      | Initial when t.mode = Server ->
+        handle_crypto_record
           t
           ~frame_type:Crypto
-          (Crypto_error
-             (Tls.Packet.alert_type_to_int Tls.Packet.UNEXPECTED_MESSAGE))
-      | Server Established -> report_error t ~frame_type:Crypto Internal_error
-      | Client (AwaitServerHello (_, _, _)) ->
-        if encryption_level <> Initial
-        then ()
-        else (
-          match Qtls.handle_raw_record t.tls_state fragment_cstruct with
-          | Error e -> report_tls_failure t e
-          | Ok (tls_state', tls_packets, (None | Some _)) ->
-            (* TODO: send alerts as quic error *)
-            process_tls_result t ~new_tls_state:tls_state' ~tls_packets)
-      | Client13
-          ( AwaitServerEncryptedExtensions13 _
-          | AwaitServerCertificateRequestOrCertificate13 _
-          | AwaitServerCertificate13 _ | AwaitServerCertificateVerify13 _
-          | AwaitServerFinished13 _ ) ->
-        if encryption_level <> Handshake
-        then ()
-        else (
-          match Qtls.handle_raw_record t.tls_state fragment_cstruct with
-          | Error e -> report_tls_failure t e
-          | Ok (tls_state', tls_packets, (None | Some _)) ->
-            (* TODO: send alerts as quic error *)
-            process_tls_result t ~new_tls_state:tls_state' ~tls_packets)
-      | Client13 (AwaitServerHello13 _) ->
-        if encryption_level <> Initial
-        then ()
-        else (
-          match Qtls.handle_raw_record t.tls_state fragment_cstruct with
-          | Error e -> report_tls_failure t e
-          | Ok (tls_state', tls_packets, (None | Some _)) ->
-            process_tls_result t ~new_tls_state:tls_state' ~tls_packets)
-      | Client _ | Client13 _ -> ()
-      | Server _ | Server13 _ -> ());
+          ~embed_quic_transport_params:(fun _raw_transport_params ->
+            Some
+              Transport_parameters.(
+                encode
+                  [ Encoding.Original_destination_connection_id t.original_dest_cid
+                  ; Initial_source_connection_id t.source_cid
+                  ; Initial_max_data (Int64.to_int t.local_initial_max_data)
+                  ; Initial_max_stream_data_bidi_local
+                      (Int64.to_int t.local_initial_max_stream_data_bidi_local)
+                  ; Initial_max_stream_data_bidi_remote
+                      (Int64.to_int t.local_initial_max_stream_data_bidi_remote)
+                  ; Initial_max_stream_data_uni
+                      (Int64.to_int t.local_initial_max_stream_data_uni)
+                  ; Initial_max_streams_bidi
+                      (Int64.to_int t.local_initial_max_streams_bidi)
+                  ; Initial_max_streams_uni
+                      (Int64.to_int t.local_initial_max_streams_uni)
+                  ]))
+          fragment_cstruct
+      | Initial | Handshake | Application_data ->
+        handle_crypto_record t ~frame_type:Crypto fragment_cstruct
+      | Zero_RTT -> ());
       exhaust_crypto_stream t ~packet_info ~stream
     | None -> ()
 
@@ -1275,33 +1273,14 @@ module Connection = struct
     t
 
   let send_handshake_bytes t =
-    match t.tls_state.handshake.machina with
-    | Client (Tls.State.AwaitServerHello (_, _, [ raw_record ]))
-    (* | Client13 (AwaitServerHello13 (_, _, raw)) *) ->
-      let current_encryption_level = t.encdec.current in
-      assert (current_encryption_level = Initial);
-      let crypto_stream =
-        Spaces.of_encryption_level t.crypto_streams current_encryption_level
-      in
-      (match t.processed_retry_packet with
-      | false ->
-        (* Very first initial packet for the connection, push to the crypto
-           stream. *)
-        let _fragment = Stream.Send.push raw_record crypto_stream.send in
-        ()
-      | true ->
-        send_frames
-          t
-          ~encryption_level:current_encryption_level
-          [ Frame.Crypto
-              { Frame.off = 0
-              ; len = String.length raw_record
-              ; payload = raw_record
-              ; payload_off = 0
-              }
-          ])
-    | Client _ | Client13 _ -> assert false
-    | Server _ | Server13 _ -> assert false
+    let { Qtls.tls_state; tls_packets; was_handshake_in_progress } =
+      Qtls.initial_packets t.tls_state
+    in
+    process_tls_result
+      t
+      ~was_handshake_in_progress
+      ~new_tls_state:tls_state
+      ~tls_packets
 
   let establish_connection t =
     send_handshake_bytes t;
