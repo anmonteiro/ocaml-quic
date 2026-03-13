@@ -1,5 +1,11 @@
 (tests
- (names test_server test_packet_protection test_parser test_rfc9002 test_flow_control)
+ (names
+  test_server
+  test_packet_protection
+  test_parser
+  test_rfc9002
+  test_flow_control
+  test_stream_recv)
  (libraries alcotest hex quic qtls_ocaml_tls tls mirage-crypto-rng.unix fmt.tty logs.fmt)
  (deps
   (source_tree ../certificates))

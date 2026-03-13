@@ -167,9 +167,17 @@ let process_data_frame stream bs =
     let request_body = Reqd.request_body reqd in
     let faraday = Body.Reader.unsafe_faraday request_body in
     if not (Faraday.is_closed faraday)
-    then (
-      Faraday.schedule_bigstring faraday bs;
-      Body.Reader.execute_read request_body)
+    then Faraday.schedule_bigstring faraday bs
+
+let flush_request_body stream =
+  match stream.reqd with
+  | None -> ()
+  | Some reqd ->
+    let request_body = Reqd.request_body reqd in
+    if Body.Reader.has_pending_output request_body
+    then
+      try Body.Reader.execute_read request_body with
+      | exn -> Reqd.report_exn reqd exn
 
 let process_settings_frame t stream settings =
   match t.saw_control_settings with
@@ -218,6 +226,7 @@ let parser_input bs ~off ~len =
 
 let rec read t stream ~reader bs ~off ~len =
   Reader.read_with_more reader (parser_input bs ~off ~len) Incomplete;
+  flush_request_body stream;
   Stream.schedule_read
     stream.stream
     ~on_eof:(read_eof t stream ~reader)
@@ -225,6 +234,10 @@ let rec read t stream ~reader bs ~off ~len =
 
 and read_eof t stream ~reader () =
   Reader.read_with_more reader Bigstringaf.empty Complete;
+  flush_request_body stream;
+  (match stream.reqd with
+  | Some reqd -> Body.Reader.close (Reqd.request_body reqd)
+  | None -> ());
   if is_peer_critical_stream t (Stream.id stream.stream)
   then close_with_h3_error stream Error.Code.Closed_critical_stream
 

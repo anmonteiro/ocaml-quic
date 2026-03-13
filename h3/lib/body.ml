@@ -33,6 +33,8 @@
  *---------------------------------------------------------------------------*)
 
 module Reader = struct
+  let max_coalesced_read = 0x10000
+
   type t =
     { faraday : Faraday.t
     ; mutable read_scheduled : bool
@@ -61,6 +63,41 @@ module Reader = struct
   let is_closed t = Faraday.is_closed t.faraday
   let unsafe_faraday t = t.faraday
 
+  let coalesce_iovecs iovecs =
+    match iovecs with
+    | [] -> assert false
+    | [ iovec ] -> `Direct iovec
+    | first :: _ ->
+      let remaining = ref max_coalesced_read in
+      let selected_rev = ref [] in
+      let total = ref 0 in
+      let rec collect_prefix = function
+        | [] -> ()
+        | ({ Httpaf.IOVec.len; _ } as iovec) :: rest when len <= !remaining ->
+          selected_rev := iovec :: !selected_rev;
+          total := !total + len;
+          remaining := !remaining - len;
+          collect_prefix rest
+        | _ -> ()
+      in
+      collect_prefix iovecs;
+      match List.rev !selected_rev with
+      | [] | [ _ ] -> `Direct first
+      | selected ->
+        let buffer = Bigstringaf.create !total in
+        let dst_off = ref 0 in
+        List.iter
+          (fun { Httpaf.IOVec.buffer = src; off = src_off; len } ->
+             Bigstringaf.blit
+               src
+               ~src_off
+               buffer
+               ~dst_off:!dst_off
+               ~len;
+             dst_off := !dst_off + len)
+          selected;
+        `Coalesced (buffer, !total)
+
   let rec do_execute_read t on_eof on_read =
     match Faraday.operation t.faraday with
     | `Yield -> ()
@@ -70,13 +107,17 @@ module Reader = struct
       t.on_read <- default_on_read;
       on_eof ()
     | `Writev [] -> assert false
-    | `Writev (iovec :: _) ->
+    | `Writev iovecs ->
       t.read_scheduled <- false;
       t.on_eof <- default_on_eof;
       t.on_read <- default_on_read;
-      let { Httpaf.IOVec.buffer; off; len } = iovec in
-      Faraday.shift t.faraday len;
-      on_read buffer ~off ~len;
+      (match coalesce_iovecs iovecs with
+      | `Direct { Httpaf.IOVec.buffer; off; len } ->
+        Faraday.shift t.faraday len;
+        on_read buffer ~off ~len
+      | `Coalesced (buffer, len) ->
+        Faraday.shift t.faraday len;
+        on_read buffer ~off:0 ~len);
       (* Application is done reading, we can give flow control tokens back to
          the peer. *)
       (* t.done_reading len; *)
