@@ -92,6 +92,7 @@ let test_dynamic_flow_control_allows_large_upload () =
   let transport_parameters =
     Quic.Config.
       { initial_max_data = 4096
+      ; max_idle_timeout = 30_000
       ; initial_max_stream_data_bidi_local = 4096
       ; initial_max_stream_data_bidi_remote = 4096
       ; initial_max_stream_data_uni = 4096
@@ -183,6 +184,53 @@ let test_zero_length_fin_closes_reader () =
     true
     !saw_eof
 
+let test_idle_timeout_retires_abandoned_connection () =
+  let transport_parameters =
+    Quic.Config.
+      { initial_max_data = 4096
+      ; max_idle_timeout = 5
+      ; initial_max_stream_data_bidi_local = 4096
+      ; initial_max_stream_data_bidi_remote = 4096
+      ; initial_max_stream_data_uni = 4096
+      ; initial_max_streams_bidi = 8
+      ; initial_max_streams_uni = 8
+      }
+  in
+  let config = make_config ~transport_parameters in
+  let now = ref 0L in
+  let now_ms () = !now in
+  let noop_handler ~cid:_ ~start_stream:_ =
+    Transport.F (fun _stream -> { Transport.on_error = (fun _ -> ()) })
+  in
+  let server = Transport.Server.create ~now_ms ~config noop_handler in
+  let client = Transport.Client.create ~now_ms ~config noop_handler in
+  Transport.connect client ~address:"server-address" ~host:"localhost" noop_handler;
+  let rec drain step =
+    if step > 10_000
+    then Alcotest.fail "handshake did not quiesce"
+    else
+      let progressed =
+        pump_write ~src:client ~dst:server ~client_address:"client-address"
+        || pump_write ~src:server ~dst:client ~client_address:"server-address"
+      in
+      if progressed then drain (step + 1)
+  in
+  drain 0;
+  (match Transport.next_write_operation server with
+  | `Yield (Some deadline_ms) ->
+    Alcotest.(check int64) "idle timeout armed" 5L deadline_ms
+  | `Yield None -> Alcotest.fail "expected idle timeout to be armed"
+  | `Writev _ | `Close _ -> Alcotest.fail "expected quiescent server before timeout");
+  now := 6L;
+  Transport.on_timeout client;
+  Transport.on_timeout server;
+  Alcotest.(check bool)
+    "server has no pending work after idle timeout"
+    true
+    (match Transport.next_write_operation server with
+    | `Yield None -> true
+    | `Writev _ | `Yield (Some _) | `Close _ -> false)
+
 let () =
   Mirage_crypto_rng_unix.use_default ();
   Alcotest.run
@@ -195,4 +243,7 @@ let () =
         ; ( "zero-length FIN closes the stream reader"
           , `Quick
           , test_zero_length_fin_closes_reader )
+        ; ( "idle timeout retires abandoned connections"
+          , `Quick
+          , test_idle_timeout_retires_abandoned_connection )
         ] ) ]

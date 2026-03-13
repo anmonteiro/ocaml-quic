@@ -69,6 +69,53 @@ CAMLprim value ocaml_quic_eio_send_msg_iovecs(value vfd, value vaddr,
   CAMLreturn(Val_int(ret));
 }
 
+CAMLprim value ocaml_quic_eio_send_msg_iovecs_nb(value vfd, value vaddr,
+                                                 value viovecs) {
+  CAMLparam3(vfd, vaddr, viovecs);
+  union sock_addr_union addr;
+  socklen_param_type addr_len;
+  struct msghdr msg;
+  struct iovec small_iov[16];
+  struct iovec *iov = small_iov;
+  mlsize_t count = 0;
+  value cur = viovecs;
+  int ret;
+
+  while (cur != Val_emptylist) {
+    count++;
+    cur = Field(cur, 1);
+  }
+
+  if (count > sizeof(small_iov) / sizeof(small_iov[0])) {
+    iov = caml_stat_alloc_noexc(count * sizeof(struct iovec));
+    if (iov == NULL) caml_raise_out_of_memory();
+  }
+
+  cur = viovecs;
+  for (mlsize_t i = 0; i < count; i++) {
+    value viov = Field(cur, 0);
+    struct caml_ba_array *ba = Caml_ba_array_val(IOVEC_BUFFER(viov));
+    char *base = (char *)ba->data + IOVEC_OFF(viov);
+    iov[i].iov_base = base;
+    iov[i].iov_len = IOVEC_LEN(viov);
+    cur = Field(cur, 1);
+  }
+
+  get_sockaddr(vaddr, &addr, &addr_len);
+  memset(&msg, 0, sizeof(msg));
+  msg.msg_name = &addr;
+  msg.msg_namelen = addr_len;
+  msg.msg_iov = iov;
+  msg.msg_iovlen = count;
+
+  ret = sendmsg(Int_val(vfd), &msg, 0);
+
+  if (iov != small_iov) caml_stat_free(iov);
+
+  if (ret == -1) uerror("sendmsg", Nothing);
+  CAMLreturn(Val_int(ret));
+}
+
 static value ocaml_quic_alloc_encoded_sockaddr(union sock_addr_union *addr,
                                                socklen_param_type addr_len) {
   CAMLparam0();
@@ -119,9 +166,7 @@ CAMLprim value ocaml_quic_eio_recvfrom_into(value vfd, value vbuf, value voff,
   socklen_param_type addr_len = sizeof(addr);
   int ret;
 
-  caml_enter_blocking_section();
   ret = recvfrom(Int_val(vfd), dst, Long_val(vlen), 0, &addr.s_gen, &addr_len);
-  caml_leave_blocking_section();
 
   if (ret == -1) uerror("recvfrom", Nothing);
 

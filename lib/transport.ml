@@ -178,6 +178,8 @@ module Connection = struct
       crypto_streams : Stream.t Spaces.t
     ; mutable peer_address : string
     ; mutable peer_transport_params : Transport_parameters.t
+    ; local_max_idle_timeout_ms : int64 option
+    ; mutable last_activity_ms : int64
     ; local_initial_max_data : int64
     ; local_initial_max_stream_data_bidi_local : int64
     ; local_initial_max_stream_data_bidi_remote : int64
@@ -246,6 +248,23 @@ module Connection = struct
 
   let wakeup_writer t = t.wakeup_writer ()
   let next_recovery_time_ms t = t.now_ms ()
+  let note_activity t = t.last_activity_ms <- t.now_ms ()
+
+  let effective_idle_timeout_ms t =
+    let peer_timeout =
+      match t.peer_transport_params.max_idle_timeout with
+      | timeout when timeout <= 0 -> None
+      | timeout -> Some (Int64.of_int timeout)
+    in
+    match t.local_max_idle_timeout_ms, peer_timeout with
+    | None, None -> None
+    | Some timeout, None | None, Some timeout -> Some timeout
+    | Some local, Some peer -> Some (Int64.min local peer)
+
+  let idle_timeout_deadline_ms t =
+    Option.map
+      (fun timeout_ms -> Int64.add t.last_activity_ms timeout_ms)
+      (effective_idle_timeout_ms t)
 
   let packet_is_in_flight frames =
     Frame.is_any_ack_eliciting frames
@@ -261,6 +280,7 @@ module Connection = struct
 
   let on_packet_sent t ~encryption_level ~packet_number ~bytes_sent frames =
     let time_sent_ms = next_recovery_time_ms t in
+    if Frame.is_any_ack_eliciting frames then t.last_activity_ms <- time_sent_ms;
     Recovery.Debug.record_packet_sent
       t.recovery
       ~encryption_level
@@ -306,6 +326,11 @@ module Connection = struct
   let shutdown_writer t =
     Writer.close t.writer;
     wakeup_writer t
+
+  let force_shutdown t =
+    Queue.clear t.queued_packets;
+    Writer.close_and_drain t.writer;
+    t.shutdown t
 
   let shutdown t =
     let shutdown () =
@@ -709,6 +734,10 @@ module Connection = struct
               Transport_parameters.(
                 encode
                   [ Encoding.Original_destination_connection_id t.original_dest_cid
+                  ; Max_idle_timeout
+                      (match t.local_max_idle_timeout_ms with
+                      | None -> 0
+                      | Some timeout_ms -> Int64.to_int timeout_ms)
                   ; Initial_source_connection_id t.source_cid
                   ; Initial_max_data (Int64.to_int t.local_initial_max_data)
                   ; Initial_max_stream_data_bidi_local
@@ -1219,6 +1248,11 @@ module Connection = struct
       ; dest_cid = CID.empty
       ; peer_address
       ; peer_transport_params = Transport_parameters.default
+      ; local_max_idle_timeout_ms =
+          (match transport_parameters.Config.max_idle_timeout with
+          | timeout when timeout <= 0 -> None
+          | timeout -> Some (Int64.of_int timeout))
+      ; last_activity_ms = now_ms ()
       ; local_initial_max_data =
           Int64.of_int transport_parameters.Config.initial_max_data
       ; local_initial_max_stream_data_bidi_local =
@@ -1636,12 +1670,20 @@ let next_timeout_ms t =
                     | Some current -> Some (Int64.min timeout current)))
               None
        in
+       let idle_timeout = Connection.idle_timeout_deadline_ms connection in
        let timeout =
-         match recovery_timeout, ack_timeout with
-         | None, None -> None
-         | Some timeout, None | None, Some timeout -> Some timeout
-         | Some recovery_timeout, Some ack_timeout ->
-           Some (Int64.min recovery_timeout ack_timeout)
+         match recovery_timeout, ack_timeout, idle_timeout with
+         | None, None, None -> None
+         | Some timeout, None, None
+         | None, Some timeout, None
+         | None, None, Some timeout ->
+           Some timeout
+         | Some a, Some b, None
+         | Some a, None, Some b
+         | None, Some a, Some b ->
+           Some (Int64.min a b)
+         | Some a, Some b, Some c ->
+           Some (Int64.min a (Int64.min b c))
        in
        match timeout, !next_timeout with
        | None, _ -> ()
@@ -1652,52 +1694,60 @@ let next_timeout_ms t =
 
 let on_timeout t =
   let now_ms = t.now_ms () in
+  let expired = ref [] in
   iter_unique_connections t (fun (connection : Connection.t) ->
-       match
-         (Recovery.Debug.snapshot connection.recovery).timer
-           .loss_detection_timer_ms
-       with
+       match Connection.idle_timeout_deadline_ms connection with
        | Some timeout_ms when Int64.compare timeout_ms now_ms <= 0 ->
-         Recovery.Debug.on_loss_detection_timeout
-           connection.recovery
-           ~now_ms:(connection.now_ms ());
-         if Encryption_level.mem connection.encdec.current connection.encdec
-         then (
-           let remaining_probes = ref 2 in
-           let retransmissions_rev = ref [] in
-           List.iter
-             (fun encryption_level ->
-                if
-                  !remaining_probes > 0
-                  && Encryption_level.mem encryption_level connection.encdec
-                then
-                  let candidates =
-                    Recovery.drain_lost connection.recovery ~encryption_level
-                    @ Recovery.pto_probe_packets
-                        connection.recovery
-                        ~encryption_level
-                        ~max_packets:!remaining_probes
-                  in
-                  List.iter
-                    (fun frames ->
-                       if !remaining_probes > 0 && frames <> []
-                       then (
-                         decr remaining_probes;
-                         retransmissions_rev :=
-                           (encryption_level, frames) :: !retransmissions_rev))
-                    candidates)
-             [ Initial; Handshake; Application_data ];
-           match List.rev !retransmissions_rev with
-           | [] ->
-             Connection.send_frames
-               connection
-               ~encryption_level:connection.encdec.current
-               [ Frame.Ping ]
-           | frames_list ->
-             List.iter
-               (fun (encryption_level, frames) ->
-                  Connection.send_frames connection ~encryption_level frames)
-               frames_list);
+         expired := connection :: !expired
+       | Some _ | None ->
+         let wrote = ref false in
+         (match
+            (Recovery.Debug.snapshot connection.recovery).timer
+              .loss_detection_timer_ms
+          with
+          | Some timeout_ms when Int64.compare timeout_ms now_ms <= 0 ->
+            Recovery.Debug.on_loss_detection_timeout
+              connection.recovery
+              ~now_ms:(connection.now_ms ());
+            if Encryption_level.mem connection.encdec.current connection.encdec
+            then (
+              let remaining_probes = ref 2 in
+              let retransmissions_rev = ref [] in
+              List.iter
+                (fun encryption_level ->
+                   if
+                     !remaining_probes > 0
+                     && Encryption_level.mem encryption_level connection.encdec
+                   then
+                     let candidates =
+                       Recovery.drain_lost connection.recovery ~encryption_level
+                       @ Recovery.pto_probe_packets
+                           connection.recovery
+                           ~encryption_level
+                           ~max_packets:!remaining_probes
+                     in
+                     List.iter
+                       (fun frames ->
+                          if !remaining_probes > 0 && frames <> []
+                          then (
+                            decr remaining_probes;
+                            retransmissions_rev :=
+                              (encryption_level, frames) :: !retransmissions_rev))
+                       candidates)
+                [ Initial; Handshake; Application_data ];
+              (match List.rev !retransmissions_rev with
+              | [] ->
+                Connection.send_frames
+                  connection
+                  ~encryption_level:connection.encdec.current
+                  [ Frame.Ping ]
+              | frames_list ->
+                List.iter
+                  (fun (encryption_level, frames) ->
+                     Connection.send_frames connection ~encryption_level frames)
+                  frames_list);
+              wrote := true)
+          | Some _ | None -> ());
          let maybe_send_delayed_ack encryption_level pn_space =
            match pn_space.Packet_number.ack_deadline_ms with
            | Some ack_deadline_ms
@@ -1707,7 +1757,8 @@ let on_timeout t =
                connection
                ~encryption_level
                [ Packet_number.compose_ack_frame pn_space ];
-             Packet_number.on_ack_sent pn_space
+             Packet_number.on_ack_sent pn_space;
+             wrote := true
            | Some _ | None -> ()
          in
          maybe_send_delayed_ack Initial connection.packet_number_spaces.initial;
@@ -1717,8 +1768,9 @@ let on_timeout t =
          maybe_send_delayed_ack
            Application_data
            connection.packet_number_spaces.application_data;
-         Connection.wakeup_writer connection
-       | Some _ | None -> ());
+         if !wrote then Connection.wakeup_writer connection);
+  List.iter Connection.force_shutdown !expired;
+  if !expired <> [] then wakeup_writer t;
   wakeup_writer t
 
 let send_packets t ~packet_info =
@@ -1905,6 +1957,7 @@ let packet_handler t ?error packet =
       in
       Connection.report_error c ?encryption_level error
     | None ->
+      Connection.note_activity c;
       if CID.is_empty c.original_dest_cid
       then
         (* From RFC9000§7.3:
@@ -2133,6 +2186,7 @@ let connect t ~address ~host connection_handler =
         [ (* Encoding.Original_destination_connection_id dest_cid *)
           (* ; *)
           Encoding.Initial_source_connection_id src_cid
+        ; Max_idle_timeout transport_parameters.Config.max_idle_timeout
         ; Active_connection_id_limit 2
         ; Initial_max_data transport_parameters.Config.initial_max_data
         ; Initial_max_stream_data_bidi_local

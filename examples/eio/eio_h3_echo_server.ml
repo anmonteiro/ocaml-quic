@@ -240,6 +240,7 @@ let () =
   let transport_parameters =
     Quic.Config.
       { initial_max_data = 1 lsl 26
+      ; max_idle_timeout = 30_000
       ; initial_max_stream_data_bidi_local = 1 lsl 26
       ; initial_max_stream_data_bidi_remote = 1 lsl 26
       ; initial_max_stream_data_uni = 1 lsl 26

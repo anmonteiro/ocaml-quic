@@ -32,6 +32,7 @@
 
 type transport_parameters =
   { initial_max_data : int
+  ; max_idle_timeout : int
   ; initial_max_stream_data_bidi_local : int
   ; initial_max_stream_data_bidi_remote : int
   ; initial_max_stream_data_uni : int
@@ -41,6 +42,7 @@ type transport_parameters =
 
 let default_transport_parameters =
   { initial_max_data = 1 lsl 27
+  ; max_idle_timeout = 30_000
   ; initial_max_stream_data_bidi_local = 1 lsl 27
   ; initial_max_stream_data_bidi_remote = 1 lsl 27
   ; initial_max_stream_data_uni = 1 lsl 27

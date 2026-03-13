@@ -39,6 +39,10 @@ external send_msg_iovecs :
   Unix.file_descr -> Unix.sockaddr -> 'a Faraday.iovec list -> int
   = "ocaml_quic_eio_send_msg_iovecs"
 
+external send_msg_iovecs_nb :
+  Unix.file_descr -> Unix.sockaddr -> 'a Faraday.iovec list -> int
+  = "ocaml_quic_eio_send_msg_iovecs_nb"
+
 external recvfrom_into :
   Unix.file_descr -> Bigstringaf.t -> int -> int -> int * string
   = "ocaml_quic_eio_recvfrom_into"
@@ -183,6 +187,11 @@ module IO_loop = struct
       | None -> 0
       | Some v -> int_of_string v
 
+    let send_msg_nb_threshold =
+      match Sys.getenv_opt "QUIC_EIO_SEND_NB_THRESHOLD" with
+      | None -> 256
+      | Some v -> int_of_string v
+
     let read_once dsock buffer =
       let p, u = Promise.create () in
       let addr_p, addr_u = Promise.create () in
@@ -283,9 +292,16 @@ module IO_loop = struct
         | Some fd ->
           (match
              Eio_unix.Fd.use fd ~if_closed:(fun () -> None) (fun fd ->
-               Some (send_msg_iovecs fd (Addr.parse_unix client_address) iovecs))
+               let sockaddr = Addr.parse_unix client_address in
+               if lenv <= send_msg_nb_threshold
+               then (
+                 try Some (`Ok (send_msg_iovecs_nb fd sockaddr iovecs))
+                 with
+                 | Unix.Unix_error (Unix.EAGAIN, _, _) -> Some `Would_block)
+               else Some (`Ok (send_msg_iovecs fd sockaddr iovecs)))
            with
-           | Some _ -> `Ok lenv
+           | Some (`Ok _) -> `Ok lenv
+           | Some `Would_block -> `Would_block
            | None -> `Closed)
         | None -> fallback_send ()
       else fallback_send ()
@@ -299,6 +315,7 @@ module IO_loop = struct
     let read_buffer = Buffer.create read_buffer_size in
     let recv_seq_no = ref 0 in
     let send_seq_no = ref 0 in
+    let write_burst_limit = 64 in
     let read_once =
       match cancel with
       | None -> (fun () -> Io.read socket read_buffer)
@@ -361,7 +378,7 @@ module IO_loop = struct
           read_loop ())
     in
     let rec write_loop () =
-      let rec write_loop_step () =
+      let rec write_loop_step writes_since_yield =
         match Runtime.next_write_operation t with
         | `Writev (io_vectors, client_address, cid) ->
           let sent_len = iovecs_len io_vectors in
@@ -382,8 +399,18 @@ module IO_loop = struct
                 socket
                 io_vectors
           in
-          Runtime.report_write_result t ~cid write_result;
-          write_loop_step ()
+          (match write_result with
+          | `Would_block ->
+            Fiber.yield ();
+            `Continue
+          | (`Ok _ | `Closed) as write_result ->
+            Runtime.report_write_result t ~cid write_result;
+            let writes_since_yield = writes_since_yield + 1 in
+            if writes_since_yield >= write_burst_limit
+            then (
+              Fiber.yield ();
+              `Continue)
+            else write_loop_step writes_since_yield)
         | `Yield timeout_ms ->
           let wake_p, wake_u = Promise.create () in
           Runtime.yield_writer t (Promise.resolve wake_u);
@@ -413,7 +440,7 @@ module IO_loop = struct
           `Continue
         | `Close _ -> `Stop
       in
-      match write_loop_step () with
+      match write_loop_step 0 with
       | `Continue -> write_loop ()
       | `Stop -> ()
       | exception Cancelled -> ()
