@@ -962,6 +962,8 @@ let make_client_connection_for_congestion_tests () =
       ~now_ms:(fun () -> 0L)
       ~wakeup_writer:(fun () -> ())
       ~shutdown:(fun _ -> ())
+      ~register_connection_id:ignore
+      ~deregister_connection_id:ignore
       ~connection_handler
       ~remember_new_token:ignore
       source_cid

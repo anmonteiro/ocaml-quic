@@ -162,6 +162,13 @@ module Connection = struct
     | Closing of int64
     | Draining of int64
 
+  type pending_path_validation =
+    { challenge : Bigstringaf.t
+    ; peer_address : string
+    ; dest_cid : CID.t
+    ; sequence_no : int
+    }
+
   type handler =
     | Uninitialized of
         (cid:string -> start_stream:start_stream -> stream_handler)
@@ -201,6 +208,9 @@ module Connection = struct
     ; mutable peer_max_streams_bidi : int64
     ; mutable peer_max_streams_uni : int64
     ; peer_stream_max_data : (Stream_id.t, int64) Hashtbl.t
+    ; peer_connection_ids : (int, CID.t) Hashtbl.t
+    ; mutable peer_retire_prior_to : int
+    ; mutable active_peer_connection_id_sequence : int
     ; mutable sent_data_bytes : int64
     ; sent_stream_highest_offsets : (Stream_id.t, int64) Hashtbl.t
     ; recovery : Recovery.t
@@ -219,6 +229,12 @@ module Connection = struct
     ; mutable token_value : string
     ; mutable close_state : close_state
     ; mutable closing_frame : Frame.t option
+    ; local_connection_ids : (int, CID.t) Hashtbl.t
+    ; mutable active_local_connection_id_sequence : int
+    ; mutable next_local_connection_id_sequence : int
+    ; register_connection_id : CID.t -> unit
+    ; deregister_connection_id : CID.t -> unit
+    ; mutable pending_path_validation : pending_path_validation option
     ; remember_new_token : string -> unit
     ; now_ms : unit -> int64
     }
@@ -463,6 +479,76 @@ module Connection = struct
   let maybe_remove_closed_stream t stream =
     if Stream.is_closed stream then Hashtbl.remove t.streams stream.id
 
+  let ensure_local_connection_id_budget t =
+    let active_limit = max 1 t.peer_transport_params.active_connection_id_limit in
+    let missing = active_limit - Hashtbl.length t.local_connection_ids in
+    if missing > 0 && Encryption_level.mem Application_data t.encdec
+    then
+      for _ = 1 to missing do
+        let sequence_no = t.next_local_connection_id_sequence in
+        let cid = CID.generate () in
+        Hashtbl.replace t.local_connection_ids sequence_no cid;
+        t.next_local_connection_id_sequence <- sequence_no + 1;
+        t.register_connection_id cid;
+        send_frames
+          t
+          ~encryption_level:Application_data
+          [ Frame.New_connection_id
+              { cid
+              ; stateless_reset_token = Mirage_crypto_rng.generate 16
+              ; retire_prior_to = 0
+              ; sequence_no
+              }
+          ]
+      done
+
+  let start_path_validation t ~peer_address ~cid ~sequence_no =
+    if
+      not (is_terminating t)
+      && Encryption_level.mem Application_data t.encdec
+      && Option.is_none t.pending_path_validation
+    then (
+      let challenge_s = Mirage_crypto_rng.generate 8 in
+      let challenge =
+        Bigstringaf.of_string ~off:0 ~len:(String.length challenge_s) challenge_s
+      in
+      t.pending_path_validation <-
+        Some { challenge; peer_address; dest_cid = cid; sequence_no };
+      t.peer_address <- peer_address;
+      t.dest_cid <- cid;
+      send_frames
+        t
+        ~encryption_level:Application_data
+        [ Frame.Path_challenge challenge ])
+
+  let process_path_response_frame t buf =
+    match t.pending_path_validation with
+    | Some { challenge; _ }
+      when String.equal
+             (Bigstringaf.to_string challenge)
+             (Bigstringaf.to_string buf) ->
+      t.pending_path_validation <- None
+    | Some _ | None -> ()
+
+  let process_retire_connection_id_frame t sequence_no =
+    if sequence_no = t.active_local_connection_id_sequence
+    then
+      report_error
+        t
+        ~frame_type:Frame.Type.Retire_connection_id
+        Protocol_violation
+    else
+      match Hashtbl.find_opt t.local_connection_ids sequence_no with
+      | None ->
+        report_error
+          t
+          ~frame_type:Frame.Type.Retire_connection_id
+          Protocol_violation
+      | Some cid ->
+        Hashtbl.remove t.local_connection_ids sequence_no;
+        t.deregister_connection_id cid;
+        ensure_local_connection_id_budget t
+
   let process_reset_stream_frame
         t
         ~stream_id
@@ -667,6 +753,7 @@ module Connection = struct
       assert (t.encdec.current = Application_data);
       send_frames t [ Frame.Handshake_done ];
       issue_new_token t;
+      ensure_local_connection_id_budget t;
       (* From RFC9001§4.9.2:
        *   "An endpoint MUST discard its Handshake keys when the TLS handshake
        *   is confirmed" (and Initial keys at the same time). Per RFC9001§4.1.2,
@@ -1145,7 +1232,8 @@ module Connection = struct
           Encryption_level.remove Initial t.encdec;
           Encryption_level.remove Handshake t.encdec;
           Recovery.discard_space t.recovery ~encryption_level:Initial;
-          Recovery.discard_space t.recovery ~encryption_level:Handshake
+          Recovery.discard_space t.recovery ~encryption_level:Handshake;
+          ensure_local_connection_id_budget t
         | Error err -> report_error t ~frame_type:Handshake_done err))
 
   let process_path_challenge_frame t buf =
@@ -1219,20 +1307,62 @@ module Connection = struct
                 { stream_id; max_data = int_of_int64_clamped current }
             ]
 
-  let process_new_connection_id_frame t ~cid ~retire_prior_to ~sequence_no =
-    if CID.length cid = 0 || retire_prior_to > sequence_no
+  let process_new_connection_id_frame
+        t
+        ~cid
+        ~retire_prior_to
+        ~sequence_no
+        ~packet_info
+    =
+    if
+      CID.length cid = 0
+      || CID.length cid > CID.max_length
+      || retire_prior_to > sequence_no
     then
       report_error
         t
         ~frame_type:Frame.Type.New_connection_id
         Frame_encoding_error
-    else (
-      Format.eprintf
-        "new conn? %s@."
-        (let (`Hex x) = Hex.of_string (CID.to_string cid) in
-         x);
-      (* Track the latest peer-provided CID for outgoing packets. *)
-      t.dest_cid <- cid)
+    else if sequence_no < t.peer_retire_prior_to
+    then
+      report_error
+        t
+        ~frame_type:Frame.Type.New_connection_id
+        Frame_encoding_error
+    else
+      match Hashtbl.find_opt t.peer_connection_ids sequence_no with
+      | Some existing when not (CID.equal existing cid) ->
+        report_error
+          t
+          ~frame_type:Frame.Type.New_connection_id
+          Protocol_violation
+      | Some _ | None ->
+        Hashtbl.replace t.peer_connection_ids sequence_no cid;
+        if retire_prior_to > t.peer_retire_prior_to
+        then (
+          for retired = t.peer_retire_prior_to to retire_prior_to - 1 do
+            if Hashtbl.mem t.peer_connection_ids retired
+            then (
+              Hashtbl.remove t.peer_connection_ids retired;
+              send_frames
+                t
+                ~encryption_level:packet_info.encryption_level
+                [ Frame.Retire_connection_id retired ])
+          done;
+          t.peer_retire_prior_to <- retire_prior_to);
+        let should_switch =
+          sequence_no > t.active_peer_connection_id_sequence
+          || sequence_no >= retire_prior_to
+             && not (CID.equal cid t.dest_cid)
+        in
+        if should_switch
+        then (
+          t.active_peer_connection_id_sequence <- sequence_no;
+          start_path_validation
+            t
+            ~peer_address:t.peer_address
+            ~cid
+            ~sequence_no)
 
   let frame_allowed_at_encryption_level ~encryption_level frame =
     match encryption_level with
@@ -1343,10 +1473,16 @@ module Connection = struct
         | Streams_blocked (direction, max_streams) ->
         process_streams_blocked_frame t ~direction max_streams
         | New_connection_id { cid; retire_prior_to; sequence_no; _ } ->
-        process_new_connection_id_frame t ~cid ~retire_prior_to ~sequence_no
-        | Retire_connection_id _ -> ()
+          process_new_connection_id_frame
+            t
+            ~cid
+            ~retire_prior_to
+            ~sequence_no
+            ~packet_info
+        | Retire_connection_id sequence_no ->
+          process_retire_connection_id_frame t sequence_no
         | Path_challenge buf -> process_path_challenge_frame t buf
-        | Path_response _ -> ()
+        | Path_response buf -> process_path_response_frame t buf
         | Connection_close_quic { frame_type; reason_phrase; error_code } ->
         process_connection_close_quic_frame
           t
@@ -1404,6 +1540,8 @@ module Connection = struct
         ~now_ms
         ~wakeup_writer
         ~shutdown
+        ~register_connection_id
+        ~deregister_connection_id
         ~connection_handler
         ~remember_new_token
         connection_id
@@ -1455,6 +1593,12 @@ module Connection = struct
       ; peer_max_streams_bidi = 0L
       ; peer_max_streams_uni = 0L
       ; peer_stream_max_data = Hashtbl.create ~random:true 1024
+      ; peer_connection_ids =
+          (let ids = Hashtbl.create ~random:true 4 in
+           Hashtbl.add ids 0 CID.empty;
+           ids)
+      ; peer_retire_prior_to = 0
+      ; active_peer_connection_id_sequence = 0
       ; sent_data_bytes = 0L
       ; sent_stream_highest_offsets = Hashtbl.create ~random:true 1024
       ; recovery = Recovery.create ()
@@ -1484,6 +1628,15 @@ module Connection = struct
       ; token_value = ""
       ; close_state = Open
       ; closing_frame = None
+      ; local_connection_ids =
+          (let ids = Hashtbl.create ~random:true 4 in
+           Hashtbl.add ids 0 connection_id;
+           ids)
+      ; active_local_connection_id_sequence = 0
+      ; next_local_connection_id_sequence = 1
+      ; register_connection_id
+      ; deregister_connection_id
+      ; pending_path_validation = None
       ; remember_new_token
       ; now_ms
       }
@@ -2023,6 +2176,7 @@ let create_new_connection
       in
       generate_unique_cid ()
   in
+  let connection_ref = ref None in
   let connection =
     Connection.create
       ~mode:t.mode
@@ -2032,10 +2186,17 @@ let create_new_connection
       ~now_ms:t.now_ms
       ~wakeup_writer:(ready_to_write t)
       ~shutdown:(on_close t)
+      ~register_connection_id:(fun cid ->
+        match !connection_ref with
+        | Some connection -> register_connection_id t ~cid ~connection
+        | None -> ())
+      ~deregister_connection_id:(fun cid ->
+        Connection.Table.remove t.connections cid)
       ~connection_handler
       ~remember_new_token:(fun token -> t.remembered_new_token <- Some token)
       src_cid
   in
+  connection_ref := Some connection;
   Encryption_level.add Initial encdec connection.encdec;
   register_connection_id t ~cid:connection.source_cid ~connection;
   connection
@@ -2092,6 +2253,8 @@ let process_retry_packet
              *   the Retry packet in the Destination Connection ID field of
              *   subsequent packets that it sends. *)
             c.dest_cid <- pkt_src_cid;
+            Hashtbl.replace c.peer_connection_ids 0 pkt_src_cid;
+            Hashtbl.replace c.peer_connection_ids 0 pkt_src_cid;
 
             (* From RFC9000§17.2.5.2:
              *   The client responds to a Retry packet with an Initial packet
@@ -2207,6 +2370,8 @@ let packet_handler t ?error packet =
            *   Connection ID it sends to match the value of the Source
            *   Connection ID that it receives. *)
           c.dest_cid <- src_cid
+          ;
+          Hashtbl.replace c.peer_connection_ids 0 src_cid
         | None ->
           (* TODO: short packets will fail here? *)
           assert (
@@ -2222,6 +2387,18 @@ let packet_handler t ?error packet =
           ; packet_has_ack_eliciting_frame = false
           }
         in
+
+	        (match t.current_peer_address with
+          | Some peer_address
+            when encryption_level = Application_data
+                 && not (String.equal peer_address c.peer_address)
+                 && not c.peer_transport_params.disable_active_migration ->
+            Connection.start_path_validation
+              c
+              ~peer_address
+              ~cid:c.dest_cid
+              ~sequence_no:c.active_peer_connection_id_sequence
+          | Some _ | None -> ());
 
 	        if Packet.Payload.length payload = 0
 	        then
@@ -2432,6 +2609,7 @@ let connect t ~address ~host connection_handler =
       ~encdec
   in
   new_connection.dest_cid <- dest_cid;
+  Hashtbl.replace new_connection.peer_connection_ids 0 dest_cid;
   new_connection.token_value <-
     Option.value ~default:"" t.remembered_new_token;
   Connection.initialize_handler
