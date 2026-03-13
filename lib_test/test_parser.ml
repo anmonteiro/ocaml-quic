@@ -550,6 +550,92 @@ let test_server_issues_new_token_frame () =
       (Bigstringaf.length data)
   | _ -> Alcotest.fail "expected a single NEW_TOKEN frame"
 
+let test_local_connection_close_enters_closing () =
+  let conn = make_connection () in
+  conn.encdec.current <- Encryption_level.Application_data;
+  Quic.Transport.Connection.report_error conn Error.Internal_error;
+  (match conn.close_state with
+  | Quic.Transport.Connection.Closing _ -> ()
+  | _ -> Alcotest.fail "expected local close to enter closing");
+  let packet_info =
+    { Quic.Transport.packet_number = 0L
+    ; header =
+        Packet.Header.Short
+          { dest_cid = Quic.CID.of_string "test-server-cid" }
+    ; encryption_level = Encryption_level.Application_data
+    ; connection = conn
+    ; packet_has_ack_eliciting_frame = false
+    }
+  in
+  Quic.Transport.Connection.frame_handler ~packet_info conn Frame.Ping;
+  Alcotest.(check (list string))
+    "closing connections requeue the stored CONNECTION_CLOSE"
+    [ serialize_frame
+        (Frame.Connection_close_quic
+           { frame_type = Frame.Type.Padding
+           ; reason_phrase = ""
+           ; error_code = Error.Internal_error
+           }) ]
+    (List.map serialize_frame (take_queued_frames conn))
+
+let test_remote_connection_close_enters_draining () =
+  let conn = make_connection () in
+  Quic.Transport.Connection.process_connection_close_app_frame
+    conn
+    ~error_code:7
+    "bye";
+  (match conn.close_state with
+  | Quic.Transport.Connection.Draining _ -> ()
+  | _ -> Alcotest.fail "expected peer close to enter draining");
+  let packet_info =
+    { Quic.Transport.packet_number = 0L
+    ; header =
+        Packet.Header.Short
+          { dest_cid = Quic.CID.of_string "test-server-cid" }
+    ; encryption_level = Encryption_level.Application_data
+    ; connection = conn
+    ; packet_has_ack_eliciting_frame = false
+    }
+  in
+  Quic.Transport.Connection.frame_handler ~packet_info conn Frame.Ping;
+  Alcotest.(check (list string))
+    "draining connections ignore subsequent frames"
+    []
+    (List.map serialize_frame (take_queued_frames conn))
+
+let test_close_timeout_deregisters_connection () =
+  let config =
+    Quic.Config.
+      { certificates = server_certificates ()
+      ; alpn_protocols = [ "h3" ]
+      ; transport_parameters = default_transport_parameters
+      }
+  in
+  let transport =
+    Quic.Transport.Client.create
+      ~now_ms:(fun () -> 1L)
+      ~config
+      (fun ~cid:_ ~start_stream:_ ->
+         Quic.Transport.F (fun _ -> { Quic.Transport.on_error = ignore }))
+  in
+  Quic.Transport.connect
+    transport
+    ~address:"peer-address"
+    ~host:"localhost"
+    (fun ~cid:_ ~start_stream:_ ->
+       Quic.Transport.F (fun _ -> { Quic.Transport.on_error = ignore }));
+  let connection =
+    Quic.Transport.Connection.Table.to_seq_values transport.connections
+    |> List.of_seq
+    |> List.hd
+  in
+  connection.close_state <- Quic.Transport.Connection.Closing 0L;
+  Quic.Transport.on_timeout transport;
+  Alcotest.(check int)
+    "closing connections are removed after their timeout"
+    0
+    (Quic.Transport.Connection.Table.length transport.connections)
+
 let suite =
   [ "parser", `Quick, test_parser
   ; "fast frame roundtrip", `Quick, test_fast_frame_parser_roundtrips_payload
@@ -573,6 +659,12 @@ let suite =
   ; "client remembers NEW_TOKEN", `Quick, test_new_token_is_remembered_on_client
   ; "connect uses remembered NEW_TOKEN", `Quick, test_connect_uses_remembered_new_token
   ; "server issues NEW_TOKEN", `Quick, test_server_issues_new_token_frame
+  ; "local connection close enters closing", `Quick
+    , test_local_connection_close_enters_closing
+  ; "remote connection close enters draining", `Quick
+    , test_remote_connection_close_enters_draining
+  ; "close timeout deregisters connection", `Quick
+    , test_close_timeout_deregisters_connection
   ]
 
 let () =

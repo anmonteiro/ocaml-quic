@@ -157,6 +157,11 @@ type start_stream = ?error_handler:error_handler -> Direction.t -> Stream.t
 type stream_handler = F of (Stream.t -> on_error_handler)
 
 module Connection = struct
+  type close_state =
+    | Open
+    | Closing of int64
+    | Draining of int64
+
   type handler =
     | Uninitialized of
         (cid:string -> start_stream:start_stream -> stream_handler)
@@ -212,6 +217,8 @@ module Connection = struct
     ; (* TODO: should be retry or initial? *)
       mutable processed_retry_packet : bool
     ; mutable token_value : string
+    ; mutable close_state : close_state
+    ; mutable closing_frame : Frame.t option
     ; remember_new_token : string -> unit
     ; now_ms : unit -> int64
     }
@@ -313,6 +320,33 @@ module Connection = struct
     Writer.close t.writer;
     wakeup_writer t
 
+  let close_timeout_deadline t =
+    Int64.add (t.now_ms ()) (Int64.mul 3L (Recovery.pto_base_ms t.recovery))
+
+  let is_terminating t =
+    match t.close_state with
+    | Open -> false
+    | Closing _ | Draining _ -> true
+
+  let finish_closing t =
+    let close_writer () = shutdown_writer t in
+    match _flush_pending_packets t with
+    | Wrote | Wrote_app_data -> Writer.flush t.writer close_writer
+    | Didnt_write -> close_writer ()
+
+  let enter_closing t close_frame =
+    if not (is_terminating t)
+    then (
+      t.close_state <- Closing (close_timeout_deadline t);
+      t.closing_frame <- Some close_frame;
+      finish_closing t)
+
+  let enter_draining t =
+    Queue.clear t.queued_packets;
+    t.close_state <- Draining (close_timeout_deadline t);
+    t.closing_frame <- None;
+    shutdown_writer t
+
   let shutdown t =
     let shutdown () =
       shutdown_writer t;
@@ -376,31 +410,34 @@ module Connection = struct
     ()
 
   let report_error ?frame_type ?encryption_level t error =
-    if not t.did_send_connection_close
+    if not t.did_send_connection_close && not (is_terminating t)
     then (
       Queue.clear t.queued_packets;
+      let close_frame =
+        Frame.Connection_close_quic
+          { frame_type = Option.value ~default:Frame.Type.Padding frame_type
+          ; reason_phrase = ""
+          ; error_code = error
+          }
+      in
       send_frames
         t
         ?encryption_level
-        [ Frame.Connection_close_quic
-            { frame_type = Option.value ~default:Frame.Type.Padding frame_type
-            ; reason_phrase = ""
-            ; error_code = error
-            }
-        ];
+        [ close_frame ];
       t.did_send_connection_close <- true;
-      shutdown t;
+      enter_closing t close_frame;
       wakeup_writer t)
 
   let report_application_error t error_code =
-    if not t.did_send_connection_close
+    if not t.did_send_connection_close && not (is_terminating t)
     then (
       Queue.clear t.queued_packets;
-      send_frames
-        t
-        [ Frame.Connection_close_app { reason_phrase = ""; error_code } ];
+      let close_frame =
+        Frame.Connection_close_app { reason_phrase = ""; error_code }
+      in
+      send_frames t [ close_frame ];
       t.did_send_connection_close <- true;
-      shutdown t;
+      enter_closing t close_frame;
       wakeup_writer t)
 
   let report_tls_failure t failure =
@@ -1053,7 +1090,6 @@ module Connection = struct
           wakeup_writer t
         | Some _ | None -> ())
 
-  (* TODO: closing/ draining states, section 10.2 *)
   let process_connection_close_quic_frame
         (t : t)
         ~frame_type
@@ -1065,11 +1101,11 @@ module Connection = struct
       (Frame.Type.serialize frame_type)
       reason_phrase
       (Error.serialize error_code);
-    shutdown t
+    enter_draining t
 
   let process_connection_close_app_frame (t : t) ~error_code reason_phrase =
     Format.eprintf "close_app: %s %d@." reason_phrase error_code;
-    shutdown t
+    enter_draining t
 
   let process_handshake_done_frame (t : t) =
     (* From RFC9000§19.20:
@@ -1226,32 +1262,51 @@ module Connection = struct
         ~frame_type:(Frame.to_frame_type frame)
         ~encryption_level:packet_info.encryption_level
         Protocol_violation
-    else (
-      if Frame.is_ack_eliciting frame
-      then packet_info.packet_has_ack_eliciting_frame <- true;
-      match frame with
-      | Frame.Padding _n ->
+    else
+      match t.close_state with
+      | Draining _ -> ()
+      | Closing _ ->
+        (match frame with
+        | Connection_close_quic { frame_type; reason_phrase; error_code } ->
+          process_connection_close_quic_frame
+            t
+            ~frame_type
+            ~error_code
+            reason_phrase
+        | Connection_close_app { reason_phrase; error_code } ->
+          process_connection_close_app_frame t ~error_code reason_phrase
+        | _ ->
+          if Frame.is_ack_eliciting frame
+          then
+            match t.closing_frame with
+            | Some close_frame -> send_frames t [ close_frame ]
+            | None -> ())
+      | Open ->
+        if Frame.is_ack_eliciting frame
+        then packet_info.packet_has_ack_eliciting_frame <- true;
+        (match frame with
+        | Frame.Padding _n ->
         (* From RFC9000§19.1:
          *   The PADDING frame (type=0x00) has no semantic value. PADDING frames
          *   can be used to increase the size of a packet. *)
         ()
-      | Ping ->
+        | Ping ->
         (* From RFC9000§19.2:
          *   The receiver of a PING frame simply needs to acknowledge the packet
          *   containing this frame. *)
         ()
-      | Ack { delay; ranges; _ } ->
+        | Ack { delay; ranges; _ } ->
         process_ack_frame t ~packet_info ~delay ~ranges
-      | Reset_stream { stream_id; application_protocol_error; final_size } ->
+        | Reset_stream { stream_id; application_protocol_error; final_size } ->
         process_reset_stream_frame
           t
           ~stream_id
           ~final_size
           application_protocol_error
-      | Stop_sending { stream_id; application_protocol_error } ->
+        | Stop_sending { stream_id; application_protocol_error } ->
         process_stop_sending_frame t ~stream_id application_protocol_error
-      | Crypto fragment -> process_crypto_frame t ~packet_info fragment
-      | New_token { length; data } ->
+        | Crypto fragment -> process_crypto_frame t ~packet_info fragment
+        | New_token { length; data } ->
         (match t.mode with
         | Server ->
           report_error t ~frame_type:Frame.Type.New_token Protocol_violation
@@ -1265,39 +1320,39 @@ module Connection = struct
           else
             let token = Bigstringaf.substring data ~off:0 ~len:length in
             t.remember_new_token token)
-      | Stream { id; fragment; is_fin } ->
+        | Stream { id; fragment; is_fin } ->
         process_stream_frame
           t
           ~encryption_level:packet_info.encryption_level
           ~id
           ~fragment
           ~is_fin
-      | Max_data max_data -> process_max_data_frame t max_data
-      | Max_stream_data { stream_id; max_data } ->
+        | Max_data max_data -> process_max_data_frame t max_data
+        | Max_stream_data { stream_id; max_data } ->
         process_max_stream_data_frame t ~stream_id ~max_data
-      | Max_streams (direction, max_streams) ->
+        | Max_streams (direction, max_streams) ->
         process_max_streams_frame t ~direction max_streams
-      | Data_blocked max_data -> process_data_blocked_frame t max_data
-      | Stream_data_blocked { id; max_data } ->
+        | Data_blocked max_data -> process_data_blocked_frame t max_data
+        | Stream_data_blocked { id; max_data } ->
         process_stream_data_blocked_frame t ~stream_id:id ~max_data
-      | Streams_blocked (direction, max_streams) ->
+        | Streams_blocked (direction, max_streams) ->
         process_streams_blocked_frame t ~direction max_streams
-      | New_connection_id { cid; retire_prior_to; sequence_no; _ } ->
+        | New_connection_id { cid; retire_prior_to; sequence_no; _ } ->
         process_new_connection_id_frame t ~cid ~retire_prior_to ~sequence_no
-      | Retire_connection_id _ -> ()
-      | Path_challenge buf -> process_path_challenge_frame t buf
-      | Path_response _ -> ()
-      | Connection_close_quic { frame_type; reason_phrase; error_code } ->
+        | Retire_connection_id _ -> ()
+        | Path_challenge buf -> process_path_challenge_frame t buf
+        | Path_response _ -> ()
+        | Connection_close_quic { frame_type; reason_phrase; error_code } ->
         process_connection_close_quic_frame
           t
           ~frame_type
           ~error_code
           reason_phrase
-      | Connection_close_app { reason_phrase; error_code } ->
+        | Connection_close_app { reason_phrase; error_code } ->
         process_connection_close_app_frame t ~error_code reason_phrase
-      | Handshake_done -> process_handshake_done_frame t
-      | Unknown x ->
-        report_error t ~frame_type:(Frame.Type.Unknown x) Frame_encoding_error)
+        | Handshake_done -> process_handshake_done_frame t
+        | Unknown x ->
+          report_error t ~frame_type:(Frame.Type.Unknown x) Frame_encoding_error)
 
   let next_stream_id t ~typ ~direction =
     let seq =
@@ -1422,6 +1477,8 @@ module Connection = struct
       ; did_send_connection_close = false
       ; processed_retry_packet = false
       ; token_value = ""
+      ; close_state = Open
+      ; closing_frame = None
       ; remember_new_token
       ; now_ms
       }
@@ -1806,6 +1863,12 @@ let iter_unique_connections t f =
 let next_timeout_ms t =
   let next_timeout = ref None in
   iter_unique_connections t (fun (connection : Connection.t) ->
+       let close_timeout =
+         match connection.close_state with
+         | Connection.Open -> None
+         | Connection.Closing timeout_ms | Connection.Draining timeout_ms ->
+           Some timeout_ms
+       in
        let recovery_timeout =
          (Recovery.Debug.snapshot connection.recovery).timer.loss_detection_timer_ms
        in
@@ -1825,10 +1888,11 @@ let next_timeout_ms t =
               None
        in
        let timeout =
-         match recovery_timeout, ack_timeout with
-         | None, None -> None
-         | Some timeout, None | None, Some timeout -> Some timeout
-         | Some recovery_timeout, Some ack_timeout ->
+         match close_timeout, recovery_timeout, ack_timeout with
+         | Some timeout, _, _ -> Some timeout
+         | None, None, None -> None
+         | None, Some timeout, None | None, None, Some timeout -> Some timeout
+         | None, Some recovery_timeout, Some ack_timeout ->
            Some (Int64.min recovery_timeout ack_timeout)
        in
        match timeout, !next_timeout with
@@ -1841,11 +1905,17 @@ let next_timeout_ms t =
 let on_timeout t =
   let now_ms = t.now_ms () in
   iter_unique_connections t (fun (connection : Connection.t) ->
-       match
-         (Recovery.Debug.snapshot connection.recovery).timer
-           .loss_detection_timer_ms
-       with
-       | Some timeout_ms when Int64.compare timeout_ms now_ms <= 0 ->
+       match connection.close_state with
+       | Connection.Closing timeout_ms | Connection.Draining timeout_ms
+         when Int64.compare timeout_ms now_ms <= 0 ->
+         deregister_connection_ids t ~connection
+       | Connection.Closing _ | Connection.Draining _ -> ()
+       | Connection.Open ->
+         (match
+            (Recovery.Debug.snapshot connection.recovery).timer
+              .loss_detection_timer_ms
+          with
+         | Some timeout_ms when Int64.compare timeout_ms now_ms <= 0 ->
          Recovery.Debug.on_loss_detection_timeout
            connection.recovery
            ~now_ms:(connection.now_ms ());
@@ -1906,7 +1976,7 @@ let on_timeout t =
            Application_data
            connection.packet_number_spaces.application_data;
          Connection.wakeup_writer connection
-       | Some _ | None -> ());
+         | Some _ | None -> ()));
   wakeup_writer t
 
 let send_packets t ~packet_info =
@@ -2149,7 +2219,10 @@ let packet_handler t ?error packet =
         in
 
 	        if Packet.Payload.length payload = 0
-	        then Connection.report_error c Protocol_violation
+	        then
+            if Connection.is_terminating c
+            then ()
+            else Connection.report_error c Protocol_violation
 	        else (
 	          let parse_result =
 	            match payload with
@@ -2189,7 +2262,7 @@ let packet_handler t ?error packet =
                   ()
                 | _other -> ())
               acked_frames;
-	            if c.did_send_connection_close
+	            if Connection.is_terminating c
 	            then ()
 	            else (
 	              (* This packet has been processed, mark it for acknowledgement. *)
