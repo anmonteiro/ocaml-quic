@@ -69,6 +69,7 @@ type info =
   { mutable sent : Q.t
   ; acked : Frame.t Queue.t
   ; lost : Frame.t list Queue.t
+  ; mutable ack_eliciting_in_flight : int
   ; mutable time_of_last_ack_eliciting_packet_ms : int64 option
   }
 
@@ -135,12 +136,6 @@ let pto_base_ms t =
           Constants.k_granularity_ms)
        t.rtt.max_ack_delay_ms)
 
-let has_ack_eliciting_in_flight info =
-  Q.fold
-    (fun _ packet acc -> acc || (packet.in_flight && packet.ack_eliciting))
-    false
-    info.sent
-
 let set_loss_detection_timer t =
   if t.congestion.bytes_in_flight <= 0
   then t.timer.loss_detection_timer_ms <- None
@@ -151,7 +146,7 @@ let set_loss_detection_timer t =
       Spaces.to_list t.spaces
       |> List.fold_left
            (fun acc (_level, info) ->
-              if has_ack_eliciting_in_flight info
+              if info.ack_eliciting_in_flight > 0
               then
                 match info.time_of_last_ack_eliciting_packet_ms with
                 | None -> acc
@@ -322,6 +317,10 @@ let detect_lost_packets t ~encryption_level ~now_ms ~largest_newly_acked =
            then (
              if packet.in_flight
              then subtract_bytes_in_flight t packet.sent_bytes;
+             if packet.in_flight && packet.ack_eliciting
+             then
+               info.ack_eliciting_in_flight <-
+                 max 0 (info.ack_eliciting_in_flight - 1);
              lost_packets_rev := packet :: !lost_packets_rev;
              Q.remove packet_number acc)
            else acc)
@@ -336,6 +335,7 @@ let create ?(max_datagram_size = Constants.default_max_datagram_size) () =
     { sent = Q.empty
     ; acked = Queue.create ()
     ; lost = Queue.create ()
+    ; ack_eliciting_in_flight = 0
     ; time_of_last_ack_eliciting_packet_ms = None
     }
   in
@@ -383,6 +383,9 @@ let record_packet_sent
   let info = Spaces.of_encryption_level t.spaces encryption_level in
   let ack_eliciting = Frame.is_any_ack_eliciting frames in
   let in_flight = packet_is_in_flight frames in
+  if not in_flight
+  then ()
+  else (
   let sent_bytes = if in_flight then max 1 bytes_sent else 0 in
   let sent =
     { packet_number
@@ -395,13 +398,15 @@ let record_packet_sent
   in
   assert (not (Q.mem packet_number info.sent));
   info.sent <- Q.add packet_number sent info.sent;
+  if in_flight && ack_eliciting
+  then info.ack_eliciting_in_flight <- info.ack_eliciting_in_flight + 1;
   if in_flight
   then t.congestion.bytes_in_flight <- t.congestion.bytes_in_flight + sent_bytes;
   if in_flight && t.timer.pto_probe_count > 0
   then t.timer.pto_probe_count <- t.timer.pto_probe_count - 1;
   if ack_eliciting
   then info.time_of_last_ack_eliciting_packet_ms <- Some time_sent_ms;
-  set_loss_detection_timer t
+  set_loss_detection_timer t)
 
 let on_packet_sent t ~encryption_level ~packet_number frames =
   let time_sent_ms = next_implicit_now_ms t in
@@ -431,6 +436,10 @@ let record_ack_received
            acked_packets_rev := packet :: !acked_packets_rev;
            if packet.ack_eliciting
            then Queue.add_seq info.acked (List.to_seq packet.frames);
+           if packet.in_flight && packet.ack_eliciting
+           then
+             info.ack_eliciting_in_flight <-
+               max 0 (info.ack_eliciting_in_flight - 1);
            if packet.in_flight
            then subtract_bytes_in_flight t packet.sent_bytes;
            Q.remove packet_number acc)
@@ -502,6 +511,10 @@ let on_ack_received t ~encryption_level ~ranges =
          then (
            if packet.ack_eliciting
            then Queue.add_seq info.acked (List.to_seq packet.frames);
+           if packet.in_flight && packet.ack_eliciting
+           then
+             info.ack_eliciting_in_flight <-
+               max 0 (info.ack_eliciting_in_flight - 1);
            if packet.in_flight
            then subtract_bytes_in_flight t packet.sent_bytes;
            Q.remove packet_number acc)
@@ -555,6 +568,7 @@ let discard_space t ~encryption_level =
   in
   subtract_bytes_in_flight t removed_in_flight;
   info.sent <- Q.empty;
+  info.ack_eliciting_in_flight <- 0;
   Queue.clear info.acked;
   Queue.clear info.lost;
   info.time_of_last_ack_eliciting_packet_ms <- None;

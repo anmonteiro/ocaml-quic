@@ -35,6 +35,14 @@
 open Eio.Std
 module Buffer = Gluten.Buffer
 
+external send_msg_iovecs :
+  Unix.file_descr -> Unix.sockaddr -> 'a Faraday.iovec list -> int
+  = "ocaml_quic_eio_send_msg_iovecs"
+
+external recvfrom_into :
+  Unix.file_descr -> Bigstringaf.t -> int -> int -> int * string
+  = "ocaml_quic_eio_recvfrom_into"
+
 type drop_direction =
   [ `Receive
   | `Send
@@ -53,26 +61,71 @@ type should_drop =
   direction:drop_direction -> packet_kind:drop_packet_kind -> seq_no:int -> len:int -> bool
 
 module Addr = struct
-  (* type t = Eio.Net.Sockaddr.datagram *)
-
   let parsed = Hashtbl.create 16
-  let last_serialized : (Eio.Net.Sockaddr.datagram * string) option ref = ref None
+  let parsed_unix = Hashtbl.create 16
+  let tag_unix = Char.chr 0
+  let tag_v4 = Char.chr 4
+  let tag_v6 = Char.chr 6
+
+  let port_be s off =
+    ((Char.code s.[off]) lsl 8) lor Char.code s.[off + 1]
+
+  let encode ~tag raw port =
+    let len = 1 + String.length raw + 2 in
+    let buf = Bytes.create len in
+    Bytes.set buf 0 tag;
+    Bytes.blit_string raw 0 buf 1 (String.length raw);
+    Bytes.set_uint16_be buf (1 + String.length raw) port;
+    Bytes.unsafe_to_string buf
+
+  (* Eio documents [Ipaddr.t] interoperability via raw octets, e.g.
+     [Ipaddr.of_octets_exn (eio_ip :> string)]. The direct coercion is not
+     accepted here, but the runtime representation is still the raw byte
+     string. *)
+  let raw_ip (ip : _ Eio.Net.Ipaddr.t) : string = Obj.magic ip
+
+  let serialize : Eio.Net.Sockaddr.datagram -> string = function
+    | `Unix path -> String.make 1 tag_unix ^ path
+    | `Udp (host, port) ->
+      Eio.Net.Ipaddr.fold
+        host
+        ~v4:(fun ip -> encode ~tag:tag_v4 (raw_ip ip) port)
+        ~v6:(fun ip -> encode ~tag:tag_v6 (raw_ip ip) port)
+
+  let decode s =
+    match String.get s 0 with
+    | tag when tag = tag_unix ->
+      `Unix (String.sub s 1 (String.length s - 1))
+    | tag when tag = tag_v4 ->
+      let host = Eio.Net.Ipaddr.of_raw (String.sub s 1 4) in
+      let port = port_be s 5 in
+      `Udp (host, port)
+    | tag when tag = tag_v6 ->
+      let host = Eio.Net.Ipaddr.of_raw (String.sub s 1 16) in
+      let port = port_be s 17 in
+      `Udp (host, port)
+    | _ -> invalid_arg "Quic_eio.Addr.decode"
 
   let parse (s : string) : Eio.Net.Sockaddr.datagram =
     match Hashtbl.find_opt parsed s with
     | Some addr -> addr
     | None ->
-      let addr = Marshal.from_string s 0 in
+      let addr = decode s in
       Hashtbl.replace parsed s addr;
       addr
 
-  let serialize (dgram : Eio.Net.Sockaddr.datagram) =
-    match !last_serialized with
-    | Some (cached_addr, serialized) when cached_addr = dgram -> serialized
-    | _ ->
-      let serialized = Marshal.to_string dgram [] in
-      last_serialized := Some (dgram, serialized);
-      serialized
+  let parse_unix (s : string) : Unix.sockaddr =
+    match Hashtbl.find_opt parsed_unix s with
+    | Some addr -> addr
+    | None ->
+      let addr =
+        match parse s with
+        | `Unix path -> Unix.ADDR_UNIX path
+        | `Udp (host, port) ->
+          Unix.ADDR_INET (Eio_unix.Net.Ipaddr.to_unix host, port)
+      in
+      Hashtbl.replace parsed_unix s addr;
+      addr
 end
 
 module IO_loop = struct
@@ -125,19 +178,37 @@ module IO_loop = struct
       iovecs
 
   module Io = struct
+    let send_msg_fast_threshold =
+      match Sys.getenv_opt "QUIC_EIO_SEND_FAST_THRESHOLD" with
+      | None -> 0
+      | Some v -> int_of_string v
+
     let read_once dsock buffer =
       let p, u = Promise.create () in
       let addr_p, addr_u = Promise.create () in
       Buffer.put
         ~f:(fun buf ~off ~len k ->
-          let cstruct = Cstruct.of_bigarray buf ~off ~len in
-          match Eio.Net.recv dsock cstruct with
-          | addr, n ->
-            Promise.resolve addr_u addr;
-            k n
-          | exception exn ->
-            Promise.resolve u (`Exn exn);
-            raise exn)
+          match Eio_unix.Resource.fd_opt dsock with
+          | Some fd ->
+            (match
+               Eio_unix.Fd.use fd ~if_closed:(fun () -> None) (fun fd ->
+                 Some (recvfrom_into fd buf off len))
+             with
+             | Some (n, addr) ->
+               Promise.resolve addr_u addr;
+               k n
+             | None ->
+               Promise.resolve u (`Exn End_of_file);
+               raise End_of_file)
+          | None ->
+            let cstruct = Cstruct.of_bigarray buf ~off ~len in
+            match Eio.Net.recv dsock cstruct with
+            | addr, n ->
+              Promise.resolve addr_u (Addr.serialize addr);
+              k n
+            | exception exn ->
+              Promise.resolve u (`Exn exn);
+              raise exn)
         buffer
         (fun read -> Promise.resolve u (`Ok read));
       match Promise.await p with
@@ -196,14 +267,28 @@ module IO_loop = struct
       let lenv =
         List.fold_left (fun acc { Faraday.len; _ } -> acc + len) 0 iovecs
       in
-      let iovecs =
-        List.map
-          (fun { Faraday.buffer; off; len } -> Cstruct.of_bigarray ~off ~len buffer)
-          iovecs
+      let fallback_send () =
+        let iovecs =
+          List.map
+            (fun { Faraday.buffer; off; len } -> Cstruct.of_bigarray ~off ~len buffer)
+            iovecs
+        in
+        match Eio.Net.send dsock ~dst:(Addr.parse client_address) iovecs with
+        | () -> `Ok lenv
+        | exception End_of_file -> `Closed
       in
-      match Eio.Net.send dsock ~dst:client_address iovecs with
-      | () -> `Ok lenv
-      | exception End_of_file -> `Closed
+      if lenv >= send_msg_fast_threshold
+      then
+        match Eio_unix.Resource.fd_opt dsock with
+        | Some fd ->
+          (match
+             Eio_unix.Fd.use fd ~if_closed:(fun () -> None) (fun fd ->
+               Some (send_msg_iovecs fd (Addr.parse_unix client_address) iovecs))
+           with
+           | Some _ -> `Ok lenv
+           | None -> `Closed)
+        | None -> fallback_send ()
+      else fallback_send ()
   end
 
   module Runtime = Quic.Transport
@@ -230,7 +315,7 @@ module IO_loop = struct
         match Runtime.next_read_operation t with
         | `Read ->
           (match read_once () with
-          | _n, addr ->
+          | _n, client_address ->
             let (_ : int) =
               Buffer.get read_buffer ~f:(fun buf ~off ~len ->
                 let seq_no = !recv_seq_no in
@@ -238,9 +323,7 @@ module IO_loop = struct
                 let packet_kind = classify_received_packet_kind buf ~off ~len in
                 if should_drop ~direction:`Receive ~packet_kind ~seq_no ~len
                 then len
-                else
-                  let client_address = Addr.serialize addr in
-                  Runtime.read ~client_address t buf ~off ~len)
+                else Runtime.read ~client_address t buf ~off ~len)
             in
             ()
           | exception Cancelled -> ()
@@ -295,7 +378,7 @@ module IO_loop = struct
             then `Ok sent_len
             else
               Io.writev
-                ~client_address:(Addr.parse client_address)
+                ~client_address
                 socket
                 io_vectors
           in
