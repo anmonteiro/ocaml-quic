@@ -165,7 +165,91 @@ let test_initial () =
     Alcotest.fail
       "Expected state machine to issue a write operation after seeing headers."
 
-let suites = [ "initial", `Quick, test_initial ]
+let test_client_initial_v2_version () =
+  let config =
+    { Quic.Config.certificates = server_certificates ()
+    ; alpn_protocols = [ "h3" ]
+    ; transport_parameters = Quic.Config.default_transport_parameters
+    }
+  in
+  let t =
+    Transport.Client.create
+      ~now_ms:(fun () -> 0L)
+      ~config
+      (fun ~cid:_ ~start_stream:_ ->
+         Transport.F (fun _stream -> { Transport.on_error = ignore }))
+  in
+  Transport.connect
+    ~version:Packet.Version.v2
+    t
+    ~address:"127.0.0.1:4433"
+    ~host:"localhost"
+    (fun ~cid:_ ~start_stream:_ ->
+       Transport.F (fun _stream -> { Transport.on_error = ignore }));
+  match Transport.next_write_operation t with
+  | `Writev (iovecs, _, _) ->
+    let packet = Write_operation.iovecs_to_string iovecs in
+    Alcotest.(check int32)
+      "client Initial packet uses v2"
+      Packet.Version.v2
+      (Bytes.get_int32_be (Bytes.of_string packet) 1)
+  | `Yield _ | `Close _ ->
+    Alcotest.fail "expected client to write initial packet"
+
+let test_server_negotiates_unsupported_version () =
+  let config =
+    { Quic.Config.certificates = server_certificates ()
+    ; alpn_protocols = [ "h3" ]
+    ; transport_parameters = Quic.Config.default_transport_parameters
+    }
+  in
+  let t =
+    Transport.Server.create
+      ~now_ms:(fun () -> 0L)
+      ~config
+      (fun ~cid:_ ~start_stream:_ -> assert false)
+  in
+  let packet =
+    "\xc0"
+    ^ "\xaa\xbb\xcc\xdd"
+    ^ "\x08"
+    ^ "clientdc"
+    ^ "\x08"
+    ^ "serversc"
+  in
+  let read = read_string t packet in
+  Alcotest.(check int) "reads the whole datagram" (String.length packet) read;
+  match Transport.next_write_operation t with
+  | `Writev (iovecs, _, _) ->
+    let packet = Write_operation.iovecs_to_string iovecs in
+    (match
+       Quic.Fast_parse.Packet_parser.parse_unprotected
+         (Bigstringaf.of_string ~off:0 ~len:(String.length packet) packet)
+         ~off:0
+         ~len:(String.length packet)
+     with
+    | Packet.VersionNegotiation { source_cid; dest_cid; versions } ->
+      Alcotest.(check string)
+        "version negotiation swaps connection ids"
+        "clientdc"
+        (CID.to_string source_cid);
+      Alcotest.(check string)
+        "version negotiation targets the original source cid"
+        "serversc"
+        (CID.to_string dest_cid);
+      Alcotest.(check (list int32))
+        "version negotiation advertises supported versions"
+        [ Packet.Version.v1; Packet.Version.v2 ]
+        versions
+    | _ -> Alcotest.fail "expected version negotiation packet")
+  | `Yield _ | `Close _ ->
+    Alcotest.fail "expected server to write version negotiation packet"
+
+let suites =
+  [ "initial", `Quick, test_initial
+  ; "client initial v2", `Quick, test_client_initial_v2_version
+  ; "version negotiation", `Quick, test_server_negotiates_unsupported_version
+  ]
 
 let setup_logging ?style_renderer level =
   Fmt_tty.setup_std_outputs ?style_renderer ();

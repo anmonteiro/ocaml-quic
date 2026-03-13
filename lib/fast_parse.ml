@@ -478,8 +478,8 @@ module Packet_parser = struct
           let version = Bigstringaf.unsafe_get_int32_be buffer (off + 1) in
           match Packet.Version.parse version with
           | Negotiation -> false
-          | Number _ ->
-            match Packet.parse_type first_byte with
+          | Number version ->
+            match Packet.parse_type ~version first_byte with
             | Retry -> false
             | _ -> true
 
@@ -497,45 +497,39 @@ module Packet_parser = struct
   let parse_unprotected buffer ~off ~len =
     let cursor = Cursor.create buffer ~off ~len in
     let first_byte = Cursor.uint8 cursor in
-    match Packet.parse_type first_byte with
-    | Retry ->
-      let version, source_cid, dest_cid = parse_long_header_common cursor in
-      let header_size = Cursor.consumed cursor in
-      if Cursor.remaining cursor < 16
-      then failf "retry packet shorter than integrity tag";
-      let pseudo_len = len - 16 in
-      let token_len = pseudo_len - header_size in
-      let token = Cursor.take_string cursor token_len in
-      let tag = Cursor.take_bigstring cursor 16 in
-      let pseudo = Bigstringaf.sub buffer ~off ~len:pseudo_len in
-      let version =
-        match version with
-        | Packet.Version.Negotiation -> Int32.zero
-        | Number version -> version
+    let version, source_cid, dest_cid = parse_long_header_common cursor in
+    match version with
+    | Number version ->
+      (match Packet.parse_type ~version first_byte with
+      | Retry ->
+        let header_size = Cursor.consumed cursor in
+        if Cursor.remaining cursor < 16
+        then failf "retry packet shorter than integrity tag";
+        let pseudo_len = len - 16 in
+        let token_len = pseudo_len - header_size in
+        let token = Cursor.take_string cursor token_len in
+        let tag = Cursor.take_bigstring cursor 16 in
+        let pseudo = Bigstringaf.sub buffer ~off ~len:pseudo_len in
+        Packet.Retry
+          { header =
+              Packet.Header.Long
+                { version; source_cid; dest_cid; packet_type = Retry }
+          ; token
+          ; pseudo
+          ; tag
+          }
+      | _ -> failf "unexpected protected long packet")
+    | Negotiation ->
+      let remaining = Cursor.remaining cursor in
+      if remaining mod 4 <> 0
+      then failf "invalid version negotiation payload length";
+      let rec gather acc =
+        if Cursor.remaining cursor = 0
+        then List.rev acc
+        else gather (Cursor.int32_be cursor :: acc)
       in
-      Packet.Retry
-        { header =
-            Packet.Header.Long
-              { version; source_cid; dest_cid; packet_type = Retry }
-        ; token
-        ; pseudo
-        ; tag
-        }
-    | _ ->
-      let version, source_cid, dest_cid = parse_long_header_common cursor in
-      match version with
-      | Number _ -> failf "unexpected protected long packet"
-      | Negotiation ->
-        let remaining = Cursor.remaining cursor in
-        if remaining mod 4 <> 0
-        then failf "invalid version negotiation payload length";
-        let rec gather acc =
-          if Cursor.remaining cursor = 0
-          then List.rev acc
-          else gather (Cursor.int32_be cursor :: acc)
-        in
-        Packet.VersionNegotiation
-          { source_cid; dest_cid; versions = gather [] }
+      Packet.VersionNegotiation
+        { source_cid; dest_cid; versions = gather [] }
 
   let parse_protected_header buffer ~off ~len =
     let cursor = Cursor.create buffer ~off ~len in
@@ -548,13 +542,13 @@ module Packet_parser = struct
       ; header_prefix_len = Cursor.consumed cursor
       }
     | Long ->
-      let packet_type = Packet.parse_type first_byte in
       let version, source_cid, dest_cid = parse_long_header_common cursor in
       let version =
         match version with
         | Packet.Version.Negotiation -> failf "unexpected negotiation packet"
         | Number version -> version
       in
+      let packet_type = Packet.parse_type ~version first_byte in
       let header =
         match packet_type with
         | Packet.Type.Initial ->

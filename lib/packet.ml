@@ -31,6 +31,9 @@
  *---------------------------------------------------------------------------*)
 
 module Version = struct
+  let v1 = 0x00000001l
+  let v2 = 0x6b3343cfl
+
   type t =
     | Negotiation
     | Number of (* really an unsigned 32-bit int *)
@@ -47,6 +50,10 @@ module Version = struct
     | other -> Number other
 
   let serialize = function Negotiation -> Int32.zero | Number n -> n
+
+  let is_v1 v = Int32.equal v v1
+  let is_v2 v = Int32.equal v v2
+  let is_supported v = is_v1 v || is_v2 v
 end
 
 module Type = struct
@@ -56,18 +63,28 @@ module Type = struct
     | Handshake
     | Retry
 
-  let parse = function
-    | 0x0 -> Initial
-    | 0x1 -> Zero_RTT
-    | 0x2 -> Handshake
-    | 0x3 -> Retry
+  let parse ~version =
+    function
+    | 0x0 ->
+      if Version.is_v2 version then Retry else Initial
+    | 0x1 ->
+      if Version.is_v2 version then Initial else Zero_RTT
+    | 0x2 ->
+      if Version.is_v2 version then Zero_RTT else Handshake
+    | 0x3 ->
+      if Version.is_v2 version then Handshake else Retry
     | _ -> raise Not_found
 
-  let serialize = function
-    | Initial -> 0x0
-    | Zero_RTT -> 0x1
-    | Handshake -> 0x2
-    | Retry -> 0x3
+  let serialize ~version =
+    function
+    | Initial ->
+      if Version.is_v2 version then 0x1 else 0x0
+    | Zero_RTT ->
+      if Version.is_v2 version then 0x2 else 0x1
+    | Handshake ->
+      if Version.is_v2 version then 0x3 else 0x2
+    | Retry ->
+      if Version.is_v2 version then 0x0 else 0x3
 end
 
 module Header = struct
@@ -121,16 +138,16 @@ module Header = struct
     | Initial _ | Long _ -> true
 end
 
-let parse_type first_byte =
+let parse_type ~version first_byte =
   (* From RFC<QUIC-RFC>§17.2:
    *   Long Packet Type: The next two bits (those with a mask of 0x30) of
    *   byte 0 contain a packet type. Packet types are listed in Table 5. *)
   let masked = first_byte land 0b00110000 in
   let type_ = masked lsr 4 in
-  Type.parse type_
+  Type.parse ~version type_
 
-let parse_type_opt first_byte =
-  try Some (parse_type first_byte) with Not_found -> None
+let parse_type_opt ~version first_byte =
+  try Some (parse_type ~version first_byte) with Not_found -> None
 
 module Payload = struct
   type t =
