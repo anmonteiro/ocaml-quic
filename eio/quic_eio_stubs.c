@@ -185,7 +185,7 @@ static int ocaml_quic_encoded_sockaddr_matches(value vaddr,
 CAMLprim value ocaml_quic_eio_recvfrom_into_nb(value vfd, value vbuf, value voff,
                                                value vlen, value vlast_addr_opt) {
   CAMLparam5(vfd, vbuf, voff, vlen, vlast_addr_opt);
-  CAMLlocal4(vpair, vaddr, vn, vsome);
+  CAMLlocal3(vresult, vaddr, vn);
   struct caml_ba_array *ba = Caml_ba_array_val(vbuf);
   char *dst = (char *)ba->data + Long_val(voff);
   union sock_addr_union addr;
@@ -201,14 +201,15 @@ CAMLprim value ocaml_quic_eio_recvfrom_into_nb(value vfd, value vbuf, value voff
 
   vn = Val_int(ret);
   if (vlast_addr_opt != Val_int(0) &&
-      ocaml_quic_encoded_sockaddr_matches(Field(vlast_addr_opt, 0), &addr, addr_len))
-    vaddr = Field(vlast_addr_opt, 0);
-  else
-    vaddr = ocaml_quic_alloc_encoded_sockaddr(&addr, addr_len);
-  vpair = caml_alloc(2, 0);
-  Store_field(vpair, 0, vn);
-  Store_field(vpair, 1, vaddr);
-  vsome = caml_alloc(1, 0);
-  Store_field(vsome, 0, vpair);
-  CAMLreturn(vsome);
+      ocaml_quic_encoded_sockaddr_matches(Field(vlast_addr_opt, 0), &addr, addr_len)) {
+    vresult = caml_alloc(1, 0);
+    Store_field(vresult, 0, vn);
+    CAMLreturn(vresult);
+  }
+
+  vaddr = ocaml_quic_alloc_encoded_sockaddr(&addr, addr_len);
+  vresult = caml_alloc(2, 1);
+  Store_field(vresult, 0, vn);
+  Store_field(vresult, 1, vaddr);
+  CAMLreturn(vresult);
 }

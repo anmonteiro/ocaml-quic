@@ -43,13 +43,18 @@ external send_msg_iovecs_nb :
   Unix.file_descr -> Unix.sockaddr -> 'a Faraday.iovec list -> int
   = "ocaml_quic_eio_send_msg_iovecs_nb"
 
+type recvfrom_into_nb_result =
+  | No_data
+  | Same_addr of int
+  | New_addr of int * string
+
 external recvfrom_into_nb :
   Unix.file_descr ->
   Bigstringaf.t ->
   int ->
   int ->
   string option ->
-  (int * string) option
+  recvfrom_into_nb_result
   = "ocaml_quic_eio_recvfrom_into_nb"
 
 type drop_direction =
@@ -215,8 +220,8 @@ module IO_loop = struct
            ~f:(fun buf ~off ~len k ->
              match Eio_unix.Resource.fd_opt dsock with
              | Some fd ->
-               (match
-                  Eio_unix.Fd.use fd ~if_closed:(fun () -> None) (fun fd ->
+                (match
+                   Eio_unix.Fd.use fd ~if_closed:(fun () -> None) (fun fd ->
                     Some
                       (recvfrom_into_nb
                          fd
@@ -225,11 +230,14 @@ module IO_loop = struct
                          len
                          !last_client_address))
                 with
-                | Some (Some (n, addr)) ->
+                | Some (New_addr (n, addr)) ->
                   last_client_address := Some addr;
                   Promise.resolve u (`Read (n, addr));
                   k n
-                | Some None ->
+                | Some (Same_addr n) ->
+                  Promise.resolve u (`Read (n, Option.get !last_client_address));
+                  k n
+                | Some No_data ->
                   Promise.resolve u `Would_block;
                   raise_notrace Exit
                 | None ->
