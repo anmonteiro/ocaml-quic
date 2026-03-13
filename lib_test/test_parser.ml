@@ -409,6 +409,37 @@ let test_streams_blocked_reissues_current_limit () =
     [ serialize_frame (Frame.Max_streams (Unidirectional, 8)) ]
     (List.map serialize_frame (take_queued_frames conn))
 
+let test_data_blocked_reissues_current_limit () =
+  let transport_parameters =
+    Quic.Config.
+      { default_transport_parameters with
+        initial_max_data = 4096
+      }
+  in
+  let conn = make_connection ~transport_parameters () in
+  Quic.Transport.Connection.process_data_blocked_frame conn 1024;
+  Alcotest.(check (list string))
+    "receiving DATA_BLOCKED below the current limit reissues MAX_DATA"
+    [ serialize_frame (Frame.Max_data 4096) ]
+    (List.map serialize_frame (take_queued_frames conn))
+
+let test_stream_data_blocked_reissues_current_limit () =
+  let transport_parameters =
+    Quic.Config.
+      { default_transport_parameters with
+        initial_max_stream_data_bidi_remote = 2048
+      }
+  in
+  let conn = make_connection ~transport_parameters () in
+  Quic.Transport.Connection.process_stream_data_blocked_frame
+    conn
+    ~stream_id:1L
+    ~max_data:512;
+  Alcotest.(check (list string))
+    "receiving STREAM_DATA_BLOCKED below the current limit reissues MAX_STREAM_DATA"
+    [ serialize_frame (Frame.Max_stream_data { stream_id = 1L; max_data = 2048 }) ]
+    (List.map serialize_frame (take_queued_frames conn))
+
 let suite =
   [ "parser", `Quick, test_parser
   ; "fast frame roundtrip", `Quick, test_fast_frame_parser_roundtrips_payload
@@ -425,6 +456,10 @@ let suite =
     , `Quick
     , test_max_streams_updates_peer_limit_and_emits_streams_blocked )
   ; "streams blocked reissues limit", `Quick, test_streams_blocked_reissues_current_limit
+  ; "data blocked reissues limit", `Quick, test_data_blocked_reissues_current_limit
+  ; ( "stream data blocked reissues limit"
+    , `Quick
+    , test_stream_data_blocked_reissues_current_limit )
   ]
 
 let () =
