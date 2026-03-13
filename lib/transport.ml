@@ -34,10 +34,11 @@ module Reader = Fast_parse.Reader
 module Writer = Serialize.Writer
 
 module Packet_number = struct
-  let max_ack_ranges = 32
-  let ack_history_window = 4096L
+  let max_ack_ranges = 256
+  let ack_history_window = 65536L
   let delayed_ack_packet_threshold = 2
   let delayed_ack_timeout_ms = 25L
+  let aggressive_ack_window_packets = 1024
 
   type t =
     { mutable sent : int64
@@ -45,6 +46,7 @@ module Packet_number = struct
     ; mutable received_need_ack : Frame.Range.t list
     ; mutable ack_elicited : bool
     ; mutable ack_eliciting_since_last_ack : int
+    ; mutable aggressive_ack_remaining : int
     ; mutable ack_deadline_ms : int64 option
     }
 
@@ -54,6 +56,7 @@ module Packet_number = struct
     ; received_need_ack = []
     ; ack_elicited = false
     ; ack_eliciting_since_last_ack = 0
+    ; aggressive_ack_remaining = 0
     ; ack_deadline_ms = None
     }
 
@@ -132,12 +135,21 @@ module Packet_number = struct
     t.ack_eliciting_since_last_ack <- 0;
     t.ack_deadline_ms <- None
 
-  let note_ack_eliciting_received t ~encryption_level ~now_ms =
+  let note_ack_eliciting_received t ~encryption_level ~now_ms ~out_of_order =
     match encryption_level with
     | Encryption_level.Application_data ->
       let count = t.ack_eliciting_since_last_ack + 1 in
+      if out_of_order
+      then
+        t.aggressive_ack_remaining <-
+          max t.aggressive_ack_remaining aggressive_ack_window_packets;
+      let aggressive_ack = t.aggressive_ack_remaining > 0 in
       t.ack_eliciting_since_last_ack <- count;
-      if count >= delayed_ack_packet_threshold
+      if aggressive_ack then t.aggressive_ack_remaining <- t.aggressive_ack_remaining - 1;
+      if
+        out_of_order
+        || aggressive_ack
+        || count >= delayed_ack_packet_threshold
       then (
         t.ack_elicited <- true;
         t.ack_deadline_ms <- None)
@@ -2017,6 +2029,7 @@ let packet_handler t ?error packet =
         let pn_space =
           Spaces.of_encryption_level c.packet_number_spaces encryption_level
         in
+        let prev_received = pn_space.received in
         pn_space.received <- Int64.max pn_space.received packet_number;
 
         (match Packet.source_cid packet with
@@ -2095,10 +2108,22 @@ let packet_handler t ?error packet =
               Packet_number.insert_for_acking pn_space packet_number;
               if packet_info.packet_has_ack_eliciting_frame
               then
+                let has_ack_gaps =
+                  match pn_space.Packet_number.received_need_ack with
+                  | _ :: _ :: _ -> true
+                  | _ -> false
+                in
+                let out_of_order =
+                  has_ack_gaps
+                  ||
+                  (Int64.compare prev_received (-1L) >= 0
+                   && Int64.compare packet_number (Int64.add prev_received 1L) <> 0)
+                in
                 Packet_number.note_ack_eliciting_received
                   pn_space
                   ~encryption_level:packet_info.encryption_level
-                  ~now_ms:(c.now_ms ());
+                  ~now_ms:(c.now_ms ())
+                  ~out_of_order;
               (* packet_info should now contain frames we need to send in
                  response. *)
 	              send_packets t ~packet_info;

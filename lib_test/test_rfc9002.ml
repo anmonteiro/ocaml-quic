@@ -1165,7 +1165,8 @@ let test_application_data_ack_is_delayed_until_second_packet_or_timeout () =
   Transport.Packet_number.note_ack_eliciting_received
     pn
     ~encryption_level:Application_data
-    ~now_ms:0L;
+    ~now_ms:0L
+    ~out_of_order:false;
   Alcotest.(check bool) "first application-data packet does not force ACK" false
     pn.ack_elicited;
   Alcotest.(check (option int64))
@@ -1175,7 +1176,8 @@ let test_application_data_ack_is_delayed_until_second_packet_or_timeout () =
   Transport.Packet_number.note_ack_eliciting_received
     pn
     ~encryption_level:Application_data
-    ~now_ms:5L;
+    ~now_ms:5L
+    ~out_of_order:false;
   Alcotest.(check bool) "second application-data packet forces ACK" true
     pn.ack_elicited;
   Alcotest.(check (option int64))
@@ -1188,10 +1190,25 @@ let test_handshake_ack_remains_immediate () =
   Transport.Packet_number.note_ack_eliciting_received
     pn
     ~encryption_level:Handshake
-    ~now_ms:0L;
+    ~now_ms:0L
+    ~out_of_order:false;
   Alcotest.(check bool) "handshake packet forces immediate ACK" true
     pn.ack_elicited;
   Alcotest.(check (option int64)) "no delayed timer for handshake" None
+    pn.ack_deadline_ms
+
+let test_application_data_out_of_order_ack_is_immediate () =
+  let pn = Transport.Packet_number.create () in
+  Transport.Packet_number.note_ack_eliciting_received
+    pn
+    ~encryption_level:Application_data
+    ~now_ms:0L
+    ~out_of_order:true;
+  Alcotest.(check bool) "out-of-order application-data packet forces ACK" true
+    pn.ack_elicited;
+  Alcotest.(check (option int64))
+    "out-of-order application-data packet clears delayed timer"
+    None
     pn.ack_deadline_ms
 
 let constants_suite =
@@ -1309,6 +1326,8 @@ let congestion_control_suite =
     , test_stream_flush_respects_exact_frame_overhead_budget
   ; "application-data ACK is delayed until threshold or timeout", `Quick
     , test_application_data_ack_is_delayed_until_second_packet_or_timeout
+  ; "out-of-order application-data ACK remains immediate", `Quick
+    , test_application_data_out_of_order_ack_is_immediate
   ; "handshake ACK remains immediate", `Quick
     , test_handshake_ack_remains_immediate
   ]
