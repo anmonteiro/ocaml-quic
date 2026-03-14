@@ -384,6 +384,7 @@ module IO_loop = struct
         ~read_buffer_size
         ~cancel
         ~should_drop
+        ~connect_on_first_peer
         ~connected_peer
         t
         socket
@@ -409,6 +410,15 @@ module IO_loop = struct
         | `Read ->
           (match read_once () with
           | _n, client_address ->
+            (match !connected_peer, connect_on_first_peer with
+            | None, true ->
+              (match Eio_unix.Resource.fd_opt socket with
+              | Some file_descr ->
+                Eio_unix.Fd.use file_descr ~if_closed:(fun () -> ()) (fun fd ->
+                  Unix.connect fd (Addr.parse_unix client_address);
+                  connected_peer := Some client_address)
+              | None -> ())
+            | _ -> ());
             let (_ : int) =
               Buffer.get read_buffer ~f:(fun buf ~off ~len ->
                 let seq_no = !recv_seq_no in
@@ -549,6 +559,7 @@ module Server = struct
         env
         ~sw
         ?(should_drop = IO_loop.never_drop)
+        ?(udp_connect_first_peer = false)
         ~config
         listen_address
         handler
@@ -575,6 +586,7 @@ module Server = struct
       ~read_buffer_size:(max 0x1000 config.max_datagram_size)
       ~cancel:None
       ~should_drop
+      ~connect_on_first_peer:udp_connect_first_peer
       ~connected_peer:(ref None)
       server_fd
 end
@@ -632,6 +644,7 @@ module Client = struct
         ~cancel:None
         ~read_buffer_size:(max 0x1000 config.max_datagram_size)
         ~should_drop
+        ~connect_on_first_peer:false
         ~connected_peer
         connection
         fd);

@@ -184,6 +184,7 @@ let () =
   let upload_out = ref None in
   let chunk_size = ref max_data_chunk_size in
   let max_dgram_size = ref Quic.Config.default_max_datagram_size in
+  let udp_connect_first_peer = ref false in
   let drop_recv_pct = ref 0.0 in
   let drop_send_pct = ref 0.0 in
   let drop_handshake = ref false in
@@ -204,6 +205,9 @@ let () =
     ; ( "-max-dgram-size"
       , Arg.Set_int max_dgram_size
       , " Max QUIC datagram size override for benchmarking (default 1200)" )
+    ; ( "-udp-connect-first-peer"
+      , Arg.Set udp_connect_first_peer
+      , " Connect the UDP socket to the first peer for single-client benchmarking" )
     ; ( "-drop-recv-pct"
       , Arg.Set_float drop_recv_pct
       , " Drop percentage for received UDP datagrams (0.0-100.0, default 0.0)" )
@@ -302,7 +306,8 @@ let () =
   in
   Format.eprintf
     "listening on UDP %d (drop_recv_pct=%.2f drop_send_pct=%.2f \
-     drop_handshake=%b seed=%d serve_file=%s upload_out=%s chunk_size=%d)@."
+     drop_handshake=%b seed=%d serve_file=%s upload_out=%s chunk_size=%d \
+     udp_connect_first_peer=%b)@."
     !port
     !drop_recv_pct
     !drop_send_pct
@@ -310,7 +315,8 @@ let () =
     !drop_seed
     (Option.value !serve_file ~default:"<none>")
     (Option.value !upload_out ~default:"<discard>")
-    !chunk_size;
+    !chunk_size
+    !udp_connect_first_peer;
   Eio_main.run (fun env ->
     Eio.Switch.run (fun sw ->
       let handler =
@@ -326,6 +332,7 @@ let () =
              env
              ~sw
              ~should_drop
+             ~udp_connect_first_peer:!udp_connect_first_peer
              ~config
              listen_address
              handler)
@@ -336,6 +343,7 @@ let () =
                env
                ~sw
                ~should_drop
+               ~udp_connect_first_peer:!udp_connect_first_peer
                ~config
                listen_address_v6
                handler
