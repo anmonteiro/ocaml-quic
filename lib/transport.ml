@@ -2152,7 +2152,7 @@ let create ~mode ~now_ms ~config connection_handler =
         in
         (match Encryption_level.find encryption_level connection.encdec with
         | Some { decrypter = Some decrypter; _ } ->
-          Crypto.AEAD.decrypt_packet_bigstring
+          Crypto.AEAD.decrypt_packet_bigstring_for_parse
             decrypter
             ~payload_length
             ~header_prefix_len
@@ -2178,7 +2178,7 @@ let create ~mode ~now_ms ~config connection_handler =
               ~mode:(Crypto.Mode.peer t.mode)
               connection_id
           in
-          Crypto.AEAD.decrypt_packet_bigstring
+          Crypto.AEAD.decrypt_packet_bigstring_for_parse
             decrypter
             ~payload_length
             ~header_prefix_len

@@ -680,7 +680,14 @@ module AEAD = struct
     ; pn_length : int
     }
 
-  let decrypt_packet_bytes t ~payload_length ~largest_pn ciphertext =
+  type parse_ret =
+    { packet_number : int64
+    ; first_byte_unprotected : int
+    ; plaintext : string
+    ; pn_length : int
+    }
+
+  let decrypt_packet_bytes_impl t ~payload_length ~largest_pn ~return_header ciphertext =
     let offset = sample_offset ~conn_id_len:t.conn_id_len ciphertext in
     let header =
       match t.ciphersuite with
@@ -709,8 +716,6 @@ module AEAD = struct
             (logor
                (shift_left (of_int b1) 16)
                (logor (shift_left (of_int b2) 8) (of_int b3))))
-        (* Int64.logand (Int64.of_int32 (Cstruct.BE.get_uint32 header off))
-           0x00000000FFFFFFFFL *)
       | 3 ->
         Int64.of_int
           ((Bytes.get_uint8 header off * (1 lsl 16))
@@ -724,7 +729,6 @@ module AEAD = struct
       decode_packet_number ~largest_pn ~pn_nbits:(8 * pn_length) ~truncated_pn
     in
     let header_len = off + pn_length in
-    let header = Bytes.sub ciphertext 0 header_len |> Bytes.unsafe_to_string in
     let ciphertext_len = payload_length - pn_length in
     let plaintext =
       match t.cipher with
@@ -738,17 +742,32 @@ module AEAD = struct
           ~ciphertext_off:header_len
           ~ciphertext_len
       | _ ->
+        let header = Bytes.sub ciphertext 0 header_len |> Bytes.unsafe_to_string in
         let ciphertext =
-          (* This cstruct can have coalesced packets. we just want to decrypt
-             the ciphertext of `payload_length - packet_number_length`. *)
           Bytes.sub ciphertext header_len ciphertext_len
           |> Bytes.unsafe_to_string
         in
         decrypt_payload_into t ~packet_number:pn ~header ciphertext
     in
+    let first_byte_unprotected = Bytes.get_uint8 ciphertext 0 in
     match plaintext with
-    | Some plaintext -> Some { pn_length; packet_number = pn; header; plaintext }
     | None -> None
+    | Some plaintext ->
+      if return_header
+      then
+        let header = Bytes.sub ciphertext 0 header_len |> Bytes.unsafe_to_string in
+        Some (`Full { pn_length; packet_number = pn; header; plaintext })
+      else Some (`Parse { pn_length; packet_number = pn; first_byte_unprotected; plaintext })
+
+  let decrypt_packet_bytes t ~payload_length ~largest_pn ciphertext =
+    match decrypt_packet_bytes_impl t ~payload_length ~largest_pn ~return_header:true ciphertext with
+    | Some (`Full ret) -> Some ret
+    | Some (`Parse _) | None -> None
+
+  let decrypt_packet_bytes_for_parse t ~payload_length ~largest_pn ciphertext =
+    match decrypt_packet_bytes_impl t ~payload_length ~largest_pn ~return_header:false ciphertext with
+    | Some (`Parse ret) -> Some ret
+    | Some (`Full _) | None -> None
 
   (* Ciphertext includes header + payload *)
   let decrypt_packet t ~payload_length ~largest_pn ciphertext =
@@ -771,6 +790,24 @@ module AEAD = struct
     let packet = Bytes.create packet_len in
     Bigstringaf.unsafe_blit_to_bytes ciphertext ~src_off:off packet ~dst_off:0 ~len:packet_len;
     decrypt_packet_bytes
+      t
+      ~payload_length
+      ~largest_pn
+      packet
+
+  let decrypt_packet_bigstring_for_parse
+        t
+        ~payload_length
+        ~header_prefix_len
+        ~largest_pn
+        (ciphertext : Bigstringaf.t)
+        ~off
+        ~len
+    =
+    let packet_len = min len (header_prefix_len + payload_length) in
+    let packet = Bytes.create packet_len in
+    Bigstringaf.unsafe_blit_to_bytes ciphertext ~src_off:off packet ~dst_off:0 ~len:packet_len;
+    decrypt_packet_bytes_for_parse
       t
       ~payload_length
       ~largest_pn

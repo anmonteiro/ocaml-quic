@@ -588,7 +588,7 @@ module Packet_parser = struct
           in
           match decrypt ~payload_length ~header ~header_prefix_len buffer ~off ~len with
           | None -> Skip len
-          | Some { Crypto.AEAD.header = unprotected_header
+          | Some { Crypto.AEAD.first_byte_unprotected
                  ; plaintext
                  ; packet_number
                  ; pn_length
@@ -602,7 +602,6 @@ module Packet_parser = struct
                 }
             in
             let consumed = header_prefix_len + payload_length in
-            let first_byte_unprotected = String.get_uint8 unprotected_header 0 in
             if first_byte_unprotected land 0b00001100 <> 0
             then Error (packet, Protocol_violation, consumed)
             else Packet (packet, consumed)
@@ -622,7 +621,7 @@ module Reader = struct
         -> Cstruct.buffer
         -> off:int
         -> len:int
-        -> Crypto.AEAD.ret option
+        -> Crypto.AEAD.parse_ret option
     ; handler : ?error:Error.t -> Packet.t -> unit
     ; mutable closed : bool
     }
