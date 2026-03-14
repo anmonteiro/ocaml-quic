@@ -125,6 +125,7 @@ run_scenario() {
 
   local run
   for run in $(seq 1 "$RUNS"); do
+    echo "scenario=${scenario} run=${run}/${RUNS} port=${port}" >&2
     cleanup
     local server_log="$BENCH_OUTPUT_DIR/${scenario}.server.run${run}.log"
     local curl_log="$BENCH_OUTPUT_DIR/${scenario}.curl.run${run}.log"
@@ -144,23 +145,39 @@ run_scenario() {
     wait_for_server "$server_log"
 
     local curl_output
+    local curl_status
+    set +e
     case "$curl_mode" in
       upload)
         curl_output=$(curl --http3-only -k -sS -o /dev/null \
           -X POST --data-binary "@$PAYLOAD" \
           -w 'total=%{time_total} speed=%{speed_upload}\n' \
           "$curl_url" 2>"$curl_log")
+        curl_status=$?
         ;;
       download)
         curl_output=$(curl --http3-only -k -sS -o /dev/null \
           -w 'total=%{time_total} speed=%{speed_download}\n' \
           "$curl_url" 2>"$curl_log")
+        curl_status=$?
         ;;
       *)
+        set -e
         echo "unknown curl mode: $curl_mode" >&2
         exit 1
         ;;
     esac
+    set -e
+    if [ "$curl_status" -ne 0 ]; then
+      echo "curl failed: scenario=${scenario} run=${run}/${RUNS} exit=${curl_status} url=${curl_url}" >&2
+      echo "server_log=${server_log}" >&2
+      echo "curl_log=${curl_log}" >&2
+      echo "--- curl stderr (tail) ---" >&2
+      tail -n 100 "$curl_log" >&2 || true
+      echo "--- server log (tail) ---" >&2
+      tail -n 200 "$server_log" >&2 || true
+      return "$curl_status"
+    fi
 
     local total
     local speed

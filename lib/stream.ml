@@ -229,8 +229,12 @@ module Recv = struct
     then (
       try Buffer.execute_read t.consumer with
       | exn ->
-        (* report_exn t exn *)
-        Format.eprintf "REAL EXN: %s@." (Printexc.to_string exn);
+        let bt = Printexc.get_raw_backtrace () in
+        let bt_s = Printexc.raw_backtrace_to_string bt in
+        Format.eprintf
+          "REAL EXN: %s@.%s@."
+          (Printexc.to_string exn)
+          (if String.length bt_s = 0 then "(no backtrace captured)" else bt_s);
         failwith "NYI: Streamd.flush_recv / report_exn")
 
   let rec pop t =

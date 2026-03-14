@@ -52,8 +52,11 @@ jobs:
           nix develop .#benchmark -c bash ./scripts/bench/run_h3_loopback_benchmarks.sh > benchmark-output/results.jsonl
         env:
           BENCH_OUTPUT_DIR: benchmark-output/raw
+          OCAMLRUNPARAM: b
+          OCAML_BACKTRACE: "1"
 
       - name: Upload benchmark artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: benchmark-output-${{ github.sha }}
