@@ -33,6 +33,33 @@
 module Reader = Fast_parse.Reader
 module Writer = Serialize.Writer
 
+let string_of_error = function
+  | Error.No_error -> "No_error"
+  | Internal_error -> "Internal_error"
+  | Connection_refused -> "Connection_refused"
+  | Flow_control_error -> "Flow_control_error"
+  | Stream_limit_error -> "Stream_limit_error"
+  | Stream_state_error -> "Stream_state_error"
+  | Final_size_error -> "Final_size_error"
+  | Frame_encoding_error -> "Frame_encoding_error"
+  | Transport_parameter_error -> "Transport_parameter_error"
+  | Connection_id_limit_error -> "Connection_id_limit_error"
+  | Protocol_violation -> "Protocol_violation"
+  | Invalid_token -> "Invalid_token"
+  | Application_error -> "Application_error"
+  | Crypto_buffer_exceeded -> "Crypto_buffer_exceeded"
+  | Key_update_error -> "Key_update_error"
+  | AEAD_limit_reached -> "AEAD_limit_reached"
+  | No_viable_path -> "No_viable_path"
+  | Crypto_error n -> Printf.sprintf "Crypto_error(%d)" n
+  | Other n -> Printf.sprintf "Other(%d)" n
+
+let string_of_encryption_level = function
+  | Encryption_level.Initial -> "initial"
+  | Zero_RTT -> "0rtt"
+  | Handshake -> "handshake"
+  | Application_data -> "application_data"
+
 module Packet_number = struct
   let max_ack_ranges = 32
   let ack_history_window = 4096L
@@ -450,6 +477,24 @@ module Connection = struct
   let report_error ?frame_type ?encryption_level t error =
     if not t.did_send_connection_close
     then (
+      let frame_type_s =
+        match frame_type with
+        | None -> "none"
+        | Some frame_type -> string_of_int (Frame.Type.serialize frame_type)
+      in
+      let enc_level_s =
+        match encryption_level with
+        | None -> "none"
+        | Some level -> string_of_encryption_level level
+      in
+      Format.eprintf
+        "transport report_error: cid=%s peer=%s frame_type=%s enc=%s error=%s code=%d@."
+        (CID.to_string t.source_cid)
+        t.peer_address
+        frame_type_s
+        enc_level_s
+        (string_of_error error)
+        (Error.serialize error);
       Queue.clear t.queued_packets;
       send_frames
         t
@@ -576,10 +621,16 @@ module Connection = struct
         else ()
 
   let report_tls_failure t failure =
+    let alert = Qtls.alert_of_failure t.tls_state failure in
+    Format.eprintf
+      "tls failure: cid=%s peer=%s alert=%d@."
+      (CID.to_string t.source_cid)
+      t.peer_address
+      alert;
     report_error
       t
       ~frame_type:Frame.Type.Crypto
-      (Crypto_error (Qtls.alert_of_failure t.tls_state failure))
+      (Crypto_error alert)
 
   let process_tls_result t ~was_handshake_in_progress ~new_tls_state ~tls_packets =
     let encryption_level_of_qtls = function
@@ -758,7 +809,15 @@ module Connection = struct
         apply_peer_transport_params t transport_params;
         t.recovery.rtt.max_ack_delay_ms <-
           Int64.of_int transport_params.max_ack_delay
-      | Error err -> report_error t ~frame_type err)
+      | Error err ->
+        Format.eprintf
+          "transport params decode failure: cid=%s peer=%s frame_type=%d error=%s code=%d@."
+          (CID.to_string t.source_cid)
+          t.peer_address
+          (Frame.Type.serialize frame_type)
+          (string_of_error err)
+          (Error.serialize err);
+        report_error t ~frame_type err)
 
   let handle_crypto_record t ~frame_type ?embed_quic_transport_params fragment_cstruct =
     match
@@ -2021,6 +2080,28 @@ let packet_handler t ?error packet =
           Some (Encryption_level.of_header header)
         | Packet.VersionNegotiation _ | Packet.Retry _ -> None
       in
+      Format.eprintf
+        "packet_handler transport error: dcid=%s peer=%s enc=%s error=%s code=%d packet=%s@."
+        (CID.to_string connection_id)
+        (Option.value t.current_peer_address ~default:"<none>")
+        (match encryption_level with
+        | None -> "none"
+        | Some level -> string_of_encryption_level level)
+        (string_of_error error)
+        (Error.serialize error)
+        (match packet with
+        | Packet.VersionNegotiation _ -> "version_negotiation"
+        | Packet.Retry _ -> "retry"
+        | Frames { header; _ } ->
+          (match header with
+          | Packet.Header.Initial _ -> "initial"
+          | Packet.Header.Short _ -> "short"
+          | Long { packet_type; _ } ->
+            (match packet_type with
+            | Zero_RTT -> "0rtt"
+            | Handshake -> "handshake"
+            | Retry -> "retry"
+            | Initial -> "initial")));
       Connection.report_error c ?encryption_level error
     | None ->
       Connection.note_activity c;
@@ -2190,6 +2271,11 @@ let create ~mode ~now_ms ~config connection_handler =
           then
             (* A Handshake packet before Handshake keys are available is
                invalid; close with PROTOCOL_VIOLATION. *)
+            Format.eprintf
+              "decrypt path missing handshake keys: cid=%s peer=%s enc_current=%s@."
+              (CID.to_string connection.source_cid)
+              connection.peer_address
+              (string_of_encryption_level connection.encdec.current);
             Connection.report_error
               connection
               ~frame_type:Frame.Type.Padding
@@ -2359,7 +2445,15 @@ let next_write_operation (t : t) =
 
 let report_write_result t ~cid result =
   match Connection.Table.find_opt t.connections (CID.of_string cid) with
-  | Some conn -> Writer.report_result conn.writer result
+  | Some conn ->
+    (match result with
+    | `Closed ->
+      Format.eprintf
+        "write_result closed: cid=%s peer=%s@."
+        (CID.to_string conn.source_cid)
+        conn.peer_address
+    | `Ok _ -> ());
+    Writer.report_result conn.writer result
   | None ->
     Format.eprintf "connection not found: probably already retired?@.";
     ()
