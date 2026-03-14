@@ -14,6 +14,7 @@ BENCH_SERVER_BIN=${BENCH_SERVER_BIN:-_build/default/examples/eio/eio_h3_echo_ser
 BENCH_BUILD=${BENCH_BUILD:-1}
 BENCH_PORT_BASE=${BENCH_PORT_BASE:-4600}
 BENCH_OUTPUT_DIR=${BENCH_OUTPUT_DIR:-$(mktemp -d -t ocaml-quic-bench.XXXXXX)}
+BENCH_SCENARIOS=${BENCH_SCENARIOS:-h3_upload_curl,h3_download_curl}
 
 mkdir -p "$BENCH_OUTPUT_DIR"
 
@@ -243,5 +244,19 @@ run_scenario() {
     "$workflow_url"
 }
 
-run_scenario h3_upload_curl "$BENCH_PORT_BASE" upload upload "https://127.0.0.1:${BENCH_PORT_BASE}/upload"
-run_scenario h3_download_curl "$((BENCH_PORT_BASE + 1))" download download "https://127.0.0.1:$((BENCH_PORT_BASE + 1))/file"
+IFS=',' read -r -a scenarios <<< "$BENCH_SCENARIOS"
+
+for scenario in "${scenarios[@]}"; do
+  case "$scenario" in
+    h3_upload_curl)
+      run_scenario h3_upload_curl "$BENCH_PORT_BASE" upload upload "https://127.0.0.1:${BENCH_PORT_BASE}/upload"
+      ;;
+    h3_download_curl)
+      run_scenario h3_download_curl "$((BENCH_PORT_BASE + 1))" download download "https://127.0.0.1:$((BENCH_PORT_BASE + 1))/file"
+      ;;
+    *)
+      echo "unknown BENCH_SCENARIOS entry: $scenario" >&2
+      exit 1
+      ;;
+  esac
+done

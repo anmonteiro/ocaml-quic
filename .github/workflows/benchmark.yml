@@ -47,11 +47,30 @@ jobs:
           fi
 
       - name: Run loopback benchmarks
+        id: bench_main
+        continue-on-error: true
         run: |
           mkdir -p benchmark-output
           nix develop .#benchmark -c bash ./scripts/bench/run_h3_loopback_benchmarks.sh > benchmark-output/results.jsonl
         env:
           BENCH_OUTPUT_DIR: benchmark-output/raw
+          OCAMLRUNPARAM: b
+          OCAML_BACKTRACE: "1"
+
+      - name: Retry upload benchmark with UDP fast path disabled
+        if: steps.bench_main.outcome == 'failure' && runner.os == 'Linux'
+        run: |
+          mkdir -p benchmark-output/diag-fastpath-disabled
+          BENCH_SCENARIOS=h3_upload_curl \
+          BENCH_FILE_SIZE_MIB=16 \
+          BENCH_OUTPUT_DIR=benchmark-output/diag-fastpath-disabled/raw \
+          QUIC_EIO_DISABLE_UDP_FASTPATH=1 \
+          nix develop .#benchmark -c bash ./scripts/bench/run_h3_loopback_benchmarks.sh \
+            > benchmark-output/diag-fastpath-disabled/results.jsonl
+        env:
+          RUNS: 1
+          BENCH_PROFILE: linux-fastpath-disabled-diagnostic
+          BENCH_CHUNK_SIZE: ${{ env.BENCH_CHUNK_SIZE }}
           OCAMLRUNPARAM: b
           OCAML_BACKTRACE: "1"
 
@@ -62,7 +81,12 @@ jobs:
           name: benchmark-output-${{ github.sha }}
           path: benchmark-output
 
+      - name: Fail if main benchmark failed
+        if: steps.bench_main.outcome == 'failure'
+        run: exit 1
+
       - name: Checkout gh-pages
+        if: steps.bench_main.outcome == 'success'
         id: checkout_pages
         continue-on-error: true
         uses: actions/checkout@v6
@@ -72,7 +96,7 @@ jobs:
           fetch-depth: 0
 
       - name: Initialize gh-pages branch
-        if: steps.checkout_pages.outcome == 'failure'
+        if: steps.bench_main.outcome == 'success' && steps.checkout_pages.outcome == 'failure'
         run: |
           rm -rf gh-pages
           mkdir -p gh-pages
@@ -86,6 +110,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Update dashboard data
+        if: steps.bench_main.outcome == 'success'
         run: |
           mkdir -p gh-pages/benchmarks
           touch gh-pages/benchmarks/results.jsonl
@@ -95,6 +120,7 @@ jobs:
           cp benchmarks/site/style.css gh-pages/benchmarks/style.css
 
       - name: Commit and push gh-pages
+        if: steps.bench_main.outcome == 'success'
         run: |
           cd gh-pages
           git config user.name github-actions[bot]
