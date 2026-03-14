@@ -883,8 +883,17 @@ module Writer = struct
     assert (frames <> []);
     let tag_len = Crypto.AEAD.tag_len header_info.encrypter in
     let pn_length = packet_number_length header_info.packet_number in
-    let payload_len =
-      List.fold_left (fun acc frame -> acc + frame_encoded_length frame) 0 frames
+    let payload_len, write_frames =
+      match frames with
+      | [ frame ] ->
+        let payload_len = frame_encoded_length frame in
+        payload_len, (fun plaintext -> ignore (write_frame_bytes plaintext 0 frame))
+      | _ ->
+        let payload_len =
+          List.fold_left (fun acc frame -> acc + frame_encoded_length frame) 0 frames
+        in
+        payload_len, (fun plaintext ->
+          ignore (List.fold_left (write_frame_bytes plaintext) 0 frames))
     in
     let pn_offset = 4 - pn_length in
     let min_payload_len = pn_offset + 16 - tag_len in
@@ -893,9 +902,8 @@ module Writer = struct
     in
     let payload_len = payload_len + padding in
     let plaintext = Bytes.create payload_len in
-    let payload_off =
-      List.fold_left (write_frame_bytes plaintext) 0 frames
-    in
+    write_frames plaintext;
+    let payload_off = payload_len - padding in
     let payload_off =
       if padding > 0
       then (
