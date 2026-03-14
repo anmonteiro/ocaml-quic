@@ -839,6 +839,414 @@ module Relay = struct
       (connection_handler state)
 end
 
+module Relay_h3 = struct
+  let alpn = "h3"
+  let upload_chunk_size = 16384
+  let flush_batch_bytes = 256 * 1024
+
+  let config () =
+    let cert = "./certificates/server.pem" in
+    let priv_key = "./certificates/server.key" in
+    let certificates = `Single (Qx509.private_of_pems ~cert ~priv_key) in
+    { Quic.Config.certificates
+    ; alpn_protocols = [ alpn ]
+    ; transport_parameters = Quic.Config.default_transport_parameters
+    ; max_datagram_size = Quic.Config.default_max_datagram_size
+    }
+
+  let relay_data_port port = port + 1
+
+  let error_message_of_client_error = function
+    | `Protocol_error (_e, msg) -> msg
+    | `Malformed_response msg -> "malformed response: " ^ msg
+    | `Exn exn -> Printexc.to_string exn
+    | `Invalid_response_body_length _ -> "invalid response body length"
+
+  type transfer =
+    { mutable upload_path : string option
+    ; mutable filename_hex : string option
+    ; mutable content_length : string option
+    ; mutable content_type : string option
+    ; mutable downloader : H3.Reqd.t option
+    ; mutable upload_complete : bool
+    ; mutable download_started : bool
+    }
+
+  type state = { transfers : (string, transfer) Hashtbl.t }
+
+  let create_state () = { transfers = Hashtbl.create 16 }
+
+  let get_transfer t transfer_id =
+    match Hashtbl.find_opt t.transfers transfer_id with
+    | Some x -> x
+    | None ->
+      let x =
+        { upload_path = None
+        ; filename_hex = None
+        ; content_length = None
+        ; content_type = None
+        ; downloader = None
+        ; upload_complete = false
+        ; download_started = false
+        }
+      in
+      Hashtbl.add t.transfers transfer_id x;
+      x
+
+  let maybe_cleanup t transfer_id transfer =
+    if transfer.upload_complete && transfer.downloader = None
+    then (
+      Option.iter
+        (fun path -> try Unix.unlink path with _ -> ())
+        transfer.upload_path;
+      Hashtbl.remove t.transfers transfer_id)
+
+  let transfer_headers transfer =
+    let headers =
+      ref
+        [ "content-type"
+        , Option.value transfer.content_type ~default:"application/octet-stream"
+        ]
+    in
+    (match transfer.content_length with
+    | Some v -> headers := ("content-length", v) :: !headers
+    | None -> ());
+    (match transfer.filename_hex with
+    | Some v -> headers := ("x-wormhole-name", v) :: !headers
+    | None -> ());
+    H3.Headers.of_list (List.rev !headers)
+
+  let start_download_if_ready t transfer_id transfer =
+    match
+      transfer.download_started,
+      transfer.upload_complete,
+      transfer.upload_path,
+      transfer.downloader
+    with
+    | false, true, Some upload_path, Some download_reqd ->
+      transfer.download_started <- true;
+      let response =
+        H3.Response.create ~headers:(transfer_headers transfer) `OK
+      in
+      let response_body = H3.Reqd.respond_with_streaming download_reqd response in
+      let ic = open_in_bin upload_path in
+      let buf = Bytes.create upload_chunk_size in
+      let finalize () =
+        close_in_noerr ic;
+        H3.Body.Writer.close response_body;
+        transfer.downloader <- None;
+        maybe_cleanup t transfer_id transfer
+      in
+      let rec pump () =
+        let rec fill_batch batched_bytes =
+          match input ic buf 0 (Bytes.length buf) with
+          | 0 -> `Eof batched_bytes
+          | n ->
+            H3.Body.Writer.write_string
+              response_body
+              ~off:0
+              ~len:n
+              (Bytes.unsafe_to_string buf);
+            let batched_bytes = batched_bytes + n in
+            if batched_bytes >= flush_batch_bytes
+            then `Flushed batched_bytes
+            else fill_batch batched_bytes
+          | exception exn ->
+            finalize ();
+            raise exn
+        in
+        match fill_batch 0 with
+        | `Eof 0 -> finalize ()
+        | `Eof _ -> H3.Body.Writer.flush response_body finalize
+        | `Flushed _ -> H3.Body.Writer.flush response_body pump
+      in
+      pump ()
+    | _ -> ()
+
+  let request_handler t reqd =
+    let request = H3.Reqd.request reqd in
+    let parts =
+      request.H3.Request.target
+      |> String.split_on_char '/'
+      |> List.filter (fun x -> x <> "")
+    in
+    match request.H3.Request.meth, parts with
+    | `POST, [ "relay"; "upload"; transfer_id ] ->
+      let transfer = get_transfer t transfer_id in
+      (match transfer.upload_path with
+      | Some _ ->
+        H3.Reqd.respond_with_string
+          reqd
+          (H3.Response.create `Conflict)
+          "upload already exists"
+      | None ->
+        let temp_path =
+          Filename.temp_file ("wormhole-relay-" ^ transfer_id ^ "-") ".upload"
+        in
+        let oc = open_out_bin temp_path in
+        let request_body = H3.Reqd.request_body reqd in
+        let finished = ref false in
+        let finalize ok =
+          if not !finished
+          then (
+            finished := true;
+            close_out_noerr oc;
+            if ok
+            then (
+              transfer.upload_complete <- true;
+              H3.Reqd.respond_with_string reqd (H3.Response.create `OK) "ok";
+              start_download_if_ready t transfer_id transfer)
+            else (
+              (try Unix.unlink temp_path with _ -> ());
+              transfer.upload_path <- None;
+              transfer.filename_hex <- None;
+              transfer.content_length <- None;
+              transfer.content_type <- None;
+              H3.Reqd.respond_with_string
+                reqd
+                (H3.Response.create `Internal_server_error)
+                "upload failed";
+              maybe_cleanup t transfer_id transfer))
+        in
+        transfer.upload_path <- Some temp_path;
+        transfer.filename_hex <-
+          H3.Headers.get request.H3.Request.headers "x-wormhole-name";
+        transfer.content_length <-
+          H3.Headers.get request.H3.Request.headers "content-length";
+        transfer.content_type <-
+          H3.Headers.get request.H3.Request.headers "content-type";
+        transfer.upload_complete <- false;
+        transfer.download_started <- false;
+        let rec read_body () =
+          H3.Body.Reader.schedule_read
+            request_body
+            ~on_eof:(fun () -> finalize true)
+            ~on_read:(fun bs ~off ~len ->
+              try
+                output_string oc (Bigstringaf.substring bs ~off ~len);
+                read_body ()
+              with
+              | _ ->
+                finalize false)
+        in
+        read_body ())
+    | `GET, [ "relay"; "download"; transfer_id ] ->
+      let transfer = get_transfer t transfer_id in
+      (match transfer.downloader with
+      | Some _ ->
+        H3.Reqd.respond_with_string
+          reqd
+          (H3.Response.create `Conflict)
+          "download already exists"
+      | None ->
+        transfer.downloader <- Some reqd;
+        start_download_if_ready t transfer_id transfer)
+    | _ ->
+      H3.Reqd.respond_with_string
+        reqd
+        (H3.Response.create `Not_found)
+        "not found"
+
+  let connection_handler t = H3.Server_connection.create (request_handler t)
+
+  let run env ~sw ~port =
+    let data_port = relay_data_port port in
+    let state = create_state () in
+    Format.printf "relay h3 data plane listening on udp port %d@." data_port;
+    Quic_eio.Server.establish_server
+      env
+      ~sw
+      ~config:(config ())
+      (`Udp (Eio.Net.Ipaddr.V4.any, data_port))
+      (connection_handler state)
+
+  let connect_h3 env ~sw ~host ~port =
+    let on_connect_p, on_connect_u = Eio.Promise.create () in
+    let t =
+      Quic_eio.Client.create
+        env
+        ~sw
+        ~config:(config ())
+        (fun ~cid:_ ~start_stream:_ ->
+           Quic.Transport.F (fun _ -> { on_error = ignore }))
+    in
+    let address = Direct.resolve_udp_address host port in
+    let tls_host =
+      try
+        let _ = Unix.inet_addr_of_string host in
+        "localhost"
+      with
+      | Failure _ -> host
+    in
+    Quic_eio.connect t ~address ~host:tls_host (fun ~cid ~start_stream ->
+      let conn, stream_handler =
+        H3.Client_connection.create
+          ~error_handler:(function
+            | `Protocol_error (_e, msg) -> failwith msg
+            | _ -> failwith "relay h3 client error")
+          ~cid
+          ~start_stream
+      in
+      Eio.Promise.resolve on_connect_u (conn, tls_host);
+      stream_handler);
+    let conn, tls_host = Eio.Promise.await on_connect_p in
+    t, conn, tls_host
+
+  let upload env ~sw ~host ~port ~transfer_id ~file =
+    let t, client, tls_host = connect_h3 env ~sw ~host ~port:(relay_data_port port) in
+    Fun.protect
+      ~finally:(fun () -> Quic_eio.shutdown t)
+      (fun () ->
+        let stat = Unix.stat file in
+        let total_size = Int64.of_int stat.Unix.st_size in
+        let filename = Filename.basename file in
+        let stats = Transfer_stats.create ~label:"relay send" ~total:total_size () in
+        let progress = create_progress ~label:"sending  " ~total:total_size in
+        let done_p, done_u = Eio.Promise.create () in
+        let response_handler response response_body =
+          let status = H3.Status.to_code response.H3.Response.status in
+          let rec drain () =
+            H3.Body.Reader.schedule_read
+              response_body
+              ~on_eof:(fun () ->
+                if 200 <= status && status < 300
+                then Eio.Promise.resolve done_u ()
+                else failwith (Printf.sprintf "relay upload failed with HTTP status %d" status))
+              ~on_read:(fun _ ~off:_ ~len:_ -> drain ())
+          in
+          drain ()
+        in
+        let headers =
+          H3.Headers.of_list
+            [ ":authority", tls_host
+            ; "content-type", "application/octet-stream"
+            ; "content-length", Int64.to_string total_size
+            ; "x-wormhole-name", hex_of_string filename
+            ]
+        in
+        let request =
+          H3.Request.create
+            ~scheme:"https"
+            ~headers
+            `POST
+            ("/relay/upload/" ^ transfer_id)
+        in
+        let request_body =
+          H3.Client_connection.request
+            client
+            request
+            ~error_handler:(fun error ->
+              failwith (error_message_of_client_error error))
+            ~response_handler
+        in
+        let ic = open_in_bin file in
+        Fun.protect
+          ~finally:(fun () -> close_in_noerr ic)
+          (fun () ->
+            update_progress progress 0L;
+            let buf = Bytes.create Direct.upload_chunk_size in
+            let rec pump () =
+              let rec fill_batch batched_bytes =
+                match input ic buf 0 (Bytes.length buf) with
+                | 0 -> `Eof batched_bytes
+                | n ->
+                  H3.Body.Writer.write_string
+                    request_body
+                    ~off:0
+                    ~len:n
+                    (Bytes.unsafe_to_string buf);
+                  Transfer_stats.on_bytes stats n;
+                  update_progress progress stats.bytes;
+                  let batched_bytes = batched_bytes + n in
+                  if batched_bytes >= Direct.flush_batch_bytes
+                  then `Flushed batched_bytes
+                  else fill_batch batched_bytes
+              in
+              match fill_batch 0 with
+              | `Eof 0 ->
+                finish_progress progress stats.bytes;
+                H3.Body.Writer.close request_body
+              | `Eof _ ->
+                finish_progress progress stats.bytes;
+                H3.Body.Writer.flush request_body (fun () ->
+                  H3.Body.Writer.close request_body)
+              | `Flushed _ ->
+                H3.Body.Writer.flush request_body pump
+            in
+            pump ();
+            Eio.Promise.await done_p;
+            stats)
+      )
+
+  let download env ~sw ~host ~port ~transfer_id ~output =
+    let t, client, tls_host = connect_h3 env ~sw ~host ~port:(relay_data_port port) in
+    Fun.protect
+      ~finally:(fun () -> Quic_eio.shutdown t)
+      (fun () ->
+        let done_p, done_u = Eio.Promise.create () in
+        let stats_ref = ref None in
+        let response_handler response response_body =
+          let status = H3.Status.to_code response.H3.Response.status in
+          if status < 200 || status >= 300
+          then failwith (Printf.sprintf "relay download failed with HTTP status %d" status)
+          else
+            let expected_len =
+              match H3.Response.body_length response with
+              | `Fixed len -> Some len
+              | `Unknown | `Error _ -> None
+            in
+            let sender_name =
+              match H3.Headers.get response.H3.Response.headers "x-wormhole-name" with
+              | Some name_hex -> (try string_of_hex name_hex with _ -> "download.bin")
+              | None -> "download.bin"
+            in
+            let out_path = Option.value output ~default:("recv-" ^ sender_name) in
+            let stats = Transfer_stats.create ~label:"relay recv" ?total:expected_len () in
+            stats_ref := Some stats;
+            let progress =
+              Option.map (fun total -> create_progress ~label:"receiving" ~total) expected_len
+            in
+            let oc = open_out_bin out_path in
+            let rec read_body () =
+              H3.Body.Reader.schedule_read
+                response_body
+                ~on_eof:(fun () ->
+                  Option.iter (fun p -> finish_progress p stats.bytes) progress;
+                  close_out_noerr oc;
+                  Eio.Promise.resolve done_u (stats, out_path))
+                ~on_read:(fun bs ~off ~len ->
+                  output_string oc (Bigstringaf.substring bs ~off ~len);
+                  Transfer_stats.on_bytes stats len;
+                  Option.iter (fun p -> update_progress p stats.bytes) progress;
+                  read_body ())
+            in
+            read_body ()
+        in
+        let headers = H3.Headers.of_list [ ":authority", tls_host ] in
+        let request =
+          H3.Request.create
+            ~scheme:"https"
+            ~headers
+            `GET
+            ("/relay/download/" ^ transfer_id)
+        in
+        let request_body =
+          H3.Client_connection.request
+            client
+            request
+            ~error_handler:(fun error ->
+              failwith (error_message_of_client_error error))
+            ~response_handler
+        in
+        H3.Body.Writer.close request_body;
+        Eio.Promise.await done_p)
+end
+
+let run_relay env ~sw ~port =
+  Eio.Fiber.both
+    (fun () -> Relay.run env ~sw ~port)
+    (fun () -> Relay_h3.run env ~sw ~port)
+
 module Client = struct
   type opts =
     { host : string
@@ -855,9 +1263,9 @@ module Client = struct
     { observed_host : string option
     }
 
-  type send_mode =
-    | Relay_transfer
-    | Direct_transfer of Quic_eio.t * Line_channel.t
+  type transfer_mode =
+    | Use_direct
+    | Use_relay_h3 of string
 
   let resolve_udp_address host port =
     let addrs =
@@ -959,8 +1367,8 @@ module Client = struct
   let wait_for_mode_or_fail ch =
     let rec loop () =
       match split_words (wait_for_line_or_fail ch) with
-      | [ "USE-DIRECT" ] -> `Direct
-      | [ "FALLBACK-RELAY" ] -> `Relay
+      | [ "USE-DIRECT" ] -> Use_direct
+      | [ "USE-RELAY-H3"; transfer_id ] -> Use_relay_h3 transfer_id
       | [ "PEER_LEFT" ] -> failwith "peer disconnected before transfer mode selected"
       | _ -> loop ()
     in
@@ -1234,33 +1642,29 @@ module Client = struct
              (Printf.sprintf "JOIN %s %s" opts.code (role_to_string Sender));
            let _rendezvous = wait_for_ready ch in
            let session = perform_pake ~opts ~role:Sender ch in
-           let send_mode =
-             if not direct
-             then Relay_transfer
-             else (
-               match wait_for_direct_offer ch [] with
-               | No_direct -> Relay_transfer
-               | Direct_candidates candidates ->
-                 (match Direct.upload env ~sw ~session ~file candidates with
-                 | Some stats ->
-                   transfer_stats := Some stats;
-                   Format.printf
-                     "using direct peer-to-peer transfer (%d candidates)@."
-                     (List.length candidates);
-                   Line_channel.write_line ch "USE-DIRECT";
-                   Relay_transfer
-                 | None ->
-                   Format.eprintf "sender: falling back to relay@.";
-                   Line_channel.write_line ch "FALLBACK-RELAY";
-                   Relay_transfer))
-           in
-           (match send_mode with
-           | Relay_transfer when !transfer_stats = None ->
+           if direct
+           then (
+             match wait_for_direct_offer ch [] with
+             | No_direct -> ()
+             | Direct_candidates candidates ->
+               (match Direct.upload env ~sw ~session ~file candidates with
+               | Some stats ->
+                 transfer_stats := Some stats;
+                 Format.printf
+                   "using direct peer-to-peer transfer (%d candidates)@."
+                   (List.length candidates);
+                 Line_channel.write_line ch "USE-DIRECT"
+               | None -> ()));
+           if !transfer_stats = None
+           then (
+             let transfer_id = hex_of_string (random_bytes 16) in
+             Line_channel.write_line
+               ch
+               (Printf.sprintf "USE-RELAY-H3 %s" transfer_id);
              let stats =
-               send_transfer ~yield:Eio.Fiber.yield ~ch ~session ~file
+               Relay_h3.upload env ~sw ~host:opts.host ~port:opts.port ~transfer_id ~file
              in
-             transfer_stats := Some stats
-           | Relay_transfer | Direct_transfer _ -> ());
+             transfer_stats := Some stats);
            report_stats "completed"
          with
          | Sys.Break ->
@@ -1323,7 +1727,22 @@ module Client = struct
              send_direct_candidates ch candidates);
            let recv_ch =
              match direct_listener with
-             | None -> Some ch
+             | None ->
+               (match wait_for_mode_or_fail ch with
+               | Use_relay_h3 transfer_id ->
+                 let stats, _out_path =
+                   Relay_h3.download
+                     env
+                     ~sw
+                     ~host:opts.host
+                     ~port:opts.port
+                     ~transfer_id
+                     ~output
+                 in
+                 transfer_stats := Some stats;
+                 None
+               | Use_direct ->
+                 failwith "sender selected direct mode but receiver has no direct listener")
              | Some listener ->
                (match
                   Eio.Fiber.first
@@ -1336,9 +1755,19 @@ module Client = struct
                   transfer_stats := Some stats;
                   Format.printf "received direct upload into %s@." out_path;
                   None
-                | `Mode `Relay ->
-                  Some ch
-                | `Mode `Direct ->
+                | `Mode (Use_relay_h3 transfer_id) ->
+                  let stats, _out_path =
+                    Relay_h3.download
+                      env
+                      ~sw
+                      ~host:opts.host
+                      ~port:opts.port
+                      ~transfer_id
+                      ~output
+                  in
+                  transfer_stats := Some stats;
+                  None
+                | `Mode Use_direct ->
                   let stats, out_path = Direct.await_completion listener in
                   transfer_stats := Some stats;
                   Format.printf "received direct upload into %s@." out_path;
@@ -1502,7 +1931,7 @@ let () =
     | "relay" ->
       let relay_opts = parse_relay_args Sys.argv in
       Eio_main.run (fun env ->
-        Eio.Switch.run (fun sw -> Relay.run env ~sw ~port:relay_opts.relay_port))
+        Eio.Switch.run (fun sw -> run_relay env ~sw ~port:relay_opts.relay_port))
     | "send" ->
       let send_opts = parse_send_args Sys.argv in
       let opts =
