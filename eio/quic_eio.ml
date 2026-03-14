@@ -156,6 +156,15 @@ end
 module IO_loop = struct
   let now_ms clock = Int64.of_float (Eio.Time.now clock *. 1000.)
   let never_drop ~direction:_ ~packet_kind:_ ~seq_no:_ ~len:_ = false
+  let udp_socket_buffer_bytes = 16 * 1024 * 1024
+
+  let configure_udp_socket fd =
+    match Eio_unix.Resource.fd_opt fd with
+    | Some file_descr ->
+      Eio_unix.Fd.use file_descr ~if_closed:(fun () -> ()) (fun fd ->
+        Unix.setsockopt_int fd Unix.SO_SNDBUF udp_socket_buffer_bytes;
+        Unix.setsockopt_int fd Unix.SO_RCVBUF udp_socket_buffer_bytes)
+    | None -> ()
 
   let classify_received_packet_kind buf ~off ~len =
     if len <= 0
@@ -595,6 +604,7 @@ module Server = struct
         (Eio.Stdenv.net env)
         listen_address
     in
+    IO_loop.configure_udp_socket server_fd;
     let clock = Eio.Stdenv.clock env in
     let connection =
       Quic.Transport.Server.create
@@ -637,6 +647,7 @@ module Client = struct
         (Eio.Stdenv.net env)
         `UdpV4
     in
+    IO_loop.configure_udp_socket fd;
     let clock = Eio.Stdenv.clock env in
     let connection =
       Quic.Transport.Client.create

@@ -2269,18 +2269,11 @@ let create ~mode ~now_ms ~config connection_handler =
         | Some { decrypter = None; _ } | None ->
           if encryption_level = Handshake && connection.encdec.current = Initial
           then
-            (* A Handshake packet before Handshake keys are available is
-               invalid; close with PROTOCOL_VIOLATION. *)
-            Format.eprintf
-              "decrypt path missing handshake keys: cid=%s peer=%s enc_current=%s@."
-              (CID.to_string connection.source_cid)
-              connection.peer_address
-              (string_of_encryption_level connection.encdec.current);
-            Connection.report_error
-              connection
-              ~frame_type:Frame.Type.Padding
-              Protocol_violation;
-          None)
+            (* Handshake packets can arrive before the CRYPTO data that
+               installs Handshake keys has been processed. Ignore and wait for
+               a retransmission or later packet once keys exist. *)
+            None
+          else None)
       | None ->
         if encryption_level = Initial
         then
