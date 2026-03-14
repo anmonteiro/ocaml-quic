@@ -2,7 +2,6 @@
  (names
   eio_http1_echo_server
   eio_h3_echo_server
-  eio_h3_client
-  wormhole_quic_pake)
+  eio_h3_client)
  (modules eio_http1_echo_server eio_h3_echo_server eio_h3_client qx509)
  (libraries h3 quic-eio qtls_openssl eio_main mirage-crypto-rng.unix))

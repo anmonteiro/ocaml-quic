@@ -480,6 +480,7 @@ module Relay = struct
       { Quic.Config.certificates
       ; alpn_protocols = [ "wormhole-relay-v1" ]
       ; transport_parameters = Quic.Config.default_transport_parameters
+      ; max_datagram_size = Quic.Config.default_max_datagram_size
       }
     in
     let state = create_state () in
@@ -524,6 +525,7 @@ module Client = struct
     { Quic.Config.certificates
     ; alpn_protocols = [ "wormhole-relay-v1" ]
     ; transport_parameters = Quic.Config.default_transport_parameters
+    ; max_datagram_size = Quic.Config.default_max_datagram_size
     }
 
   let connect env ~sw ~(opts : opts) =
