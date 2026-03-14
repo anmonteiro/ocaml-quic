@@ -126,6 +126,8 @@ let finish_progress t current =
    Ciphertext is sent as hex (2x expansion), so large plaintext chunks can
    exceed the current packetization limit in this example transport path. *)
 let data_chunk_size = 512
+let ack_interval_chunks = 256L
+let max_inflight_chunks = 1024L
 
 let int64_to_be n =
   let b = Bytes.create 8 in
@@ -346,7 +348,32 @@ module Pake = struct
 end
 
 module Direct = struct
-  let alpn = "wormhole-direct-v1"
+  let alpn = "h3"
+  let upload_chunk_size = 16384
+  let flush_batch_bytes = 256 * 1024
+
+  let auth_token (session : Pake.session) =
+    hmac_sha256_raw
+      ~key:session.mac_key
+      "wormhole-direct-h3-upload-v1"
+    |> hex_of_string
+
+  let resolve_udp_address host port =
+    let addrs =
+      Eio_unix.run_in_systhread (fun () ->
+        Unix.getaddrinfo host (string_of_int port) [ Unix.(AI_FAMILY PF_INET) ])
+    in
+    let addrs =
+      List.filter_map
+        (fun (addr : Unix.addr_info) ->
+           match addr.ai_addr with
+           | Unix.ADDR_UNIX _ -> None
+           | Unix.ADDR_INET (inet, p) -> Some (inet, p))
+        addrs
+    in
+    match addrs with
+    | [] -> failwith ("could not resolve host: " ^ host)
+    | (inet, p) :: _ -> `Udp (Eio_unix.Net.Ipaddr.of_unix inet, p)
 
   let config () =
     let cert = "./certificates/server.pem" in
@@ -380,23 +407,103 @@ module Direct = struct
     Hashtbl.to_seq_keys hosts |> List.of_seq |> List.sort_uniq String.compare
 
   type receiver_listener =
-    { incoming_stream : Line_channel.t Eio.Promise.t
+    { completion : ((Transfer_stats.t * string), exn) result Eio.Promise.t
     ; port : int
     ; hosts : string list
     }
 
-  let start_receiver env ~sw ~port ~advertise_host =
-    let incoming_p, incoming_u = Eio.Promise.create () in
+  let start_receiver env ~sw ~port ~advertise_host ~session ~output =
+    let completion_p, completion_u = Eio.Promise.create () in
     let resolved = ref false in
-    let connection_handler ~cid:_ ~start_stream:_ =
-      Quic.Transport.F
-        (fun stream ->
-           if not !resolved
-           then (
-             resolved := true;
-             Eio.Promise.resolve incoming_u (Line_channel.of_stream stream));
-           { on_error = ignore })
+    let resolve_once result =
+      if not !resolved
+      then (
+        resolved := true;
+        Eio.Promise.resolve completion_u result)
     in
+    let request_handler reqd =
+      let request = H3.Reqd.request reqd in
+      let auth_ok =
+        match H3.Headers.get request.H3.Request.headers "x-wormhole-auth" with
+        | Some token -> constant_time_equal token (auth_token session)
+        | None -> false
+      in
+      match request.H3.Request.meth, request.H3.Request.target, auth_ok with
+      | `POST, "/upload", true ->
+        let sender_name =
+          match H3.Headers.get request.H3.Request.headers "x-wormhole-name" with
+          | Some name_hex ->
+            (try string_of_hex name_hex with _ -> "upload.bin")
+          | None -> "upload.bin"
+        in
+        let out_path = Option.value output ~default:("recv-" ^ sender_name) in
+        let request_body = H3.Reqd.request_body reqd in
+        let expected_len =
+          match H3.Request.body_length request with
+          | `Fixed len -> Some len
+          | `Unknown | `Error _ -> None
+        in
+        let stats =
+          Transfer_stats.create ~label:"direct recv" ?total:expected_len ()
+        in
+        let progress =
+          Option.map
+            (fun total -> create_progress ~label:"receiving" ~total)
+            expected_len
+        in
+        let oc = open_out_bin out_path in
+        let finished = ref false in
+        let finalize ok =
+          if not !finished
+          then (
+            finished := true;
+            (match progress with
+            | Some p -> finish_progress p stats.bytes
+            | None -> ());
+            close_out_noerr oc;
+            if ok
+            then (
+              H3.Reqd.respond_with_string reqd (H3.Response.create `OK) "ok";
+              resolve_once (Ok (stats, out_path)))
+            else (
+              H3.Reqd.respond_with_string
+                reqd
+                (H3.Response.create `Internal_server_error)
+                "upload failed";
+              resolve_once (Error (Failure "direct upload failed"))))
+        in
+        let rec read_body () =
+          H3.Body.Reader.schedule_read
+            request_body
+            ~on_eof:(fun () -> finalize true)
+            ~on_read:(fun bigstring ~off ~len ->
+              try
+                output_string oc (Bigstringaf.substring bigstring ~off ~len);
+                Transfer_stats.on_bytes stats len;
+                Option.iter (fun p -> update_progress p stats.bytes) progress;
+                (match expected_len with
+                | Some expected when Int64.compare stats.bytes expected >= 0 ->
+                  finalize true
+                | _ -> read_body ())
+              with
+              | exn ->
+                close_out_noerr oc;
+                resolve_once (Error exn);
+                raise exn)
+        in
+        read_body ()
+      | `POST, "/upload", false ->
+        H3.Reqd.respond_with_string
+          reqd
+          (H3.Response.create `Forbidden)
+          "forbidden"
+      | _ ->
+        H3.Reqd.respond_with_string
+          reqd
+          (H3.Response.create `Not_found)
+          "not found"
+    in
+    let connection_handler = H3.Server_connection.create request_handler in
     Eio.Fiber.fork ~sw (fun () ->
       Quic_eio.Server.establish_server
         env
@@ -404,20 +511,159 @@ module Direct = struct
         ~config:(config ())
         (`Udp (Eio.Net.Ipaddr.V4.any, port))
         connection_handler);
-    { incoming_stream = incoming_p
+    { completion = completion_p
     ; port
     ; hosts = candidate_hosts ?advertise_host ()
     }
 
-  let await_stream env t ~timeout_s =
-    try
-      Some
-        (Eio.Time.with_timeout_exn
-           (Eio.Stdenv.clock env)
-           timeout_s
-           (fun () -> Eio.Promise.await t.incoming_stream))
-    with
-    | Eio.Time.Timeout -> None
+  let await_completion t =
+    match Eio.Promise.await t.completion with
+    | Ok result -> result
+    | Error exn -> raise exn
+
+  let upload_via_candidate env ~sw ~session ~file (host, port) =
+    Eio.Switch.run (fun direct_sw ->
+      let on_connect_p, on_connect_u = Eio.Promise.create () in
+      let done_p, done_u = Eio.Promise.create () in
+      let resolved = ref false in
+      let resolve_once result =
+        if not !resolved
+        then (
+          resolved := true;
+          Eio.Promise.resolve done_u result)
+      in
+      let error_handler : H3.Client_connection.error_handler = function
+        | `Protocol_error (_e, msg) -> resolve_once (Error (Failure msg))
+        | _ -> resolve_once (Error (Failure "direct h3 client error"))
+      in
+      let t =
+        Quic_eio.Client.create
+          env
+          ~sw:direct_sw
+          ~config:(config ())
+          (fun ~cid:_ ~start_stream:_ ->
+             Quic.Transport.F (fun _ -> { on_error = ignore }))
+      in
+      Fun.protect
+        ~finally:(fun () -> Quic_eio.shutdown t)
+        (fun () ->
+          let address = resolve_udp_address host port in
+          let tls_host =
+            try
+              let _ = Unix.inet_addr_of_string host in
+              "localhost"
+            with
+            | Failure _ -> host
+          in
+          Quic_eio.connect t ~address ~host:tls_host (fun ~cid ~start_stream ->
+            let conn, stream_handler =
+              H3.Client_connection.create ~error_handler ~cid ~start_stream
+            in
+            Eio.Promise.resolve on_connect_u conn;
+            stream_handler);
+          let client = Eio.Promise.await on_connect_p in
+          let stat = Unix.stat file in
+          let total_size = Int64.of_int stat.Unix.st_size in
+          let filename = Filename.basename file in
+          let stats =
+            Transfer_stats.create ~label:"direct send" ~total:total_size ()
+          in
+          let progress =
+            create_progress ~label:"sending  " ~total:total_size
+          in
+          let response_handler response response_body =
+            let status = H3.Status.to_code response.H3.Response.status in
+            if 200 <= status && status < 300
+            then resolve_once (Ok stats)
+            else (
+              let rec drain () =
+                H3.Body.Reader.schedule_read
+                  response_body
+                  ~on_eof:(fun () ->
+                    resolve_once
+                      (Error
+                         (Failure
+                            (Printf.sprintf
+                               "direct upload failed with HTTP status %d"
+                               status))))
+                  ~on_read:(fun _ ~off:_ ~len:_ -> drain ())
+              in
+              drain ())
+          in
+          let headers =
+            H3.Headers.of_list
+              [ ":authority", tls_host
+              ; "content-type", "application/octet-stream"
+              ; "content-length", Int64.to_string total_size
+              ; "x-wormhole-auth", auth_token session
+              ; "x-wormhole-name", hex_of_string filename
+              ]
+          in
+          let request =
+            H3.Request.create ~scheme:"https" ~headers `POST "/upload"
+          in
+          let request_body =
+            H3.Client_connection.request
+              client
+              request
+              ~error_handler
+              ~response_handler
+          in
+          let ic = open_in_bin file in
+          Fun.protect
+            ~finally:(fun () -> close_in_noerr ic)
+            (fun () ->
+              update_progress progress 0L;
+              let buf = Bytes.create upload_chunk_size in
+              let rec pump () =
+                let rec fill_batch batched_bytes =
+                  match input ic buf 0 (Bytes.length buf) with
+                  | 0 -> `Eof batched_bytes
+                  | n ->
+                    H3.Body.Writer.write_string
+                      request_body
+                      ~off:0
+                      ~len:n
+                      (Bytes.unsafe_to_string buf);
+                    Transfer_stats.on_bytes stats n;
+                    update_progress progress stats.bytes;
+                    let batched_bytes = batched_bytes + n in
+                    if batched_bytes >= flush_batch_bytes
+                    then `Flushed batched_bytes
+                    else fill_batch batched_bytes
+                in
+                match fill_batch 0 with
+                | `Eof 0 ->
+                  finish_progress progress stats.bytes;
+                  H3.Body.Writer.close request_body
+                | `Eof _ ->
+                  finish_progress progress stats.bytes;
+                  H3.Body.Writer.flush request_body (fun () ->
+                    H3.Body.Writer.close request_body)
+                | `Flushed _ ->
+                  H3.Body.Writer.flush request_body pump
+              in
+              pump ();
+              Eio.Time.with_timeout_exn
+                (Eio.Stdenv.clock env)
+                10.0
+                (fun () -> Eio.Promise.await done_p))))
+
+  let upload env ~sw ~session ~file candidates =
+    let rec loop = function
+      | [] -> None
+      | candidate :: rest ->
+        let result =
+          try
+            Some (upload_via_candidate env ~sw ~session ~file candidate)
+          with
+          | _ -> None
+        in
+        (match result with
+        | Some (Ok stats) -> Some stats
+        | Some (Error _) | None -> loop rest)
+    in
+    loop candidates
 end
 
 module Relay = struct
@@ -744,7 +990,7 @@ module Client = struct
     in
     try_candidates candidates
 
-  let send_transfer ~ch ~session ~file =
+  let send_transfer ~yield ~ch ~session ~file =
     let stat = Unix.stat file in
     let total_size = Int64.of_int stat.Unix.st_size in
     let filename = Filename.basename file in
@@ -770,7 +1016,25 @@ module Client = struct
            create_progress ~label:"sending  " ~total:total_size
          in
          update_progress progress 0L;
-         let rec loop seq sent_bytes =
+         let acked_seq = ref (-1L) in
+         let rec wait_for_ack target_seq =
+           if Int64.compare !acked_seq target_seq >= 0
+           then ()
+           else
+             match split_words (wait_for_line_or_fail ch) with
+             | [ "ACK"; seq_s ] ->
+               let seq = parse_int64 seq_s in
+               if Int64.compare seq !acked_seq > 0 then acked_seq := seq;
+               wait_for_ack target_seq
+             | [ "RECV-OK" ] ->
+               acked_seq := target_seq
+             | line when String.starts_with ~prefix:"RECV-BAD" (String.concat " " line) ->
+               failwith ("receiver reported integrity failure: " ^ String.concat " " line)
+             | [ "PEER_LEFT" ] ->
+               failwith "peer disconnected before final ack"
+             | _ -> wait_for_ack target_seq
+         in
+         let rec loop chunks_since_yield seq sent_bytes =
            let n = input ic buf 0 (Bytes.length buf) in
            if n = 0
            then (
@@ -808,9 +1072,20 @@ module Client = struct
              Transfer_stats.on_bytes stats n;
              let sent = Int64.add sent_bytes (Int64.of_int n) in
              update_progress progress sent;
-             loop (Int64.succ seq) sent
+             if
+               Int64.compare
+                 (Int64.sub (Int64.succ seq) !acked_seq)
+                 max_inflight_chunks
+               > 0
+             then wait_for_ack (Int64.sub (Int64.succ seq) (Int64.div max_inflight_chunks 2L));
+             let chunks_since_yield = chunks_since_yield + 1 in
+             if chunks_since_yield >= 256 then yield ();
+             loop
+               (if chunks_since_yield >= 256 then 0 else chunks_since_yield)
+               (Int64.succ seq)
+               sent
          in
-         loop 0L 0L)
+         loop 0 0L 0L)
 
   let recv_transfer ~ch ~session ~output =
     let rec wait_meta () =
@@ -867,6 +1142,8 @@ module Client = struct
                Transfer_stats.on_bytes stats n;
                let written = Int64.add written (Int64.of_int n) in
                update_progress progress written;
+               if Int64.rem (Int64.succ seq) ack_interval_chunks = 0L
+               then Line_channel.write_line ch (Printf.sprintf "ACK %Ld" seq);
                loop (Int64.succ next_seq) written
            | [ "DONE"; total_s; digest_hex ] ->
              let total = parse_int64 total_s in
@@ -940,7 +1217,6 @@ module Client = struct
   let do_send env ~sw ~opts ~file ~direct =
     let t, stream = connect env ~sw ~opts in
     let transfer_stats : Transfer_stats.t option ref = ref None in
-    let direct_t : Quic_eio.t option ref = ref None in
     let report_stats status =
       match !transfer_stats with
       | None -> ()
@@ -948,7 +1224,6 @@ module Client = struct
     in
     Fun.protect
       ~finally:(fun () ->
-        Option.iter Quic_eio.shutdown !direct_t;
         Quic.Stream.close_writer stream;
         Quic_eio.shutdown t)
       (fun () ->
@@ -966,27 +1241,26 @@ module Client = struct
                match wait_for_direct_offer ch [] with
                | No_direct -> Relay_transfer
                | Direct_candidates candidates ->
-                 (match direct_connect env ~sw candidates with
-                 | Some (direct_conn, direct_ch) ->
-                    direct_t := Some direct_conn;
+                 (match Direct.upload env ~sw ~session ~file candidates with
+                 | Some stats ->
+                   transfer_stats := Some stats;
                    Format.printf
                      "using direct peer-to-peer transfer (%d candidates)@."
                      (List.length candidates);
                    Line_channel.write_line ch "USE-DIRECT";
-                   Eio.Time.sleep (Eio.Stdenv.clock env) 0.1;
-                   Direct_transfer (direct_conn, direct_ch)
+                   Relay_transfer
                  | None ->
                    Format.eprintf "sender: falling back to relay@.";
                    Line_channel.write_line ch "FALLBACK-RELAY";
                    Relay_transfer))
            in
-           let ch =
-             match send_mode with
-             | Relay_transfer -> ch
-             | Direct_transfer (_, direct_ch) -> direct_ch
-           in
-           let stats = send_transfer ~ch ~session ~file in
-           transfer_stats := Some stats;
+           (match send_mode with
+           | Relay_transfer when !transfer_stats = None ->
+             let stats =
+               send_transfer ~yield:Eio.Fiber.yield ~ch ~session ~file
+             in
+             transfer_stats := Some stats
+           | Relay_transfer | Direct_transfer _ -> ());
            report_stats "completed"
          with
          | Sys.Break ->
@@ -999,11 +1273,6 @@ module Client = struct
   let do_recv env ~sw ~opts ~output ~direct_port ~direct_host =
     let t, stream = connect env ~sw ~opts in
     let transfer_stats : Transfer_stats.t option ref = ref None in
-    let direct_listener =
-      Option.map
-        (fun port -> Direct.start_receiver env ~sw ~port ~advertise_host:direct_host)
-        direct_port
-    in
     let report_stats status =
       match !transfer_stats with
       | None -> ()
@@ -1021,9 +1290,22 @@ module Client = struct
              (Printf.sprintf "JOIN %s %s" opts.code (role_to_string Receiver));
            let rendezvous = wait_for_ready ch in
            let session = perform_pake ~opts ~role:Receiver ch in
+           let direct_listener =
+             Option.map
+               (fun port ->
+                  Direct.start_receiver
+                    env
+                    ~sw
+                    ~port
+                    ~advertise_host:direct_host
+                    ~session
+                    ~output)
+               direct_port
+           in
             (match direct_listener with
             | None -> Line_channel.write_line ch "NO-DIRECT"
             | Some listener ->
+             Eio.Time.sleep (Eio.Stdenv.clock env) 0.1;
              let candidates =
                List.map (fun host -> host, listener.port) listener.hosts
              in
@@ -1041,22 +1323,37 @@ module Client = struct
              send_direct_candidates ch candidates);
            let recv_ch =
              match direct_listener with
-              | None -> ch
-              | Some listener ->
-                (match wait_for_mode_or_fail ch with
-                | `Relay -> ch
-                | `Direct ->
-                 let direct_ch =
-                   match Direct.await_stream env listener ~timeout_s:10.0 with
-                   | Some ch -> ch
-                   | None -> failwith "timed out waiting for direct connection"
-                 in
-                 direct_ch)
+             | None -> Some ch
+             | Some listener ->
+               (match
+                  Eio.Fiber.first
+                    (fun () -> `Mode (wait_for_mode_or_fail ch))
+                    (fun () ->
+                      let stats, out_path = Direct.await_completion listener in
+                      `Direct_done (stats, out_path))
+                with
+                | `Direct_done (stats, out_path) ->
+                  transfer_stats := Some stats;
+                  Format.printf "received direct upload into %s@." out_path;
+                  None
+                | `Mode `Relay ->
+                  Some ch
+                | `Mode `Direct ->
+                  let stats, out_path = Direct.await_completion listener in
+                  transfer_stats := Some stats;
+                  Format.printf "received direct upload into %s@." out_path;
+                  None)
            in
-           let stats = recv_transfer ~ch:recv_ch ~session ~output in
-           transfer_stats := Some stats;
+           (match recv_ch with
+           | Some recv_ch ->
+             let stats = recv_transfer ~ch:recv_ch ~session ~output in
+             transfer_stats := Some stats
+           | None -> ());
            Eio.Time.sleep (Eio.Stdenv.clock env) 0.1;
-           Format.printf "received %Ld bytes successfully@." stats.bytes;
+           (match !transfer_stats with
+           | Some stats ->
+             Format.printf "received %Ld bytes successfully@." stats.bytes
+           | None -> ());
            report_stats "completed"
          with
          | Sys.Break ->
