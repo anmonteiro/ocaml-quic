@@ -57,19 +57,38 @@ jobs:
           OCAMLRUNPARAM: b
           OCAML_BACKTRACE: "1"
 
-      - name: Retry upload benchmark with UDP fast path disabled
+      - name: Retry upload benchmark with UDP send fast path disabled
         if: steps.bench_main.outcome == 'failure' && runner.os == 'Linux'
         run: |
-          mkdir -p benchmark-output/diag-fastpath-disabled
+          mkdir -p benchmark-output/diag-send-fastpath-disabled
           BENCH_SCENARIOS=h3_upload_curl \
           BENCH_FILE_SIZE_MIB=16 \
-          BENCH_OUTPUT_DIR=benchmark-output/diag-fastpath-disabled/raw \
-          QUIC_EIO_DISABLE_UDP_FASTPATH=1 \
+          BENCH_OUTPUT_DIR=benchmark-output/diag-send-fastpath-disabled/raw \
+          QUIC_EIO_DISABLE_UDP_SEND_FASTPATH=1 \
           nix develop .#benchmark -c bash ./scripts/bench/run_h3_loopback_benchmarks.sh \
-            > benchmark-output/diag-fastpath-disabled/results.jsonl
+            > benchmark-output/diag-send-fastpath-disabled/results.jsonl
+          cat benchmark-output/diag-send-fastpath-disabled/results.jsonl
         env:
           RUNS: 1
-          BENCH_PROFILE: linux-fastpath-disabled-diagnostic
+          BENCH_PROFILE: linux-send-fastpath-disabled-diagnostic
+          BENCH_CHUNK_SIZE: ${{ env.BENCH_CHUNK_SIZE }}
+          OCAMLRUNPARAM: b
+          OCAML_BACKTRACE: "1"
+
+      - name: Retry upload benchmark with UDP recv fast path disabled
+        if: steps.bench_main.outcome == 'failure' && runner.os == 'Linux'
+        run: |
+          mkdir -p benchmark-output/diag-recv-fastpath-disabled
+          BENCH_SCENARIOS=h3_upload_curl \
+          BENCH_FILE_SIZE_MIB=16 \
+          BENCH_OUTPUT_DIR=benchmark-output/diag-recv-fastpath-disabled/raw \
+          QUIC_EIO_DISABLE_UDP_RECV_FASTPATH=1 \
+          nix develop .#benchmark -c bash ./scripts/bench/run_h3_loopback_benchmarks.sh \
+            > benchmark-output/diag-recv-fastpath-disabled/results.jsonl
+          cat benchmark-output/diag-recv-fastpath-disabled/results.jsonl
+        env:
+          RUNS: 1
+          BENCH_PROFILE: linux-recv-fastpath-disabled-diagnostic
           BENCH_CHUNK_SIZE: ${{ env.BENCH_CHUNK_SIZE }}
           OCAMLRUNPARAM: b
           OCAML_BACKTRACE: "1"

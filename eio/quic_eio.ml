@@ -203,10 +203,14 @@ module IO_loop = struct
       iovecs
 
   module Io = struct
-    let udp_fast_path_enabled =
-      match Sys.getenv_opt "QUIC_EIO_DISABLE_UDP_FASTPATH" with
-      | Some ("1" | "true" | "yes") -> false
-      | _ -> true
+    let env_disabled name =
+      match Sys.getenv_opt name with
+      | Some ("1" | "true" | "yes") -> true
+      | _ -> false
+
+    let udp_fast_path_enabled = not (env_disabled "QUIC_EIO_DISABLE_UDP_FASTPATH")
+    let udp_send_fast_path_enabled = udp_fast_path_enabled && not (env_disabled "QUIC_EIO_DISABLE_UDP_SEND_FASTPATH")
+    let udp_recv_fast_path_enabled = udp_fast_path_enabled && not (env_disabled "QUIC_EIO_DISABLE_UDP_RECV_FASTPATH")
 
     let send_msg_fast_threshold =
       match Sys.getenv_opt "QUIC_EIO_SEND_FAST_THRESHOLD" with
@@ -235,7 +239,7 @@ module IO_loop = struct
          Buffer.put
            ~f:(fun buf ~off ~len k ->
              match Eio_unix.Resource.fd_opt dsock with
-             | Some fd when udp_fast_path_enabled ->
+             | Some fd when udp_recv_fast_path_enabled ->
                 (match
                    Eio_unix.Fd.use fd ~if_closed:(fun () -> None) (fun fd ->
                      match !connected_peer with
@@ -351,7 +355,7 @@ module IO_loop = struct
         | () -> `Ok lenv
         | exception End_of_file -> `Closed
       in
-      if udp_fast_path_enabled && lenv >= send_msg_fast_threshold
+      if udp_send_fast_path_enabled && lenv >= send_msg_fast_threshold
       then
         match Eio_unix.Resource.fd_opt dsock with
         | Some fd ->
@@ -418,7 +422,7 @@ module IO_loop = struct
             (match !connected_peer, connect_on_first_peer with
             | None, true ->
               (match Eio_unix.Resource.fd_opt socket with
-              | Some file_descr when Io.udp_fast_path_enabled ->
+              | Some file_descr when Io.udp_send_fast_path_enabled || Io.udp_recv_fast_path_enabled ->
                 Eio_unix.Fd.use file_descr ~if_closed:(fun () -> ()) (fun fd ->
                   Unix.connect fd (Addr.parse_unix client_address);
                   connected_peer := Some client_address)
@@ -486,7 +490,7 @@ module IO_loop = struct
             then `Ok sent_len
             else
               (match !connected_peer with
-               | Some peer when Io.udp_fast_path_enabled && String.equal peer client_address ->
+               | Some peer when Io.udp_send_fast_path_enabled && String.equal peer client_address ->
                  (match Eio_unix.Resource.fd_opt socket with
                   | Some fd ->
                     Eio_unix.Fd.use fd ~if_closed:(fun () -> `Closed) (fun fd ->
@@ -633,7 +637,7 @@ module Client = struct
       try Eio.Resource.close fd with _ -> ()
     in
     let connect_udp address =
-      if udp_connect && IO_loop.Io.udp_fast_path_enabled
+      if udp_connect && (IO_loop.Io.udp_send_fast_path_enabled || IO_loop.Io.udp_recv_fast_path_enabled)
       then
         match Eio_unix.Resource.fd_opt fd with
         | Some file_descr ->
