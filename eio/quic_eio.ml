@@ -208,9 +208,23 @@ module IO_loop = struct
       | Some ("1" | "true" | "yes") -> true
       | _ -> false
 
+    let env_enabled name =
+      match Sys.getenv_opt name with
+      | Some ("1" | "true" | "yes") -> true
+      | _ -> false
+
+    let running_on_linux =
+      match Sys.os_type with
+      | "Unix" -> Sys.file_exists "/proc/sys/kernel/ostype"
+      | _ -> false
+
     let udp_fast_path_enabled = not (env_disabled "QUIC_EIO_DISABLE_UDP_FASTPATH")
     let udp_send_fast_path_enabled = udp_fast_path_enabled && not (env_disabled "QUIC_EIO_DISABLE_UDP_SEND_FASTPATH")
-    let udp_recv_fast_path_enabled = udp_fast_path_enabled && not (env_disabled "QUIC_EIO_DISABLE_UDP_RECV_FASTPATH")
+    let udp_recv_fast_path_enabled =
+      udp_fast_path_enabled
+      && not (env_disabled "QUIC_EIO_DISABLE_UDP_RECV_FASTPATH")
+      &&
+      ((not running_on_linux) || env_enabled "QUIC_EIO_ENABLE_LINUX_UDP_RECV_FASTPATH")
 
     let send_msg_fast_threshold =
       match Sys.getenv_opt "QUIC_EIO_SEND_FAST_THRESHOLD" with
