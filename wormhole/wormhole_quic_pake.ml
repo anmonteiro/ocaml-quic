@@ -18,6 +18,9 @@ let split_words s =
 let parse_int64 s =
   try Int64.of_string s with _ -> failwith ("invalid int64: " ^ s)
 
+let parse_int s =
+  try int_of_string s with _ -> failwith ("invalid int: " ^ s)
+
 module Transfer_stats = struct
   type t =
     { label : string
@@ -342,6 +345,81 @@ module Pake = struct
       Ok (xor_with_keystream ~key:t.enc_key ~nonce ciphertext)
 end
 
+module Direct = struct
+  let alpn = "wormhole-direct-v1"
+
+  let config () =
+    let cert = "./certificates/server.pem" in
+    let priv_key = "./certificates/server.key" in
+    let certificates = `Single (Qx509.private_of_pems ~cert ~priv_key) in
+    { Quic.Config.certificates
+    ; alpn_protocols = [ alpn ]
+    ; transport_parameters = Quic.Config.default_transport_parameters
+    ; max_datagram_size = Quic.Config.default_max_datagram_size
+    }
+
+  let candidate_hosts ?advertise_host () =
+    let hosts = Hashtbl.create 8 in
+    let add host =
+      if host <> "" then Hashtbl.replace hosts host ()
+    in
+    (match advertise_host with
+    | Some host -> add host
+    | None -> ());
+    add "127.0.0.1";
+    let hostname = Unix.gethostname () in
+    let infos =
+      try Unix.getaddrinfo hostname "" [ Unix.(AI_FAMILY PF_INET) ] with _ -> []
+    in
+    List.iter
+      (fun (info : Unix.addr_info) ->
+         match info.ai_addr with
+         | Unix.ADDR_INET (inet, _) -> add (Unix.string_of_inet_addr inet)
+         | Unix.ADDR_UNIX _ -> ())
+      infos;
+    Hashtbl.to_seq_keys hosts |> List.of_seq |> List.sort_uniq String.compare
+
+  type receiver_listener =
+    { incoming_stream : Line_channel.t Eio.Promise.t
+    ; port : int
+    ; hosts : string list
+    }
+
+  let start_receiver env ~sw ~port ~advertise_host =
+    let incoming_p, incoming_u = Eio.Promise.create () in
+    let resolved = ref false in
+    let connection_handler ~cid:_ ~start_stream:_ =
+      Quic.Transport.F
+        (fun stream ->
+           if not !resolved
+           then (
+             resolved := true;
+             Eio.Promise.resolve incoming_u (Line_channel.of_stream stream));
+           { on_error = ignore })
+    in
+    Eio.Fiber.fork ~sw (fun () ->
+      Quic_eio.Server.establish_server
+        env
+        ~sw
+        ~config:(config ())
+        (`Udp (Eio.Net.Ipaddr.V4.any, port))
+        connection_handler);
+    { incoming_stream = incoming_p
+    ; port
+    ; hosts = candidate_hosts ?advertise_host ()
+    }
+
+  let await_stream env t ~timeout_s =
+    try
+      Some
+        (Eio.Time.with_timeout_exn
+           (Eio.Stdenv.clock env)
+           timeout_s
+           (fun () -> Eio.Promise.await t.incoming_stream))
+    with
+    | Eio.Time.Timeout -> None
+end
+
 module Relay = struct
   type peer =
     { stream : Quic.Stream.t
@@ -501,6 +579,14 @@ module Client = struct
     ; password : string
     }
 
+  type direct_offer =
+    | No_direct
+    | Direct_candidates of (string * int) list
+
+  type send_mode =
+    | Relay_transfer
+    | Direct_transfer of Quic_eio.t * Line_channel.t
+
   let resolve_udp_address host port =
     let addrs =
       Eio_unix.run_in_systhread (fun () ->
@@ -518,7 +604,7 @@ module Client = struct
     | [] -> failwith ("could not resolve host: " ^ host)
     | (inet, p) :: _ -> `Udp (Eio_unix.Net.Ipaddr.of_unix inet, p)
 
-  let config () =
+  let relay_config () =
     let cert = "./certificates/server.pem" in
     let priv_key = "./certificates/server.key" in
     let certificates = `Single (Qx509.private_of_pems ~cert ~priv_key) in
@@ -528,13 +614,13 @@ module Client = struct
     ; max_datagram_size = Quic.Config.default_max_datagram_size
     }
 
-  let connect env ~sw ~(opts : opts) =
+  let connect_with_config env ~sw ~config ~(opts : opts) =
     let on_connect_p, on_connect_u = Eio.Promise.create () in
     let t =
       Quic_eio.Client.create
         env
         ~sw
-        ~config:(config ())
+        ~config
         (fun ~cid:_ ~start_stream:_ ->
            Quic.Transport.F (fun _ -> { on_error = ignore }))
     in
@@ -552,6 +638,9 @@ module Client = struct
     let start_stream = Eio.Promise.await on_connect_p in
     t, start_stream Quic.Direction.Bidirectional
 
+  let connect env ~sw ~(opts : opts) =
+    connect_with_config env ~sw ~config:(relay_config ()) ~opts
+
   let wait_for_line_or_fail ch =
     match Line_channel.read_line ch with
     | Some line -> line
@@ -565,6 +654,210 @@ module Client = struct
     | "PEER_LEFT" -> failwith "peer disconnected before setup completed"
     | line when String.starts_with ~prefix:"ERROR " line -> failwith line
     | _ -> wait_for_ready ch
+
+  let rec wait_for_direct_offer ch acc =
+    match split_words (wait_for_line_or_fail ch) with
+    | [ "NO-DIRECT" ] -> No_direct
+    | [ "DIRECT"; host_hex; port_s ] ->
+      wait_for_direct_offer ch ((string_of_hex host_hex, parse_int port_s) :: acc)
+    | [ "DIRECT-DONE" ] -> Direct_candidates (List.rev acc)
+    | [ "PEER_LEFT" ] -> failwith "peer disconnected before direct offer"
+    | line when line = [ "WAITING" ] || line = [ "JOINED" ] -> wait_for_direct_offer ch acc
+    | _ -> wait_for_direct_offer ch acc
+
+  let send_direct_candidates ch candidates =
+    match candidates with
+    | [] -> Line_channel.write_line ch "NO-DIRECT"
+    | _ ->
+      List.iter
+        (fun (host, port) ->
+           Line_channel.write_line
+             ch
+             (Printf.sprintf "DIRECT %s %d" (hex_of_string host) port))
+        candidates;
+      Line_channel.write_line ch "DIRECT-DONE"
+
+  let wait_for_mode_or_fail ch =
+    let rec loop () =
+      match split_words (wait_for_line_or_fail ch) with
+      | [ "USE-DIRECT" ] -> `Direct
+      | [ "FALLBACK-RELAY" ] -> `Relay
+      | [ "PEER_LEFT" ] -> failwith "peer disconnected before transfer mode selected"
+      | _ -> loop ()
+    in
+    loop ()
+
+  let direct_connect env ~sw candidates =
+    let rec try_candidates = function
+      | [] -> None
+      | (host, port) :: rest ->
+        let opts = { host; port; code = ""; password = "" } in
+        let attempt () =
+          let t, stream =
+            connect_with_config env ~sw ~config:(Direct.config ()) ~opts
+          in
+          let ch = Line_channel.of_stream stream in
+          Some (t, ch)
+        in
+        let result =
+          try
+            Eio.Time.with_timeout_exn (Eio.Stdenv.clock env) 2.0 attempt
+          with
+          | _ -> None
+        in
+        (match result with
+        | Some _ as ok -> ok
+        | None -> try_candidates rest)
+    in
+    try_candidates candidates
+
+  let send_transfer ~ch ~session ~file =
+    let stat = Unix.stat file in
+    let total_size = Int64.of_int stat.Unix.st_size in
+    let filename = Filename.basename file in
+    Line_channel.write_line
+      ch
+      (Printf.sprintf "META %s %Ld" (hex_of_string filename) total_size);
+    let rec wait_meta_ok () =
+      match wait_for_line_or_fail ch with
+      | "META-OK" -> ()
+      | "PEER_LEFT" ->
+        failwith "peer disconnected before receiving metadata"
+      | _ -> wait_meta_ok ()
+    in
+    wait_meta_ok ();
+    let stats = Transfer_stats.create ~label:"send" ~total:total_size () in
+    let ic = open_in_bin file in
+    Fun.protect
+      ~finally:(fun () -> close_in_noerr ic)
+      (fun () ->
+         let digest = ref Digestif.SHA256.empty in
+         let buf = Bytes.create data_chunk_size in
+         let progress =
+           create_progress ~label:"sending  " ~total:total_size
+         in
+         update_progress progress 0L;
+         let rec loop seq sent_bytes =
+           let n = input ic buf 0 (Bytes.length buf) in
+           if n = 0
+           then (
+             finish_progress progress sent_bytes;
+             let digest_hex = Digestif.SHA256.(to_hex (get !digest)) in
+             Line_channel.write_line
+               ch
+               (Printf.sprintf "DONE %Ld %s" sent_bytes digest_hex);
+             let rec wait_ack () =
+               match wait_for_line_or_fail ch with
+               | "RECV-OK" ->
+                 Format.printf
+                   "sent %Ld bytes from %s successfully@."
+                   sent_bytes
+                   file
+               | line when String.starts_with ~prefix:"RECV-BAD" line ->
+                 failwith ("receiver reported integrity failure: " ^ line)
+               | "PEER_LEFT" ->
+                 failwith "peer disconnected before final ack"
+               | _ -> wait_ack ()
+             in
+             wait_ack ();
+             stats)
+           else
+             let plain = Bytes.sub_string buf 0 n in
+             digest := Digestif.SHA256.feed_string !digest plain;
+             let ciphertext, tag = Pake.encrypt_chunk session ~seq plain in
+             Line_channel.write_line
+               ch
+               (Printf.sprintf
+                  "DATA %Ld %s %s"
+                  seq
+                  (hex_of_string ciphertext)
+                  (hex_of_string tag));
+             Transfer_stats.on_bytes stats n;
+             let sent = Int64.add sent_bytes (Int64.of_int n) in
+             update_progress progress sent;
+             loop (Int64.succ seq) sent
+         in
+         loop 0L 0L)
+
+  let recv_transfer ~ch ~session ~output =
+    let rec wait_meta () =
+      match split_words (wait_for_line_or_fail ch) with
+      | [ "META"; name_hex; size_s ] ->
+        string_of_hex name_hex, parse_int64 size_s
+      | [ "PEER_LEFT" ] -> failwith "peer disconnected before metadata"
+      | _ -> wait_meta ()
+    in
+    let sender_name, expected_size = wait_meta () in
+    let out_path = Option.value output ~default:("recv-" ^ sender_name) in
+    let stats =
+      Transfer_stats.create ~label:"recv" ~total:expected_size ()
+    in
+    let oc = open_out_bin out_path in
+    Fun.protect
+      ~finally:(fun () -> close_out_noerr oc)
+      (fun () ->
+         Format.printf
+           "receiving %s (%Ld bytes) into %s@."
+           sender_name
+           expected_size
+           out_path;
+         Line_channel.write_line ch "META-OK";
+         let digest = ref Digestif.SHA256.empty in
+         let progress =
+           create_progress ~label:"receiving" ~total:expected_size
+         in
+         update_progress progress 0L;
+         let rec loop next_seq written =
+           match split_words (wait_for_line_or_fail ch) with
+           | [ "DATA"; seq_s; ciphertext_hex; tag_hex ] ->
+             let seq = parse_int64 seq_s in
+             if seq < next_seq
+             then loop next_seq written
+             else if seq > next_seq
+             then
+               failwith
+                 (Printf.sprintf
+                    "out-of-order DATA chunk: expected=%Ld got=%Ld"
+                    next_seq
+                    seq)
+             else
+               let ciphertext = string_of_hex ciphertext_hex in
+               let tag = string_of_hex tag_hex in
+               let plain =
+                 match Pake.decrypt_chunk session ~seq ~ciphertext ~tag with
+                 | Ok x -> x
+                 | Error e -> failwith ("decrypt/auth failure: " ^ e)
+               in
+               output_string oc plain;
+               digest := Digestif.SHA256.feed_string !digest plain;
+               let n = String.length plain in
+               Transfer_stats.on_bytes stats n;
+               let written = Int64.add written (Int64.of_int n) in
+               update_progress progress written;
+               loop (Int64.succ next_seq) written
+           | [ "DONE"; total_s; digest_hex ] ->
+             let total = parse_int64 total_s in
+             let got_digest = Digestif.SHA256.(to_hex (get !digest)) in
+             if
+               total <> written || not (String.equal digest_hex got_digest)
+             then (
+               finish_progress progress written;
+               Line_channel.write_line
+                 ch
+                 (Printf.sprintf
+                    "RECV-BAD total=%Ld digest=%s"
+                    total
+                    got_digest);
+               failwith "integrity check failed")
+             else (
+               finish_progress progress written;
+               Line_channel.write_line ch "RECV-OK";
+               stats)
+           | [ "PEER_LEFT" ] ->
+             failwith "peer disconnected during transfer"
+           | _ -> loop next_seq written
+         in
+         loop 0L 0L)
 
   let perform_pake ~opts ~role ch =
     let my_secret, my_pub = Mirage_crypto_ec.X25519.gen_key () in
@@ -611,9 +904,10 @@ module Client = struct
     wait_for_auth ();
     session
 
-  let do_send env ~sw ~opts ~file =
+  let do_send env ~sw ~opts ~file ~direct =
     let t, stream = connect env ~sw ~opts in
     let transfer_stats : Transfer_stats.t option ref = ref None in
+    let direct_t : Quic_eio.t option ref = ref None in
     let report_stats status =
       match !transfer_stats with
       | None -> ()
@@ -621,6 +915,7 @@ module Client = struct
     in
     Fun.protect
       ~finally:(fun () ->
+        Option.iter Quic_eio.shutdown !direct_t;
         Quic.Stream.close_writer stream;
         Quic_eio.shutdown t)
       (fun () ->
@@ -631,73 +926,35 @@ module Client = struct
              (Printf.sprintf "JOIN %s %s" opts.code (role_to_string Sender));
            wait_for_ready ch;
            let session = perform_pake ~opts ~role:Sender ch in
-           let stat = Unix.stat file in
-           let total_size = Int64.of_int stat.Unix.st_size in
-           let filename = Filename.basename file in
-           Line_channel.write_line
-             ch
-             (Printf.sprintf "META %s %Ld" (hex_of_string filename) total_size);
-           let rec wait_meta_ok () =
-             match wait_for_line_or_fail ch with
-             | "META-OK" -> ()
-             | "PEER_LEFT" ->
-               failwith "peer disconnected before receiving metadata"
-             | _ -> wait_meta_ok ()
+           let send_mode =
+             if not direct
+             then Relay_transfer
+             else (
+               match wait_for_direct_offer ch [] with
+               | No_direct -> Relay_transfer
+               | Direct_candidates candidates ->
+                 (match direct_connect env ~sw candidates with
+                 | Some (direct_conn, direct_ch) ->
+                    direct_t := Some direct_conn;
+                   Format.printf
+                     "using direct peer-to-peer transfer (%d candidates)@."
+                     (List.length candidates);
+                   Line_channel.write_line ch "USE-DIRECT";
+                   Eio.Time.sleep (Eio.Stdenv.clock env) 0.1;
+                   Direct_transfer (direct_conn, direct_ch)
+                 | None ->
+                   Format.eprintf "sender: falling back to relay@.";
+                   Line_channel.write_line ch "FALLBACK-RELAY";
+                   Relay_transfer))
            in
-           wait_meta_ok ();
-           let stats = Transfer_stats.create ~label:"send" ~total:total_size () in
+           let ch =
+             match send_mode with
+             | Relay_transfer -> ch
+             | Direct_transfer (_, direct_ch) -> direct_ch
+           in
+           let stats = send_transfer ~ch ~session ~file in
            transfer_stats := Some stats;
-           let ic = open_in_bin file in
-           Fun.protect
-             ~finally:(fun () -> close_in_noerr ic)
-             (fun () ->
-                let digest = ref Digestif.SHA256.empty in
-                let buf = Bytes.create data_chunk_size in
-                let progress =
-                  create_progress ~label:"sending  " ~total:total_size
-                in
-                update_progress progress 0L;
-                let rec loop seq sent_bytes =
-                  let n = input ic buf 0 (Bytes.length buf) in
-                  if n = 0
-                  then (
-                    finish_progress progress sent_bytes;
-                    let digest_hex = Digestif.SHA256.(to_hex (get !digest)) in
-                    Line_channel.write_line
-                      ch
-                      (Printf.sprintf "DONE %Ld %s" sent_bytes digest_hex);
-                    let rec wait_ack () =
-                      match wait_for_line_or_fail ch with
-                      | "RECV-OK" ->
-                        Format.printf
-                          "sent %Ld bytes from %s successfully@."
-                          sent_bytes
-                          file
-                      | line when String.starts_with ~prefix:"RECV-BAD" line ->
-                        failwith ("receiver reported integrity failure: " ^ line)
-                      | "PEER_LEFT" ->
-                        failwith "peer disconnected before final ack"
-                      | _ -> wait_ack ()
-                    in
-                    wait_ack ();
-                    report_stats "completed")
-                  else
-                    let plain = Bytes.sub_string buf 0 n in
-                    digest := Digestif.SHA256.feed_string !digest plain;
-                    let ciphertext, tag = Pake.encrypt_chunk session ~seq plain in
-                    Line_channel.write_line
-                      ch
-                      (Printf.sprintf
-                         "DATA %Ld %s %s"
-                         seq
-                         (hex_of_string ciphertext)
-                         (hex_of_string tag));
-                    Transfer_stats.on_bytes stats n;
-                    let sent = Int64.add sent_bytes (Int64.of_int n) in
-                    update_progress progress sent;
-                    loop (Int64.succ seq) sent
-                in
-                loop 0L 0L)
+           report_stats "completed"
          with
          | Sys.Break ->
            report_stats "interrupted";
@@ -706,9 +963,14 @@ module Client = struct
            report_stats "failed";
            raise exn)
 
-  let do_recv env ~sw ~opts ~output =
+  let do_recv env ~sw ~opts ~output ~direct_port ~direct_host =
     let t, stream = connect env ~sw ~opts in
     let transfer_stats : Transfer_stats.t option ref = ref None in
+    let direct_listener =
+      Option.map
+        (fun port -> Direct.start_receiver env ~sw ~port ~advertise_host:direct_host)
+        direct_port
+    in
     let report_stats status =
       match !transfer_stats with
       | None -> ()
@@ -726,89 +988,34 @@ module Client = struct
              (Printf.sprintf "JOIN %s %s" opts.code (role_to_string Receiver));
            wait_for_ready ch;
            let session = perform_pake ~opts ~role:Receiver ch in
-           let rec wait_meta () =
-             match split_words (wait_for_line_or_fail ch) with
-             | [ "META"; name_hex; size_s ] ->
-               string_of_hex name_hex, parse_int64 size_s
-             | [ "PEER_LEFT" ] -> failwith "peer disconnected before metadata"
-             | _ -> wait_meta ()
+           (match direct_listener with
+            | None -> Line_channel.write_line ch "NO-DIRECT"
+            | Some listener ->
+             Format.printf
+               "awaiting direct peer connection on udp port %d@."
+               listener.port;
+             send_direct_candidates
+               ch
+               (List.map (fun host -> host, listener.port) listener.hosts));
+           let recv_ch =
+             match direct_listener with
+              | None -> ch
+              | Some listener ->
+                (match wait_for_mode_or_fail ch with
+                | `Relay -> ch
+                | `Direct ->
+                 let direct_ch =
+                   match Direct.await_stream env listener ~timeout_s:10.0 with
+                   | Some ch -> ch
+                   | None -> failwith "timed out waiting for direct connection"
+                 in
+                 direct_ch)
            in
-           let sender_name, expected_size = wait_meta () in
-           let out_path = Option.value output ~default:("recv-" ^ sender_name) in
-           let stats =
-             Transfer_stats.create ~label:"recv" ~total:expected_size ()
-           in
+           let stats = recv_transfer ~ch:recv_ch ~session ~output in
            transfer_stats := Some stats;
-           let oc = open_out_bin out_path in
-           Fun.protect
-             ~finally:(fun () -> close_out_noerr oc)
-             (fun () ->
-                Format.printf
-                  "receiving %s (%Ld bytes) into %s@."
-                  sender_name
-                  expected_size
-                  out_path;
-                Line_channel.write_line ch "META-OK";
-                let digest = ref Digestif.SHA256.empty in
-                let progress =
-                  create_progress ~label:"receiving" ~total:expected_size
-                in
-                update_progress progress 0L;
-                let rec loop next_seq written =
-                  match split_words (wait_for_line_or_fail ch) with
-                  | [ "DATA"; seq_s; ciphertext_hex; tag_hex ] ->
-                    let seq = parse_int64 seq_s in
-                    if seq < next_seq
-                    then
-                      (* Duplicate DATA chunk (e.g. due retransmission) *)
-                      loop next_seq written
-                    else if seq > next_seq
-                    then
-                      failwith
-                        (Printf.sprintf
-                           "out-of-order DATA chunk: expected=%Ld got=%Ld"
-                           next_seq
-                           seq)
-                    else
-                      let ciphertext = string_of_hex ciphertext_hex in
-                      let tag = string_of_hex tag_hex in
-                      let plain =
-                        match Pake.decrypt_chunk session ~seq ~ciphertext ~tag with
-                        | Ok x -> x
-                        | Error e -> failwith ("decrypt/auth failure: " ^ e)
-                      in
-                      output_string oc plain;
-                      digest := Digestif.SHA256.feed_string !digest plain;
-                      let n = String.length plain in
-                      Transfer_stats.on_bytes stats n;
-                      let written = Int64.add written (Int64.of_int n) in
-                      update_progress progress written;
-                      loop (Int64.succ next_seq) written
-                  | [ "DONE"; total_s; digest_hex ] ->
-                    let total = parse_int64 total_s in
-                    let got_digest = Digestif.SHA256.(to_hex (get !digest)) in
-                    if
-                      total <> written || not (String.equal digest_hex got_digest)
-                    then (
-                      finish_progress progress written;
-                      Line_channel.write_line
-                        ch
-                        (Printf.sprintf
-                           "RECV-BAD total=%Ld digest=%s"
-                           total
-                           got_digest);
-                      failwith "integrity check failed")
-                    else (
-                      finish_progress progress written;
-                      Line_channel.write_line ch "RECV-OK";
-                      Eio.Time.sleep (Eio.Stdenv.clock env) 0.1;
-                      Format.printf "received %Ld bytes successfully@." written;
-                      report_stats "completed")
-                  | [ "PEER_LEFT" ] ->
-                    failwith "peer disconnected during transfer"
-                  | _ -> loop next_seq written
-                in
-                loop 0L 0L)
+           Eio.Time.sleep (Eio.Stdenv.clock env) 0.1;
+           Format.printf "received %Ld bytes successfully@." stats.bytes;
+           report_stats "completed"
          with
          | Sys.Break ->
            report_stats "interrupted";
@@ -826,6 +1033,7 @@ type send_opts =
   ; code : string option
   ; password : string option
   ; file : string option
+  ; direct : bool
   }
 
 type recv_opts =
@@ -834,10 +1042,18 @@ type recv_opts =
   ; code : string option
   ; password : string option
   ; output : string option
+  ; direct_port : int option
+  ; direct_host : string option
   }
 
 let default_send_opts =
-  { host = "localhost"; port = 4443; code = None; password = None; file = None }
+  { host = "localhost"
+  ; port = 4443
+  ; code = None
+  ; password = None
+  ; file = None
+  ; direct = false
+  }
 
 let default_recv_opts =
   { host = "localhost"
@@ -845,6 +1061,8 @@ let default_recv_opts =
   ; code = None
   ; password = None
   ; output = None
+  ; direct_port = None
+  ; direct_host = None
   }
 
 let parse_relay_args argv =
@@ -880,6 +1098,7 @@ let parse_send_args argv =
     ; ( "-file"
       , Arg.String (fun v -> set (fun o x -> { o with file = Some x }) v)
       , " Path to file to send" )
+    ; "-direct", Arg.Unit (fun () -> opts := { !opts with direct = true }), " Attempt direct peer-to-peer transfer first"
     ]
     (fun _ -> raise (Arg.Bad "send does not accept positional arguments"))
     "wormhole_quic_pake send -code CODE -password PASS -file PATH [-host HOST] \
@@ -908,6 +1127,12 @@ let parse_recv_args argv =
     ; ( "-out"
       , Arg.String (fun v -> set (fun o x -> { o with output = Some x }) v)
       , " Output path (default: recv-<name>)" )
+    ; ( "-direct-port"
+      , Arg.Int (fun v -> set (fun o x -> { o with direct_port = Some x }) v)
+      , " Listen on this UDP port for direct peer-to-peer transfer" )
+    ; ( "-direct-host"
+      , Arg.String (fun v -> set (fun o x -> { o with direct_host = Some x }) v)
+      , " Additional host/IP candidate to advertise for direct transfer" )
     ]
     (fun _ -> raise (Arg.Bad "recv does not accept positional arguments"))
     "wormhole_quic_pake recv -code CODE -password PASS [-out PATH] [-host \
@@ -950,7 +1175,8 @@ let () =
       in
       let file = get_required "file" send_opts.file in
       Eio_main.run (fun env ->
-        Eio.Switch.run (fun sw -> Client.do_send env ~sw ~opts ~file))
+        Eio.Switch.run (fun sw ->
+          Client.do_send env ~sw ~opts ~file ~direct:send_opts.direct))
     | "recv" ->
       let recv_opts = parse_recv_args Sys.argv in
       let opts =
@@ -962,7 +1188,13 @@ let () =
       in
       Eio_main.run (fun env ->
         Eio.Switch.run (fun sw ->
-          Client.do_recv env ~sw ~opts ~output:recv_opts.output))
+          Client.do_recv
+            env
+            ~sw
+            ~opts
+            ~output:recv_opts.output
+            ~direct_port:recv_opts.direct_port
+            ~direct_host:recv_opts.direct_host))
     | _ -> usage ()
   in
   try run () with
