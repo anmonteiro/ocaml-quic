@@ -93,31 +93,50 @@ module Packet_number = struct
 
   let insert_for_acking t packet_number =
     let cutoff = Int64.sub packet_number ack_history_window in
-    let pruned = prune_ranges ~cutoff t.received_need_ack in
-    let rec insert acc = function
-      | [] ->
-        List.rev
-          ({ Frame.Range.first = packet_number; last = packet_number } :: acc)
-      | ({ Frame.Range.first; last; _ } as range) :: rest ->
-        if Int64.compare packet_number (Int64.add last 1L) > 0
-        then
-          List.rev_append
-            acc
-            ({ Frame.Range.first = packet_number; last = packet_number }
-             :: range
-             :: rest)
-        else if Int64.compare packet_number (Int64.sub first 1L) >= 0
-        then (
-          let merged =
-            { Frame.Range.first = min first packet_number
-            ; last = max last packet_number
-            }
-          in
-          let merged, rest = merge_following_ranges merged rest in
-          List.rev_append acc (merged :: rest))
-        else insert (range :: acc) rest
-    in
-    t.received_need_ack <- insert [] pruned
+    match t.received_need_ack with
+    | [] ->
+      t.received_need_ack <-
+        [ { Frame.Range.first = packet_number; last = packet_number } ]
+    | { Frame.Range.first; last } :: rest
+      when Int64.compare packet_number (Int64.add last 1L) = 0 ->
+      let newest =
+        { Frame.Range.first =
+            if Int64.compare first cutoff < 0 then cutoff else first
+        ; last = packet_number
+        }
+      in
+      let rest =
+        match rest with
+        | [] -> []
+        | _ -> prune_ranges ~cutoff rest
+      in
+      t.received_need_ack <- newest :: rest
+    | ranges ->
+      let pruned = prune_ranges ~cutoff ranges in
+      let rec insert acc = function
+        | [] ->
+          List.rev
+            ({ Frame.Range.first = packet_number; last = packet_number } :: acc)
+        | ({ Frame.Range.first; last; _ } as range) :: rest ->
+          if Int64.compare packet_number (Int64.add last 1L) > 0
+          then
+            List.rev_append
+              acc
+              ({ Frame.Range.first = packet_number; last = packet_number }
+               :: range
+               :: rest)
+          else if Int64.compare packet_number (Int64.sub first 1L) >= 0
+          then (
+            let merged =
+              { Frame.Range.first = min first packet_number
+              ; last = max last packet_number
+              }
+            in
+            let merged, rest = merge_following_ranges merged rest in
+            List.rev_append acc (merged :: rest))
+          else insert (range :: acc) rest
+      in
+      t.received_need_ack <- insert [] pruned
 
   let rec take n acc = function
     | _ when n <= 0 -> List.rev acc
@@ -212,6 +231,8 @@ module Connection = struct
     ; queued_packets : (Writer.header_info * Frame.t list) Queue.t
     ; writer : Writer.t
     ; streams : (Stream_id.t, Stream.t) Hashtbl.t
+    ; mutable last_stream_id : Stream_id.t option
+    ; mutable last_stream : Stream.t option
     ; ready_streams : Stream_id.t Queue.t
     ; ready_streams_set : (Stream_id.t, unit) Hashtbl.t
     ; mutable handler : handler
@@ -243,6 +264,26 @@ module Connection = struct
       let (F _ as handler_f : stream_handler) = f ~cid ~start_stream in
       t.handler <- Initialized handler_f
     | Initialized _ -> ()
+
+  let find_stream t stream_id =
+    match t.last_stream_id, t.last_stream with
+    | Some cached_id, Some stream when cached_id = stream_id -> Some stream
+    | _ ->
+      let stream = Hashtbl.find_opt t.streams stream_id in
+      (match stream with
+      | Some stream ->
+        t.last_stream_id <- Some stream_id;
+        t.last_stream <- Some stream
+      | None -> ());
+      stream
+
+  let remove_stream t stream_id =
+    Hashtbl.remove t.streams stream_id;
+    match t.last_stream_id with
+    | Some cached_id when cached_id = stream_id ->
+      t.last_stream_id <- None;
+      t.last_stream <- None
+    | _ -> ()
 
   type packet_info =
     { packet_number : int64
@@ -458,7 +499,7 @@ module Connection = struct
     if is_send_only_stream
     then report_error t ~frame_type:Reset_stream Stream_state_error
     else
-      match Hashtbl.find_opt t.streams stream_id with
+      match find_stream t stream_id with
       | Some stream ->
         (match stream.typ, t.mode with
         | Client Unidirectional, Client | Server Unidirectional, Server ->
@@ -472,7 +513,7 @@ module Connection = struct
           (* TODO: stream state transitions 3.1 / 3.2 *)
           stream.error_handler application_error;
 
-          Hashtbl.remove t.streams stream_id)
+          remove_stream t stream_id)
       | None -> ()
 
   (* TODO: Receiving a STOP_SENDING frame for a locally initiated stream that *)
@@ -494,7 +535,7 @@ module Connection = struct
         ~frame_type:Frame.Type.Stop_sending
         Error.Stream_state_error
     else
-      match Hashtbl.find_opt t.streams stream_id with
+      match find_stream t stream_id with
       | Some stream ->
         (match stream.typ, t.mode with
         | Client Unidirectional, Server | Server Unidirectional, Client ->
@@ -919,12 +960,22 @@ module Connection = struct
           c.wakeup_writer ())
     in
     Hashtbl.add c.streams id stream;
+    c.last_stream_id <- Some id;
+    c.last_stream <- Some stream;
     stream
 
   let process_stream_frame c ~encryption_level ~id ~fragment ~is_fin =
-    let stream_frame_type =
-      Frame.Type.Stream
-        { off = fragment.Frame.off <> 0; len = fragment.len <> 0; fin = is_fin }
+    let report_stream_error error =
+      report_error
+        c
+        ~frame_type:
+          (Frame.Type.Stream
+             { off = fragment.Frame.off <> 0
+             ; len = fragment.len <> 0
+             ; fin = is_fin
+             })
+        ~encryption_level
+        error
     in
     let direction = Direction.classify id in
     let is_locally_initiated =
@@ -932,7 +983,7 @@ module Connection = struct
       | Server -> Stream_id.is_server_initiated id
       | Client -> Stream_id.is_client_initiated id
     in
-    let stream_opt = Hashtbl.find_opt c.streams id in
+    let stream_opt = find_stream c id in
     let stream_exists = Option.is_some stream_opt in
     let is_peer_initiated = not is_locally_initiated in
     let stream_count = Int64.add (Int64.shift_right_logical id 2) 1L in
@@ -946,35 +997,16 @@ module Connection = struct
       Int64.add (Int64.of_int fragment.Frame.off) (Int64.of_int fragment.len)
     in
     if is_locally_initiated && not stream_exists
-    then
-      report_error
-        c
-        ~frame_type:stream_frame_type
-        ~encryption_level
-        Stream_state_error
+    then report_stream_error Stream_state_error
     else if is_peer_initiated && Int64.compare stream_count max_peer_streams > 0
-    then
-      report_error
-        c
-        ~frame_type:stream_frame_type
-        ~encryption_level
-        Stream_limit_error
+    then report_stream_error Stream_limit_error
     else
       match recv_window with
       | None ->
-        report_error
-          c
-          ~frame_type:stream_frame_type
-          ~encryption_level
-          Stream_state_error
+        report_stream_error Stream_state_error
       | Some recv_window ->
         if Int64.compare stream_final_offset recv_window > 0
-        then
-          report_error
-            c
-            ~frame_type:stream_frame_type
-            ~encryption_level
-            Flow_control_error
+        then report_stream_error Flow_control_error
         else
           let prev_stream_highest =
             Hashtbl.find_opt c.recv_stream_highest_offsets id
@@ -990,12 +1022,7 @@ module Connection = struct
             Int64.add c.recv_data_bytes connection_bytes_delta
           in
           if Int64.compare next_recv_data_bytes c.max_recv_data > 0
-          then
-            report_error
-              c
-              ~frame_type:stream_frame_type
-              ~encryption_level
-              Flow_control_error
+          then report_stream_error Flow_control_error
           else (
             c.recv_data_bytes <- next_recv_data_bytes;
             Hashtbl.replace c.recv_stream_highest_offsets id new_stream_highest;
@@ -1040,7 +1067,7 @@ module Connection = struct
     then
       report_error t ~frame_type:Frame.Type.Max_stream_data Stream_state_error
     else
-      match Hashtbl.find_opt t.streams stream_id with
+      match find_stream t stream_id with
       | None ->
         if is_locally_initiated
         then
@@ -1300,6 +1327,8 @@ module Connection = struct
       ; queued_packets = Queue.create ()
       ; writer = Writer.create 0x1000
       ; streams = Hashtbl.create ~random:true 1024
+      ; last_stream_id = None
+      ; last_stream = None
       ; ready_streams = Queue.create ()
       ; ready_streams_set = Hashtbl.create ~random:true 128
       ; handler = Uninitialized connection_handler
@@ -2083,7 +2112,7 @@ let packet_handler t ?error packet =
                   in
                   Stream.Send.remove off crypto_stream.send
                 | Stream { id; fragment = { Frame.off; _ }; _ } ->
-                  (match Hashtbl.find_opt c.streams id with
+                  (match Connection.find_stream c id with
                   | Some stream -> Stream.Send.remove off stream.send
                   | None -> ())
                 | Ack { ranges = _; _ } ->
