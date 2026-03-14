@@ -735,10 +735,9 @@ module Connection = struct
         ~new_tls_state:tls_state
         ~tls_packets
 
-  let rec exhaust_crypto_stream t ~packet_info ~(stream : Stream.t) =
+  let exhaust_crypto_stream t ~packet_info ~(stream : Stream.t) =
     let { encryption_level; _ } = packet_info in
-    match Stream.Recv.pop stream.recv with
-    | Some { payload; payload_off; len; _ } ->
+    Stream.Recv.drain stream.recv ~f:(fun { payload; payload_off; len; _ } ->
       let fragment_cstruct =
         if payload_off = 0 && len = String.length payload
         then payload
@@ -774,9 +773,7 @@ module Connection = struct
           fragment_cstruct
       | Initial | Handshake | Application_data ->
         handle_crypto_record t ~frame_type:Crypto fragment_cstruct
-      | Zero_RTT -> ());
-      exhaust_crypto_stream t ~packet_info ~stream
-    | None -> ()
+      | Zero_RTT -> ()))
 
   let process_crypto_frame t ~packet_info fragment =
     let { encryption_level; _ } = packet_info in
@@ -789,10 +786,7 @@ module Connection = struct
     Stream.Recv.push fragment ~is_fin:false crypto_stream.recv;
     exhaust_crypto_stream t ~packet_info ~stream:crypto_stream
 
-  let rec process_stream_data t ~stream =
-    match Stream.Recv.pop stream with
-    | Some _ -> process_stream_data t ~stream
-    | None -> ()
+  let process_stream_data _t ~stream = Stream.Recv.drain stream ~f:ignore
 
   let int64_of_nonnegative n = if n < 0 then 0L else Int64.of_int n
 
@@ -929,7 +923,8 @@ module Connection = struct
 
   let process_stream_frame c ~encryption_level ~id ~fragment ~is_fin =
     let stream_frame_type =
-      Frame.to_frame_type (Frame.Stream { id; fragment; is_fin })
+      Frame.Type.Stream
+        { off = fragment.Frame.off <> 0; len = fragment.len <> 0; fin = is_fin }
     in
     let direction = Direction.classify id in
     let is_locally_initiated =
@@ -937,7 +932,8 @@ module Connection = struct
       | Server -> Stream_id.is_server_initiated id
       | Client -> Stream_id.is_client_initiated id
     in
-    let stream_exists = Hashtbl.mem c.streams id in
+    let stream_opt = Hashtbl.find_opt c.streams id in
+    let stream_exists = Option.is_some stream_opt in
     let is_peer_initiated = not is_locally_initiated in
     let stream_count = Int64.add (Int64.shift_right_logical id 2) 1L in
     let max_peer_streams =
@@ -1004,7 +1000,7 @@ module Connection = struct
             c.recv_data_bytes <- next_recv_data_bytes;
             Hashtbl.replace c.recv_stream_highest_offsets id new_stream_highest;
             let stream =
-              match Hashtbl.find_opt c.streams id with
+              match stream_opt with
               | Some stream -> stream
               | None ->
                 let stream =

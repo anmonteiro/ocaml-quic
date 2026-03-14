@@ -277,6 +277,54 @@ module Recv = struct
           Some fragment))
     | None -> None
 
+  let drain t ~f =
+    let close_if_finished () =
+      if not (Buffer.is_closed t.consumer)
+      then
+        match t.fin_offset with
+        | Some fin_offset when fin_offset = t.offset -> Buffer.close_reader t.consumer
+        | _ -> ()
+    in
+    let rec loop () =
+      match Q.pop t.q with
+      | Some ((off, fragment), q') ->
+        if off > t.offset
+        then ()
+        else (
+          t.q <- q';
+          let fragment =
+            if off = t.offset || fragment.len = 0
+            then fragment
+            else
+              let drop_prefix = t.offset - off in
+              let len = fragment.len - drop_prefix in
+              { Frame.off = t.offset
+              ; len
+              ; payload = fragment.payload
+              ; payload_off = fragment.payload_off + drop_prefix
+              }
+          in
+          if fragment.len = 0
+          then (
+            close_if_finished ();
+            loop ())
+          else (
+            t.offset <- t.offset + fragment.len;
+            if not (Buffer.is_closed t.consumer)
+            then (
+              Buffer.write_string
+                t.consumer
+                ~off:fragment.payload_off
+                ~len:fragment.len
+                fragment.payload;
+              flush t;
+              close_if_finished ());
+            f fragment;
+            loop ()))
+      | None -> ()
+    in
+    loop ()
+
   let remove off t =
     let q' = Q.remove off t.q in
     t.q <- q'
