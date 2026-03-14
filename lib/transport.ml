@@ -34,11 +34,11 @@ module Reader = Fast_parse.Reader
 module Writer = Serialize.Writer
 
 module Packet_number = struct
-  let max_ack_ranges = 256
-  let ack_history_window = 65536L
+  let max_ack_ranges = 32
+  let ack_history_window = 4096L
   let delayed_ack_packet_threshold = 2
   let delayed_ack_timeout_ms = 25L
-  let aggressive_ack_window_packets = 1024
+  let aggressive_ack_window_packets = 8
 
   type t =
     { mutable sent : int64
