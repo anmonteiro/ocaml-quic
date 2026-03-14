@@ -48,6 +48,7 @@ let () =
     { Quic.Config.certificates
     ; alpn_protocols = [ "h3"; "h3-30"; "h3-29" ]
     ; transport_parameters = Quic.Config.default_transport_parameters
+    ; max_datagram_size = Quic.Config.default_max_datagram_size
     }
   in
   Lwt.async (fun () ->

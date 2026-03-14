@@ -30,6 +30,7 @@ let () =
     { Quic.Config.certificates
     ; alpn_protocols = [ "http/0.9" ]
     ; transport_parameters = Quic.Config.default_transport_parameters
+    ; max_datagram_size = Quic.Config.default_max_datagram_size
     }
   in
   Eio_main.run (fun env ->

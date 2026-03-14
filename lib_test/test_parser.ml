@@ -20,7 +20,15 @@ let decrypt_stub ~payload_length:_ ~header:_ buf ~off ~len =
     }
 
 let decrypt_stub_fast ~payload_length ~header ~header_prefix_len:_ buf ~off ~len =
-  decrypt_stub ~payload_length ~header buf ~off ~len
+  match decrypt_stub ~payload_length ~header buf ~off ~len with
+  | Some ret ->
+    Some
+      { Crypto.AEAD.packet_number = ret.packet_number
+      ; first_byte_unprotected = Char.code ret.header.[0]
+      ; plaintext = ret.plaintext
+      ; pn_length = ret.pn_length
+      }
+  | None -> None
 
 let test_parser () =
   let buffer = Bigstringaf.of_string ~off:0 ~len:(String.length plaintext) plaintext in

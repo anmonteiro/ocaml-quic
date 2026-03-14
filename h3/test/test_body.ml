@@ -30,6 +30,7 @@ let config =
   { Quic.Config.certificates = server_certificates ()
   ; alpn_protocols = [ "h3" ]
   ; transport_parameters = Quic.Config.default_transport_parameters
+  ; max_datagram_size = Quic.Config.default_max_datagram_size
   }
 
 let copy_iovecs_to_bigstring iovecs =

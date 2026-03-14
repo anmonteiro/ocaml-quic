@@ -277,16 +277,67 @@ module Recv = struct
           Some fragment))
     | None -> None
 
+  let drain t ~f =
+    let close_if_finished () =
+      if not (Buffer.is_closed t.consumer)
+      then
+        match t.fin_offset with
+        | Some fin_offset when fin_offset = t.offset -> Buffer.close_reader t.consumer
+        | _ -> ()
+    in
+    let rec loop () =
+      match Q.pop t.q with
+      | Some ((off, fragment), q') ->
+        if off > t.offset
+        then ()
+        else (
+          t.q <- q';
+          let fragment =
+            if off = t.offset || fragment.len = 0
+            then fragment
+            else
+              let drop_prefix = t.offset - off in
+              let len = fragment.len - drop_prefix in
+              { Frame.off = t.offset
+              ; len
+              ; payload = fragment.payload
+              ; payload_off = fragment.payload_off + drop_prefix
+              }
+          in
+          if fragment.len = 0
+          then (
+            close_if_finished ();
+            loop ())
+          else (
+            t.offset <- t.offset + fragment.len;
+            if not (Buffer.is_closed t.consumer)
+            then (
+              Buffer.write_string
+                t.consumer
+                ~off:fragment.payload_off
+                ~len:fragment.len
+                fragment.payload;
+              flush t;
+              close_if_finished ());
+            f fragment;
+            loop ()))
+      | None -> ()
+    in
+    loop ()
+
   let remove off t =
     let q' = Q.remove off t.q in
     t.q <- q'
 end
 
 module Send = struct
+  let max_buffered_bytes = 4 * 1024 * 1024
+
   type t =
     { mutable deferred : Q.t
     ; fresh : Frame.fragment Queue.t
     ; mutable offset : int (* TODO: int64? *)
+    ; mutable buffered_bytes : int
     ; producer : Buffer.t
     ; mutable fin_offset : int option
     }
@@ -306,6 +357,7 @@ module Send = struct
     let fragment = { Frame.off = t.offset; len; payload; payload_off = 0 } in
     Queue.add fragment t.fresh;
     t.offset <- t.offset + len;
+    t.buffered_bytes <- t.buffered_bytes + len;
     fragment
 
   let pop t =
@@ -313,9 +365,15 @@ module Send = struct
       match Q.pop t.deferred with
       | Some ((_off, fragment), q') ->
         t.deferred <- q';
+        t.buffered_bytes <- t.buffered_bytes - fragment.len;
         Some fragment
       | None ->
-        if Queue.is_empty t.fresh then None else Some (Queue.take t.fresh)
+        if Queue.is_empty t.fresh
+        then None
+        else (
+          let fragment = Queue.take t.fresh in
+          t.buffered_bytes <- t.buffered_bytes - fragment.len;
+          Some fragment)
     in
     match next_fragment () with
     | Some fragment ->
@@ -335,17 +393,22 @@ module Send = struct
     | None -> failwith "Quic.Stream.Send.pop_exn"
 
   let remove off t =
-    let q' = Q.remove off t.deferred in
-    t.deferred <- q'
+    match Q.find off t.deferred with
+    | Some fragment ->
+      t.buffered_bytes <- t.buffered_bytes - fragment.len;
+      t.deferred <- Q.remove off t.deferred
+    | None -> ()
 
   let requeue fragment t =
     let q' = Q.add fragment.Frame.off fragment t.deferred in
-    t.deferred <- q'
+    t.deferred <- q';
+    t.buffered_bytes <- t.buffered_bytes + fragment.len
 
   let create when_ready =
     { deferred = Q.empty
     ; fresh = Queue.create ()
     ; offset = 0
+    ; buffered_bytes = 0
     ; producer =
         (* TODO: configurable size? *)
         Buffer.create (Bigstringaf.create 0x1000) when_ready
@@ -355,7 +418,9 @@ module Send = struct
   let has_pending_output t =
     (* Force another write poll to make sure that a frame with the fin bit set
        is sent. *)
-    not (Q.is_empty t.deferred) || not (Queue.is_empty t.fresh)
+    not (Q.is_empty t.deferred)
+    || not (Queue.is_empty t.fresh)
+    || Buffer.has_pending_output t.producer
 
   (* TODO: this is probably not needed? *)
   (* || Option.is_none t.fin_offset *)
@@ -373,23 +438,27 @@ module Send = struct
       0
     | `Writev iovecs ->
       let lengthv = IOVec.lengthv iovecs in
-      let writev_len = if max_bytes < lengthv then max_bytes else lengthv in
-      let remaining = ref writev_len in
-      List.iter
-        (fun { IOVec.buffer; off; len } ->
-           if !remaining > 0
-           then
-             let take = min len !remaining in
-             if take > 0
-             then (
-               (* Copy before shifting Faraday's internal buffer; otherwise
-                  queued fragments can alias mutable storage and get corrupted. *)
-               let fragment = Bigstringaf.substring buffer ~off ~len:take in
-               ignore (push fragment t : Frame.fragment);
-               remaining := !remaining - take))
-        iovecs;
-      Faraday.shift faraday writev_len;
-      writev_len
+      let room = max 0 (max_buffered_bytes - t.buffered_bytes) in
+      let writev_len = min room (min max_bytes lengthv) in
+      if writev_len = 0
+      then 0
+      else (
+        let remaining = ref writev_len in
+        List.iter
+          (fun { IOVec.buffer; off; len } ->
+             if !remaining > 0
+             then
+               let take = min len !remaining in
+               if take > 0
+               then (
+                 (* Copy before shifting Faraday's internal buffer; otherwise
+                    queued fragments can alias mutable storage and get corrupted. *)
+                 let fragment = Bigstringaf.substring buffer ~off ~len:take in
+                 ignore (push fragment t : Frame.fragment);
+                 remaining := !remaining - take))
+          iovecs;
+        Faraday.shift faraday writev_len;
+        writev_len)
 
   let final_size t =
     (* From RFC9000§4.5:

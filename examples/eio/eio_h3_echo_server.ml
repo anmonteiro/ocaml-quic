@@ -183,6 +183,8 @@ let () =
   let serve_file = ref None in
   let upload_out = ref None in
   let chunk_size = ref max_data_chunk_size in
+  let max_dgram_size = ref Quic.Config.default_max_datagram_size in
+  let udp_connect_first_peer = ref false in
   let drop_recv_pct = ref 0.0 in
   let drop_send_pct = ref 0.0 in
   let drop_handshake = ref false in
@@ -200,6 +202,12 @@ let () =
       , Printf.sprintf
           " File transfer chunk size in bytes (max %d)"
           max_data_chunk_size )
+    ; ( "-max-dgram-size"
+      , Arg.Set_int max_dgram_size
+      , " Max QUIC datagram size override for benchmarking (default 1200)" )
+    ; ( "-udp-connect-first-peer"
+      , Arg.Set udp_connect_first_peer
+      , " Connect the UDP socket to the first peer for single-client benchmarking" )
     ; ( "-drop-recv-pct"
       , Arg.Set_float drop_recv_pct
       , " Drop percentage for received UDP datagrams (0.0-100.0, default 0.0)" )
@@ -225,6 +233,8 @@ let () =
   then failwith "-drop-recv-pct must be between 0.0 and 100.0";
   if !drop_send_pct < 0.0 || !drop_send_pct > 100.0
   then failwith "-drop-send-pct must be between 0.0 and 100.0";
+  if !max_dgram_size < Quic.Config.default_max_datagram_size
+  then failwith "-max-dgram-size must be >= 1200";
   let listen_address = `Udp (Eio.Net.Ipaddr.V4.any, !port) in
   let certificates =
     let cert = "./certificates/server.pem" in
@@ -234,6 +244,7 @@ let () =
   let transport_parameters =
     Quic.Config.
       { initial_max_data = 1 lsl 26
+      ; max_idle_timeout = 30_000
       ; initial_max_stream_data_bidi_local = 1 lsl 26
       ; initial_max_stream_data_bidi_remote = 1 lsl 26
       ; initial_max_stream_data_uni = 1 lsl 26
@@ -245,6 +256,7 @@ let () =
     { Quic.Config.certificates
     ; alpn_protocols = [ "h3" ]
     ; transport_parameters
+    ; max_datagram_size = !max_dgram_size
     }
   in
   let rng = Random.State.make [| !drop_seed |] in
@@ -294,7 +306,8 @@ let () =
   in
   Format.eprintf
     "listening on UDP %d (drop_recv_pct=%.2f drop_send_pct=%.2f \
-     drop_handshake=%b seed=%d serve_file=%s upload_out=%s chunk_size=%d)@."
+     drop_handshake=%b seed=%d serve_file=%s upload_out=%s chunk_size=%d \
+     udp_connect_first_peer=%b)@."
     !port
     !drop_recv_pct
     !drop_send_pct
@@ -302,7 +315,8 @@ let () =
     !drop_seed
     (Option.value !serve_file ~default:"<none>")
     (Option.value !upload_out ~default:"<discard>")
-    !chunk_size;
+    !chunk_size
+    !udp_connect_first_peer;
   Eio_main.run (fun env ->
     Eio.Switch.run (fun sw ->
       let handler =
@@ -318,6 +332,7 @@ let () =
              env
              ~sw
              ~should_drop
+             ~udp_connect_first_peer:!udp_connect_first_peer
              ~config
              listen_address
              handler)
@@ -328,6 +343,7 @@ let () =
                env
                ~sw
                ~should_drop
+               ~udp_connect_first_peer:!udp_connect_first_peer
                ~config
                listen_address_v6
                handler

@@ -89,6 +89,8 @@ let write_variable_length_integer t n =
     write_byte 0
   | _ -> assert false
 
+module Frame_desc = Frame
+
 module Frame = struct
   let padding = Bigstringaf.of_string ~off:0 ~len:1 "\x00"
 
@@ -496,7 +498,319 @@ module Writer = struct
       Long { version; source_cid; dest_cid; packet_type = Handshake }
     | Application_data -> Short { dest_cid }
 
-  let write_frames_packet t ~header_info frames =
+  let write_uint8_bytes buf off byte =
+    Bytes.set_uint8 buf off byte;
+    off + 1
+
+  let write_uint32_be_bytes buf off n =
+    let n = Int32.to_int n in
+    let off = write_uint8_bytes buf off ((n lsr 24) land 0xff) in
+    let off = write_uint8_bytes buf off ((n lsr 16) land 0xff) in
+    let off = write_uint8_bytes buf off ((n lsr 8) land 0xff) in
+    write_uint8_bytes buf off (n land 0xff)
+
+  let write_string_bytes buf off s =
+    Bytes.blit_string s 0 buf off (String.length s);
+    off + String.length s
+
+  let write_string_slice_bytes buf off s ~src_off ~len =
+    Bytes.blit_string s src_off buf off len;
+    off + len
+
+  let write_bigstring_bytes buf off bs ~src_off ~len =
+    Bigstringaf.blit_to_bytes bs ~src_off buf ~dst_off:off ~len;
+    off + len
+
+  let write_varint_bytes buf off n =
+    let encoding_bytes, encoding =
+      if n < 1 lsl 6
+      then 1, 0
+      else if n < 1 lsl 14
+      then 2, 1
+      else if n < 1 lsl 30
+      then 4, 2
+      else 8, 3
+    in
+    match encoding_bytes with
+    | 1 -> write_uint8_bytes buf off ((encoding lsl 6) lor n)
+    | 2 ->
+      let off =
+        write_uint8_bytes buf off ((encoding lsl 6) lor ((n lsr 8) land 0x3f))
+      in
+      write_uint8_bytes buf off (n land 0xff)
+    | 4 ->
+      let off =
+        write_uint8_bytes buf off ((encoding lsl 6) lor ((n lsr 24) land 0x3f))
+      in
+      let off = write_uint8_bytes buf off ((n lsr 16) land 0xff) in
+      let off = write_uint8_bytes buf off ((n lsr 8) land 0xff) in
+      write_uint8_bytes buf off (n land 0xff)
+    | 8 ->
+      let off =
+        write_uint8_bytes buf off ((encoding lsl 6) lor ((n lsr 56) land 0x3f))
+      in
+      let off = write_uint8_bytes buf off ((n lsr 48) land 0xff) in
+      let off = write_uint8_bytes buf off ((n lsr 40) land 0xff) in
+      let off = write_uint8_bytes buf off ((n lsr 32) land 0xff) in
+      let off = write_uint8_bytes buf off ((n lsr 24) land 0xff) in
+      let off = write_uint8_bytes buf off ((n lsr 16) land 0xff) in
+      let off = write_uint8_bytes buf off ((n lsr 8) land 0xff) in
+      write_uint8_bytes buf off (n land 0xff)
+    | _ -> assert false
+
+  let cid_encoded_length cid = 1 + CID.length cid
+
+  let header_base_length header =
+    match header with
+    | Packet.Header.Initial { token; source_cid; dest_cid; _ } ->
+      1
+      + 4
+      + cid_encoded_length dest_cid
+      + cid_encoded_length source_cid
+      + varint_encoding_length (String.length token)
+      + String.length token
+    | Long { source_cid; dest_cid; packet_type = Initial | Zero_RTT | Handshake; _ } ->
+      1 + 4 + cid_encoded_length dest_cid + cid_encoded_length source_cid
+    | Short { dest_cid } -> 1 + CID.length dest_cid
+    | Long { packet_type = Retry; _ } -> assert false
+
+  let write_connection_ids_bytes buf off ~source_cid ~dest_cid =
+    let off = write_uint8_bytes buf off (CID.length dest_cid) in
+    let off = write_string_bytes buf off (CID.to_string dest_cid) in
+    let off = write_uint8_bytes buf off (CID.length source_cid) in
+    write_string_bytes buf off (CID.to_string source_cid)
+
+  let write_packet_number_bytes buf off ~pn_length ~packet_number =
+    let packet_number =
+      Int64.to_int (Int64.logand packet_number 0xFFFFFFFFL)
+    in
+    match pn_length with
+    | 1 -> write_uint8_bytes buf off packet_number
+    | 2 ->
+      let off = write_uint8_bytes buf off ((packet_number lsr 8) land 0xff) in
+      write_uint8_bytes buf off (packet_number land 0xff)
+    | 3 ->
+      let off = write_uint8_bytes buf off ((packet_number lsr 16) land 0xff) in
+      let off = write_uint8_bytes buf off ((packet_number lsr 8) land 0xff) in
+      write_uint8_bytes buf off (packet_number land 0xff)
+    | 4 ->
+      let off = write_uint8_bytes buf off ((packet_number lsr 24) land 0xff) in
+      let off = write_uint8_bytes buf off ((packet_number lsr 16) land 0xff) in
+      let off = write_uint8_bytes buf off ((packet_number lsr 8) land 0xff) in
+      write_uint8_bytes buf off (packet_number land 0xff)
+    | _ -> assert false
+
+  let frame_type_length frame =
+    varint_encoding_length Frame_desc.(Type.serialize (to_frame_type frame))
+
+  let ack_payload_length ~ranges ~ecn_counts ~delay =
+    let range_len = List.length ranges in
+    assert (range_len > 0);
+    let first, rest = List.hd ranges, List.tl ranges in
+    let first_range =
+      Int64.sub first.Frame_desc.Range.last first.first |> Int64.to_int
+    in
+    let base =
+      varint_encoding_length (Int64.to_int first.Frame_desc.Range.last)
+      + varint_encoding_length delay
+      + varint_encoding_length (range_len - 1)
+      + varint_encoding_length first_range
+    in
+    let ranges_len, (_ : int64) =
+      List.fold_left
+        (fun (acc, smallest_ack) { Frame_desc.Range.first; last } ->
+           let gap = Int64.sub (Int64.sub smallest_ack last) 2L |> Int64.to_int in
+           let len = Int64.sub last first |> Int64.to_int in
+           (acc + varint_encoding_length gap + varint_encoding_length len, first))
+        (0, first.first)
+        rest
+    in
+    let ecn_len =
+      match ecn_counts with
+      | Some (ect0, ect1, cn) ->
+        varint_encoding_length ect0
+        + varint_encoding_length ect1
+        + varint_encoding_length cn
+      | None -> 0
+    in
+    base + ranges_len + ecn_len
+
+  let frame_payload_length = function
+    | Frame_desc.Padding n -> n
+    | Frame_desc.Ping | Handshake_done -> 0
+    | Frame_desc.Ack { delay; ranges; ecn_counts } ->
+      ack_payload_length ~ranges ~ecn_counts ~delay
+    | Reset_stream { stream_id; application_protocol_error; final_size } ->
+      varint_encoding_length (Int64.to_int stream_id)
+      + varint_encoding_length application_protocol_error
+      + varint_encoding_length final_size
+    | Stop_sending { stream_id; application_protocol_error } ->
+      varint_encoding_length (Int64.to_int stream_id)
+      + varint_encoding_length application_protocol_error
+    | Frame_desc.Crypto { Frame_desc.off; len; _ } ->
+      varint_encoding_length off + varint_encoding_length len + len
+    | Frame_desc.New_token { length; data } ->
+      varint_encoding_length length + Bigstringaf.length data
+    | Frame_desc.Stream { id; fragment = { Frame_desc.off; len; _ }; _ } ->
+      varint_encoding_length (Int64.to_int id)
+      + (if off > 0 then varint_encoding_length off else 0)
+      + (if len > 0 then varint_encoding_length len else 0)
+      + len
+    | Frame_desc.Max_data max -> varint_encoding_length max
+    | Frame_desc.Max_stream_data { stream_id; max_data } ->
+      varint_encoding_length (Int64.to_int stream_id)
+      + varint_encoding_length max_data
+    | Frame_desc.Max_streams (_, max)
+    | Frame_desc.Data_blocked max
+    | Frame_desc.Streams_blocked (_, max)
+    | Frame_desc.Retire_connection_id max ->
+      varint_encoding_length max
+    | Frame_desc.Stream_data_blocked { id; max_data } ->
+      varint_encoding_length (Int64.to_int id)
+      + varint_encoding_length max_data
+    | Frame_desc.New_connection_id
+        { cid; stateless_reset_token; retire_prior_to; sequence_no } ->
+      varint_encoding_length sequence_no
+      + varint_encoding_length retire_prior_to
+      + cid_encoded_length cid
+      + String.length stateless_reset_token
+    | Frame_desc.Path_challenge data | Path_response data -> Bigstringaf.length data
+    | Frame_desc.Connection_close_quic { frame_type; reason_phrase; error_code } ->
+      varint_encoding_length (Error.serialize error_code)
+      + varint_encoding_length (Frame_desc.Type.serialize frame_type)
+      + varint_encoding_length (String.length reason_phrase)
+      + String.length reason_phrase
+    | Frame_desc.Connection_close_app { reason_phrase; error_code } ->
+      varint_encoding_length error_code
+      + varint_encoding_length (String.length reason_phrase)
+      + String.length reason_phrase
+    | Frame_desc.Unknown _ -> assert false
+
+  let frame_encoded_length frame = frame_type_length frame + frame_payload_length frame
+
+  let write_ack_bytes buf off ~delay ~ranges ~ecn_counts =
+    let range_len = List.length ranges in
+    assert (range_len > 0);
+    let first, rest = List.hd ranges, List.tl ranges in
+    let off =
+      write_varint_bytes buf off (Int64.to_int first.Frame_desc.Range.last)
+    in
+    let off = write_varint_bytes buf off delay in
+    let off = write_varint_bytes buf off (range_len - 1) in
+    let off =
+      write_varint_bytes
+        buf
+        off
+        (Int64.sub first.Frame_desc.Range.last first.first |> Int64.to_int)
+    in
+    let off, (_ : int64) =
+      List.fold_left
+        (fun (off, smallest_ack) { Frame_desc.Range.first; last } ->
+           let gap = Int64.sub (Int64.sub smallest_ack last) 2L |> Int64.to_int in
+           let len = Int64.sub last first |> Int64.to_int in
+           let off = write_varint_bytes buf off gap in
+           let off = write_varint_bytes buf off len in
+           off, first)
+        (off, first.first)
+        rest
+    in
+    match ecn_counts with
+    | Some (ect0, ect1, cn) ->
+      let off = write_varint_bytes buf off ect0 in
+      let off = write_varint_bytes buf off ect1 in
+      write_varint_bytes buf off cn
+    | None -> off
+
+  let write_frame_bytes buf off frame =
+    let off =
+      write_varint_bytes buf off Frame_desc.(Type.serialize (to_frame_type frame))
+    in
+    match frame with
+    | Frame_desc.Padding n ->
+      Bytes.fill buf off n '\x00';
+      off + n
+    | Frame_desc.Ping | Handshake_done -> off
+    | Frame_desc.Ack { delay; ranges; ecn_counts } ->
+      write_ack_bytes buf off ~delay ~ranges ~ecn_counts
+    | Frame_desc.Reset_stream { stream_id; application_protocol_error; final_size } ->
+      let off = write_varint_bytes buf off (Int64.to_int stream_id) in
+      let off = write_varint_bytes buf off application_protocol_error in
+      write_varint_bytes buf off final_size
+    | Frame_desc.Stop_sending { stream_id; application_protocol_error } ->
+      let off = write_varint_bytes buf off (Int64.to_int stream_id) in
+      write_varint_bytes buf off application_protocol_error
+    | Frame_desc.Crypto { Frame_desc.off = frame_off; len; payload; payload_off } ->
+      let off = write_varint_bytes buf off frame_off in
+      let off = write_varint_bytes buf off len in
+      write_string_slice_bytes buf off payload ~src_off:payload_off ~len
+    | Frame_desc.New_token { length; data } ->
+      let off = write_varint_bytes buf off length in
+      write_bigstring_bytes buf off data ~src_off:0 ~len:(Bigstringaf.length data)
+    | Frame_desc.Stream
+        { id
+        ; fragment = { Frame_desc.off = frame_off; len; payload; payload_off }
+        ; _
+        } ->
+      let off = write_varint_bytes buf off (Int64.to_int id) in
+      let off =
+        if frame_off > 0 then write_varint_bytes buf off frame_off else off
+      in
+      let off = if len > 0 then write_varint_bytes buf off len else off in
+      write_string_slice_bytes buf off payload ~src_off:payload_off ~len
+    | Frame_desc.Max_data max -> write_varint_bytes buf off max
+    | Frame_desc.Max_stream_data { stream_id; max_data } ->
+      let off = write_varint_bytes buf off (Int64.to_int stream_id) in
+      write_varint_bytes buf off max_data
+    | Frame_desc.Max_streams (_, max)
+    | Frame_desc.Data_blocked max
+    | Frame_desc.Streams_blocked (_, max)
+    | Frame_desc.Retire_connection_id max ->
+      write_varint_bytes buf off max
+    | Frame_desc.Stream_data_blocked { id; max_data } ->
+      let off = write_varint_bytes buf off (Int64.to_int id) in
+      write_varint_bytes buf off max_data
+    | Frame_desc.New_connection_id
+        { cid; stateless_reset_token; retire_prior_to; sequence_no } ->
+      let off = write_varint_bytes buf off sequence_no in
+      let off = write_varint_bytes buf off retire_prior_to in
+      let cid_s = CID.to_string cid in
+      let off = write_uint8_bytes buf off (String.length cid_s) in
+      let off = write_string_bytes buf off cid_s in
+      write_string_bytes buf off stateless_reset_token
+    | Frame_desc.Path_challenge data | Path_response data ->
+      write_bigstring_bytes buf off data ~src_off:0 ~len:(Bigstringaf.length data)
+    | Frame_desc.Connection_close_quic { frame_type; reason_phrase; error_code } ->
+      let off = write_varint_bytes buf off (Error.serialize error_code) in
+      let off = write_varint_bytes buf off (Frame_desc.Type.serialize frame_type) in
+      let off = write_varint_bytes buf off (String.length reason_phrase) in
+      write_string_bytes buf off reason_phrase
+    | Frame_desc.Connection_close_app { reason_phrase; error_code } ->
+      let off = write_varint_bytes buf off error_code in
+      let off = write_varint_bytes buf off (String.length reason_phrase) in
+      write_string_bytes buf off reason_phrase
+    | Frame_desc.Unknown _ -> assert false
+
+  let write_packet_header_bytes buf off ~pn_length ~header =
+    match header with
+    | Packet.Header.Initial { version; source_cid; dest_cid; token } ->
+      let first_byte = 0b11000000 lor ((Packet.Type.serialize Initial lsl 4) lor ((pn_length - 1) land 0b11)) in
+      let off = write_uint8_bytes buf off first_byte in
+      let off = write_uint32_be_bytes buf off version in
+      let off = write_connection_ids_bytes buf off ~source_cid ~dest_cid in
+      let off = write_varint_bytes buf off (String.length token) in
+      write_string_bytes buf off token
+    | Long { version; source_cid; dest_cid; packet_type } ->
+      let first_byte =
+        0b11000000 lor ((Packet.Type.serialize packet_type lsl 4) lor ((pn_length - 1) land 0b11))
+      in
+      let off = write_uint8_bytes buf off first_byte in
+      let off = write_uint32_be_bytes buf off version in
+      write_connection_ids_bytes buf off ~source_cid ~dest_cid
+    | Short { dest_cid } ->
+      let off = write_uint8_bytes buf off (0b01000000 lor ((pn_length - 1) land 0b11)) in
+      write_string_bytes buf off (CID.to_string dest_cid)
+
+  let write_frames_packet_legacy t ~header_info frames =
     assert (frames <> []);
     let tag_len = Crypto.AEAD.tag_len header_info.encrypter in
     let pn_length = packet_number_length header_info.packet_number in
@@ -561,6 +875,96 @@ module Writer = struct
         ~packet_number:header_info.packet_number
         ~header:unprotected_header
         plaintext
+    in
+    Faraday.write_string t.encoder encrypted_header;
+    Faraday.write_string t.encoder sealed_payload
+
+  let write_frames_packet t ~header_info frames =
+    assert (frames <> []);
+    let tag_len = Crypto.AEAD.tag_len header_info.encrypter in
+    let pn_length = packet_number_length header_info.packet_number in
+    let payload_len, write_frames =
+      match frames with
+      | [ frame ] ->
+        let payload_len = frame_encoded_length frame in
+        payload_len, (fun plaintext -> ignore (write_frame_bytes plaintext 0 frame))
+      | _ ->
+        let payload_len =
+          List.fold_left (fun acc frame -> acc + frame_encoded_length frame) 0 frames
+        in
+        payload_len, (fun plaintext ->
+          ignore (List.fold_left (write_frame_bytes plaintext) 0 frames))
+    in
+    let pn_offset = 4 - pn_length in
+    let min_payload_len = pn_offset + 16 - tag_len in
+    let padding =
+      if payload_len < min_payload_len then min_payload_len - payload_len else 0
+    in
+    let payload_len = payload_len + padding in
+    let plaintext = Bytes.create payload_len in
+    write_frames plaintext;
+    let payload_off = payload_len - padding in
+    let payload_off =
+      if padding > 0
+      then (
+        Bytes.fill plaintext payload_off padding '\x00';
+        payload_off + padding)
+      else payload_off
+    in
+    assert (payload_off = payload_len);
+    let header = header_of_encryption_level header_info in
+    let payload_length = payload_len + tag_len in
+    let header_len payload_length =
+      let payload_len_field =
+        match header with
+        | Packet.Header.Initial _
+        | Long { packet_type = Initial | Zero_RTT | Handshake; _ } ->
+          varint_encoding_length (pn_length + payload_length)
+        | Short _ -> 0
+        | Long { packet_type = Retry; _ } -> assert false
+      in
+      header_base_length header + payload_len_field + pn_length
+    in
+    let packet_len_for_initial_padding =
+      header_base_length header
+      + payload_length
+      + pn_length
+      + varint_encoding_length 1200
+    in
+    let payload_length, plaintext =
+      match header_info.encryption_level, packet_len_for_initial_padding with
+      | Initial, packet_len when packet_len < 1200 ->
+        let padding_n = 1200 - packet_len in
+        let padded = Bytes.create (payload_len + padding_n) in
+        Bytes.blit plaintext 0 padded 0 payload_len;
+        Bytes.fill padded payload_len padding_n '\x00';
+        payload_length + padding_n, padded
+      | _ -> payload_length, plaintext
+    in
+    let header_len = header_len payload_length in
+    let unprotected_header = Bytes.create header_len in
+    let off = write_packet_header_bytes unprotected_header 0 ~pn_length ~header in
+    let off =
+      match header with
+      | Packet.Header.Initial _ | Long { packet_type = Initial | Zero_RTT | Handshake; _ } ->
+        write_varint_bytes unprotected_header off (pn_length + payload_length)
+      | Short _ -> off
+      | Long { packet_type = Retry; _ } -> assert false
+    in
+    let off =
+      write_packet_number_bytes
+        unprotected_header
+        off
+        ~pn_length
+        ~packet_number:header_info.packet_number
+    in
+    assert (off = header_len);
+    let encrypted_header, sealed_payload =
+      Crypto.AEAD.encrypt_packet_parts
+        header_info.encrypter
+        ~packet_number:header_info.packet_number
+        ~header:(Bytes.unsafe_to_string unprotected_header)
+        (Bytes.unsafe_to_string plaintext)
     in
     Faraday.write_string t.encoder encrypted_header;
     Faraday.write_string t.encoder sealed_payload

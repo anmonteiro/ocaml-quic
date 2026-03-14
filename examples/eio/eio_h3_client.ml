@@ -146,6 +146,8 @@ let () =
   let upload = ref None in
   let path = ref None in
   let chunk_size = ref max_data_chunk_size in
+  let max_dgram_size = ref Quic.Config.default_max_datagram_size in
+  let udp_connect = ref false in
   Arg.parse
     [ "-p", Arg.Set_int port, " Port number (4433 by default)"
     ; ( "-download"
@@ -163,6 +165,10 @@ let () =
           " File transfer chunk size in bytes (max %d)"
           max_data_chunk_size
       )
+    ; ( "-max-dgram-size"
+      , Arg.Set_int max_dgram_size
+      , " Max QUIC datagram size override for benchmarking (default 1200)" )
+    ; "-udp-connect", Arg.Set udp_connect, " Connect the underlying UDP socket to the peer"
     ]
     (fun host_argument -> host := Some host_argument)
     "eio_h3_client.exe [-p N] [-download OUT | -upload FILE] [-path PATH] HOST";
@@ -172,6 +178,8 @@ let () =
       (Printf.sprintf
          "-chunk-size must be in 1..%d to fit within QUIC datagrams"
          max_data_chunk_size);
+  if !max_dgram_size < Quic.Config.default_max_datagram_size
+  then failwith "-max-dgram-size must be >= 1200";
   let host =
     match !host with
     | None -> failwith "No hostname provided"
@@ -202,6 +210,7 @@ let () =
     { Quic.Config.certificates
     ; alpn_protocols = [ "h3" ]
     ; transport_parameters = Quic.Config.default_transport_parameters
+    ; max_datagram_size = !max_dgram_size
     }
   in
   Eio_main.run (fun env ->
@@ -228,7 +237,12 @@ let () =
 
       let client_p, client_u = Eio.Promise.create () in
       let t =
-        Quic_eio.Client.create env ~sw ~config (fun ~cid:_ ~start_stream:_ ->
+        Quic_eio.Client.create
+          env
+          ~sw
+          ~udp_connect:!udp_connect
+          ~config
+          (fun ~cid:_ ~start_stream:_ ->
           F (fun _stream -> assert false))
       in
       Quic_eio.connect t ~address ~host (fun ~cid ~start_stream ->
