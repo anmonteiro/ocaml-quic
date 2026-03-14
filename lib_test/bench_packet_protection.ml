@@ -52,6 +52,23 @@ let arg_spec =
 
 let usage = "bench_packet_protection.exe [-backend openssl|legacy] [-iters N]"
 
+let stream_frame_payload =
+  let payload = String.make 1024 'x' in
+  let f = Faraday.create 1200 in
+  Quic.Serialize.Frame.write_frame
+    f
+    (Quic.Frame.Stream
+       { id = 0L
+       ; fragment =
+           { Quic.Frame.off = 0
+           ; len = String.length payload
+           ; payload
+           ; payload_off = 0
+           }
+       ; is_fin = false
+       });
+  Faraday.serialize_to_string f
+
 let benchmark name ~bytes_per_iter f =
   Gc.full_major ();
   let t0 = Unix.gettimeofday () in
@@ -169,4 +186,36 @@ let () =
           with
           | Packet_parser.Packet (_, consumed) -> consumed
           | Packet_parser.Error (_, _, consumed) -> consumed
-          | Packet_parser.Skip consumed -> consumed))
+          | Packet_parser.Skip consumed -> consumed);
+      let stream_frame_payload_bs =
+        Bigstringaf.of_string
+          ~off:0
+          ~len:(String.length stream_frame_payload)
+          stream_frame_payload
+      in
+      benchmark
+        "frame_parse_string_stream"
+        ~bytes_per_iter:(String.length stream_frame_payload)
+        (fun () ->
+          let frames = ref 0 in
+          (match
+             Quic.Fast_parse.Frame.parse_string
+               stream_frame_payload
+               ~handler:(fun _ -> incr frames)
+           with
+           | Ok () -> ()
+           | Error e -> failwith e);
+          !frames);
+      benchmark
+        "frame_parse_bigstring_stream"
+        ~bytes_per_iter:(String.length stream_frame_payload)
+        (fun () ->
+          let frames = ref 0 in
+          (match
+             Quic.Fast_parse.Frame.parse_bigstring
+               stream_frame_payload_bs
+               ~handler:(fun _ -> incr frames)
+           with
+           | Ok () -> ()
+           | Error e -> failwith e);
+          !frames))
