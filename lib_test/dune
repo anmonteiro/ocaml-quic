@@ -11,5 +11,10 @@
   (source_tree ../certificates))
  (action
   (chdir
-   ../
-   (run %{test}))))
+  ../
+  (run %{test}))))
+
+(executable
+ (name bench_packet_protection)
+ (libraries hex unix quic qtls_ocaml_tls tls mirage-crypto-rng.unix)
+ (modules bench_packet_protection))
