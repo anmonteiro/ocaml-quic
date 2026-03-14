@@ -49,6 +49,11 @@ type drop_packet_kind =
 type should_drop =
   direction:drop_direction -> packet_kind:drop_packet_kind -> seq_no:int -> len:int -> bool
 
+module Addr : sig
+  val serialize : Eio.Net.Sockaddr.datagram -> string
+  val parse : string -> Eio.Net.Sockaddr.datagram
+end
+
 module Server : sig
   (* XXX: Alternative: ~conn_handler:(conn -> stream_handler) called for each
    * connection. *)

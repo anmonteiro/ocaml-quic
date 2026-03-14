@@ -421,10 +421,20 @@ module Direct = struct
 end
 
 module Relay = struct
+  let observed_udp_candidate stream =
+    match Quic.Stream.peer_address stream with
+    | None -> None
+    | Some encoded ->
+      (match Quic_eio.Addr.parse encoded with
+      | `Udp (host, port) ->
+        Some (Unix.string_of_inet_addr (Eio_unix.Net.Ipaddr.to_unix host), port)
+      | `Unix _ -> None)
+
   type peer =
     { stream : Quic.Stream.t
     ; mutable room_name : string option
     ; mutable role : role option
+    ; observed_candidate : (string * int) option
     }
 
   type room =
@@ -496,6 +506,12 @@ module Relay = struct
       | Receiver -> room.receiver <- Some peer);
       peer.room_name <- Some room_name;
       peer.role <- Some role;
+      (match peer.observed_candidate with
+      | Some (host, port) ->
+        send
+          peer.stream
+          (Printf.sprintf "OBSERVED %s %d" (hex_of_string host) port)
+      | None -> ());
       send peer.stream "JOINED";
       (match partner room role with
       | Some _ -> ()
@@ -544,7 +560,13 @@ module Relay = struct
   let connection_handler t ~cid:_ ~start_stream:_ =
     Quic.Transport.F
       (fun stream ->
-        let peer = { stream; room_name = None; role = None } in
+        let peer =
+          { stream
+          ; room_name = None
+          ; role = None
+          ; observed_candidate = observed_udp_candidate stream
+          }
+        in
         attach_parser t peer;
         { on_error = (fun _ -> remove_peer t peer) })
 
@@ -582,6 +604,10 @@ module Client = struct
   type direct_offer =
     | No_direct
     | Direct_candidates of (string * int) list
+
+  type rendezvous =
+    { observed_host : string option
+    }
 
   type send_mode =
     | Relay_transfer
@@ -646,14 +672,21 @@ module Client = struct
     | Some line -> line
     | None -> failwith "relay stream closed"
 
-  let rec wait_for_ready ch =
-    match wait_for_line_or_fail ch with
-    | "WAITING" -> wait_for_ready ch
-    | "JOINED" -> wait_for_ready ch
-    | line when String.starts_with ~prefix:"READY" line -> ()
-    | "PEER_LEFT" -> failwith "peer disconnected before setup completed"
-    | line when String.starts_with ~prefix:"ERROR " line -> failwith line
-    | _ -> wait_for_ready ch
+  let wait_for_ready ch =
+    let rec loop observed_host =
+      match split_words (wait_for_line_or_fail ch) with
+      | [ "WAITING" ] -> loop observed_host
+      | [ "JOINED" ] -> loop observed_host
+      | [ "OBSERVED"; host_hex; port_s ] ->
+        let _ = port_s in
+        loop (Some (string_of_hex host_hex))
+      | [ "READY"; _ ] ->
+        { observed_host }
+      | [ "PEER_LEFT" ] -> failwith "peer disconnected before setup completed"
+      | "ERROR" :: msg -> failwith ("ERROR " ^ String.concat " " msg)
+      | _ -> loop observed_host
+    in
+    loop None
 
   let rec wait_for_direct_offer ch acc =
     match split_words (wait_for_line_or_fail ch) with
@@ -924,7 +957,7 @@ module Client = struct
            Line_channel.write_line
              ch
              (Printf.sprintf "JOIN %s %s" opts.code (role_to_string Sender));
-           wait_for_ready ch;
+           let _rendezvous = wait_for_ready ch in
            let session = perform_pake ~opts ~role:Sender ch in
            let send_mode =
              if not direct
@@ -986,17 +1019,26 @@ module Client = struct
            Line_channel.write_line
              ch
              (Printf.sprintf "JOIN %s %s" opts.code (role_to_string Receiver));
-           wait_for_ready ch;
+           let rendezvous = wait_for_ready ch in
            let session = perform_pake ~opts ~role:Receiver ch in
-           (match direct_listener with
+            (match direct_listener with
             | None -> Line_channel.write_line ch "NO-DIRECT"
             | Some listener ->
+             let candidates =
+               List.map (fun host -> host, listener.port) listener.hosts
+             in
+             let candidates =
+               match rendezvous.observed_host with
+               | None -> candidates
+               | Some host ->
+                 let observed = host, listener.port in
+                 observed
+                 :: List.filter (fun candidate -> candidate <> observed) candidates
+             in
              Format.printf
                "awaiting direct peer connection on udp port %d@."
                listener.port;
-             send_direct_candidates
-               ch
-               (List.map (fun host -> host, listener.port) listener.hosts));
+             send_direct_candidates ch candidates);
            let recv_ch =
              match direct_listener with
               | None -> ch

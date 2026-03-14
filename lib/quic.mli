@@ -98,6 +98,7 @@ module Stream : sig
 
   val id : t -> Stream_id.t
   val direction : t -> Direction.t
+  val peer_address : t -> string option
 
   val schedule_read
     :  t

@@ -1011,6 +1011,7 @@ module Connection = struct
       Stream.create
         ~typ
         ~id
+        ~peer_address:c.peer_address
         ~report_application_error:(report_application_error c)
         ~on_bytes_read:(fun bytes_read ->
           maybe_replenish_recv_credit c ~stream_id:id ~bytes_read)

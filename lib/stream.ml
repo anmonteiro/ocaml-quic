@@ -477,17 +477,26 @@ type t =
   ; recv : Recv.t
   ; typ : Type.t
   ; id : int64
+  ; peer_address : string option
   ; mutable error_handler : int -> unit
   ; report_application_error : int -> unit
   }
 
 let default_error_handler _ = ()
 
-let create ~typ ~id ~report_application_error ?(on_bytes_read = ignore) when_ready =
+let create
+      ~typ
+      ~id
+      ?peer_address
+      ~report_application_error
+      ?(on_bytes_read = ignore)
+      when_ready
+  =
   { send = Send.create when_ready
   ; recv = Recv.create ~done_reading:on_bytes_read ()
   ; typ
   ; id
+  ; peer_address
   ; error_handler = default_error_handler
   ; report_application_error
   }
@@ -500,6 +509,7 @@ let create_crypto () =
   ; recv
   ; typ = Server Bidirectional
   ; id = -1L
+  ; peer_address = None
   ; error_handler = default_error_handler
   ; report_application_error = default_error_handler
   }
@@ -508,6 +518,8 @@ let id { id; _ } = id
 
 let direction { typ; _ } =
   match typ with Client direction | Server direction -> direction
+
+let peer_address { peer_address; _ } = peer_address
 
 (* Public (application layer) API *)
 let write_uint8 t c = Buffer.write_uint8 t.send.producer c
