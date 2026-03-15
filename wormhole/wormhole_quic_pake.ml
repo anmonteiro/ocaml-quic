@@ -871,13 +871,18 @@ module Relay_h3 = struct
     | `Invalid_response_body_length _ -> "invalid response body length"
 
   type transfer =
-    { mutable upload_path : string option
-    ; mutable filename_hex : string option
+    { mutable filename_hex : string option
     ; mutable content_length : string option
     ; mutable content_type : string option
+    ; mutable uploader_reqd : H3.Reqd.t option
+    ; mutable upload_body : H3.Body.Reader.t option
     ; mutable downloader : H3.Reqd.t option
+    ; queued_chunks : string Queue.t
+    ; mutable queued_bytes : int
+    ; mutable read_waiting : bool
+    ; mutable write_waiting : bool
+    ; mutable started : bool
     ; mutable upload_complete : bool
-    ; mutable download_started : bool
     }
 
   type state = { transfers : (string, transfer) Hashtbl.t }
@@ -889,25 +894,26 @@ module Relay_h3 = struct
     | Some x -> x
     | None ->
       let x =
-        { upload_path = None
-        ; filename_hex = None
+        { filename_hex = None
         ; content_length = None
         ; content_type = None
+        ; uploader_reqd = None
+        ; upload_body = None
         ; downloader = None
+        ; queued_chunks = Queue.create ()
+        ; queued_bytes = 0
+        ; read_waiting = false
+        ; write_waiting = false
+        ; started = false
         ; upload_complete = false
-        ; download_started = false
         }
       in
       Hashtbl.add t.transfers transfer_id x;
       x
 
   let maybe_cleanup t transfer_id transfer =
-    if transfer.upload_complete && transfer.downloader = None
-    then (
-      Option.iter
-        (fun path -> try Unix.unlink path with _ -> ())
-        transfer.upload_path;
-      Hashtbl.remove t.transfers transfer_id)
+    if transfer.uploader_reqd = None && transfer.downloader = None
+    then Hashtbl.remove t.transfers transfer_id
 
   let transfer_headers transfer =
     let headers =
@@ -926,49 +932,82 @@ module Relay_h3 = struct
 
   let start_download_if_ready t transfer_id transfer =
     match
-      transfer.download_started,
-      transfer.upload_complete,
-      transfer.upload_path,
+      transfer.started,
+      transfer.uploader_reqd,
+      transfer.upload_body,
       transfer.downloader
     with
-    | false, true, Some upload_path, Some download_reqd ->
-      transfer.download_started <- true;
+    | false, Some upload_reqd, Some upload_body, Some download_reqd ->
+      transfer.started <- true;
       let response =
         H3.Response.create ~headers:(transfer_headers transfer) `OK
       in
       let response_body = H3.Reqd.respond_with_streaming download_reqd response in
-      let ic = open_in_bin upload_path in
-      let buf = Bytes.create upload_chunk_size in
-      let finalize () =
-        close_in_noerr ic;
-        H3.Body.Writer.close response_body;
-        transfer.downloader <- None;
-        maybe_cleanup t transfer_id transfer
+      let finished = ref false in
+      let rec finalize_success () =
+        if not !finished
+        then (
+          finished := true;
+          H3.Body.Writer.close response_body;
+          H3.Reqd.respond_with_string upload_reqd (H3.Response.create `OK) "ok";
+          transfer.uploader_reqd <- None;
+          transfer.upload_body <- None;
+          transfer.downloader <- None;
+          transfer.started <- false;
+          transfer.read_waiting <- false;
+          transfer.write_waiting <- false;
+          transfer.queued_bytes <- 0;
+          Queue.clear transfer.queued_chunks;
+          maybe_cleanup t transfer_id transfer)
+      and maybe_read () =
+        if
+          (not !finished)
+          && (not transfer.read_waiting)
+          && (not transfer.upload_complete)
+          && transfer.queued_bytes < flush_batch_bytes
+        then (
+          transfer.read_waiting <- true;
+          H3.Body.Reader.schedule_read
+            upload_body
+            ~on_eof:(fun () ->
+              transfer.read_waiting <- false;
+              transfer.upload_complete <- true;
+              if Queue.is_empty transfer.queued_chunks && not transfer.write_waiting
+              then finalize_success ())
+            ~on_read:(fun bs ~off ~len ->
+              transfer.read_waiting <- false;
+              let chunk = Bigstringaf.substring bs ~off ~len in
+              Queue.add chunk transfer.queued_chunks;
+              transfer.queued_bytes <- transfer.queued_bytes + len;
+              if not transfer.write_waiting then maybe_write ();
+              if transfer.queued_bytes < flush_batch_bytes then maybe_read ()))
+      and maybe_write () =
+        if not !finished
+        then if Queue.is_empty transfer.queued_chunks
+        then (
+          if transfer.upload_complete
+          then finalize_success ()
+          else maybe_read ())
+        else if not transfer.write_waiting
+        then (
+          transfer.write_waiting <- true;
+          let rec fill_batch batched_bytes =
+            if Queue.is_empty transfer.queued_chunks || batched_bytes >= flush_batch_bytes
+            then batched_bytes
+            else (
+              let chunk = Queue.take transfer.queued_chunks in
+              let len = String.length chunk in
+              transfer.queued_bytes <- transfer.queued_bytes - len;
+              H3.Body.Writer.write_string response_body chunk;
+              fill_batch (batched_bytes + len))
+          in
+          ignore (fill_batch 0);
+          H3.Body.Writer.flush response_body (fun () ->
+            transfer.write_waiting <- false;
+            if transfer.queued_bytes < flush_batch_bytes then maybe_read ();
+            maybe_write ()))
       in
-      let rec pump () =
-        let rec fill_batch batched_bytes =
-          match input ic buf 0 (Bytes.length buf) with
-          | 0 -> `Eof batched_bytes
-          | n ->
-            H3.Body.Writer.write_string
-              response_body
-              ~off:0
-              ~len:n
-              (Bytes.unsafe_to_string buf);
-            let batched_bytes = batched_bytes + n in
-            if batched_bytes >= flush_batch_bytes
-            then `Flushed batched_bytes
-            else fill_batch batched_bytes
-          | exception exn ->
-            finalize ();
-            raise exn
-        in
-        match fill_batch 0 with
-        | `Eof 0 -> finalize ()
-        | `Eof _ -> H3.Body.Writer.flush response_body finalize
-        | `Flushed _ -> H3.Body.Writer.flush response_body pump
-      in
-      pump ()
+      maybe_read ()
     | _ -> ()
 
   let request_handler t reqd =
@@ -981,63 +1020,29 @@ module Relay_h3 = struct
     match request.H3.Request.meth, parts with
     | `POST, [ "relay"; "upload"; transfer_id ] ->
       let transfer = get_transfer t transfer_id in
-      (match transfer.upload_path with
+      (match transfer.uploader_reqd with
       | Some _ ->
         H3.Reqd.respond_with_string
           reqd
           (H3.Response.create `Conflict)
           "upload already exists"
       | None ->
-        let temp_path =
-          Filename.temp_file ("wormhole-relay-" ^ transfer_id ^ "-") ".upload"
-        in
-        let oc = open_out_bin temp_path in
         let request_body = H3.Reqd.request_body reqd in
-        let finished = ref false in
-        let finalize ok =
-          if not !finished
-          then (
-            finished := true;
-            close_out_noerr oc;
-            if ok
-            then (
-              transfer.upload_complete <- true;
-              H3.Reqd.respond_with_string reqd (H3.Response.create `OK) "ok";
-              start_download_if_ready t transfer_id transfer)
-            else (
-              (try Unix.unlink temp_path with _ -> ());
-              transfer.upload_path <- None;
-              transfer.filename_hex <- None;
-              transfer.content_length <- None;
-              transfer.content_type <- None;
-              H3.Reqd.respond_with_string
-                reqd
-                (H3.Response.create `Internal_server_error)
-                "upload failed";
-              maybe_cleanup t transfer_id transfer))
-        in
-        transfer.upload_path <- Some temp_path;
         transfer.filename_hex <-
           H3.Headers.get request.H3.Request.headers "x-wormhole-name";
         transfer.content_length <-
           H3.Headers.get request.H3.Request.headers "content-length";
         transfer.content_type <-
           H3.Headers.get request.H3.Request.headers "content-type";
+        transfer.uploader_reqd <- Some reqd;
+        transfer.upload_body <- Some request_body;
+        transfer.queued_bytes <- 0;
+        transfer.read_waiting <- false;
+        transfer.write_waiting <- false;
+        transfer.started <- false;
         transfer.upload_complete <- false;
-        transfer.download_started <- false;
-        let rec read_body () =
-          H3.Body.Reader.schedule_read
-            request_body
-            ~on_eof:(fun () -> finalize true)
-            ~on_read:(fun bs ~off ~len ->
-              try
-                output_string oc (Bigstringaf.substring bs ~off ~len);
-                read_body ()
-              with
-              | _ ->
-                finalize false)
-        in
-        read_body ())
+        Queue.clear transfer.queued_chunks;
+        start_download_if_ready t transfer_id transfer)
     | `GET, [ "relay"; "download"; transfer_id ] ->
       let transfer = get_transfer t transfer_id in
       (match transfer.downloader with
