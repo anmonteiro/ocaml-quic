@@ -269,6 +269,16 @@ module IO_loop = struct
       (try
          Buffer.put
            ~f:(fun buf ~off ~len k ->
+             let blocking_recv () =
+               let cstruct = Cstruct.of_bigarray buf ~off ~len in
+               match Eio.Net.recv dsock cstruct with
+               | addr, n ->
+                 Promise.resolve u (`Read (n, Addr.serialize addr));
+                 k n
+               | exception exn ->
+                 Promise.resolve u (`Exn exn);
+                 raise exn
+             in
              match Eio_unix.Resource.fd_opt dsock with
              | Some fd when udp_recv_fast_path_enabled ->
                 (match
@@ -295,21 +305,12 @@ module IO_loop = struct
                 | Some (Same_addr n) ->
                   Promise.resolve u (`Read (n, Option.get !last_client_address));
                   k n
-                | Some No_data ->
-                  Promise.resolve u `Would_block;
-                  raise_notrace Exit
+                | Some No_data -> blocking_recv ()
                 | None ->
                   Promise.resolve u (`Exn End_of_file);
                   raise End_of_file)
              | Some _ | None ->
-               let cstruct = Cstruct.of_bigarray buf ~off ~len in
-               match Eio.Net.recv dsock cstruct with
-               | addr, n ->
-                 Promise.resolve u (`Read (n, Addr.serialize addr));
-                 k n
-               | exception exn ->
-                 Promise.resolve u (`Exn exn);
-                 raise exn)
+               blocking_recv ())
            buffer
            (fun _read -> ())
        with
