@@ -147,7 +147,7 @@ let () =
   let path = ref None in
   let chunk_size = ref max_data_chunk_size in
   let max_dgram_size = ref Quic.Config.default_max_datagram_size in
-  let udp_connect = ref false in
+  let udp_connect = ref true in
   Arg.parse
     [ "-p", Arg.Set_int port, " Port number (4433 by default)"
     ; ( "-download"
@@ -169,6 +169,9 @@ let () =
       , Arg.Set_int max_dgram_size
       , " Max QUIC datagram size override for benchmarking (default 1200)" )
     ; "-udp-connect", Arg.Set udp_connect, " Connect the underlying UDP socket to the peer"
+    ; ( "-no-udp-connect"
+      , Arg.Clear udp_connect
+      , " Do not connect the underlying UDP socket to the peer" )
     ]
     (fun host_argument -> host := Some host_argument)
     "eio_h3_client.exe [-p N] [-download OUT | -upload FILE] [-path PATH] HOST";

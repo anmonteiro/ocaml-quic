@@ -670,7 +670,7 @@ module Client = struct
         env
         ~sw
         ?(should_drop = IO_loop.never_drop)
-        ?(udp_connect = false)
+        ?(udp_connect = true)
         ~config
         handler
     =
