@@ -408,6 +408,34 @@ let record_packet_sent
   then info.time_of_last_ack_eliciting_packet_ms <- Some time_sent_ms;
   set_loss_detection_timer t)
 
+let record_ack_eliciting_in_flight_packet_sent
+      t
+      ~encryption_level
+      ~packet_number
+      ~bytes_sent
+      ~time_sent_ms
+      frames
+  =
+  let info = Spaces.of_encryption_level t.spaces encryption_level in
+  let sent_bytes = max 1 bytes_sent in
+  let sent =
+    { packet_number
+    ; frames
+    ; ack_eliciting = true
+    ; in_flight = true
+    ; sent_bytes
+    ; time_sent_ms
+    }
+  in
+  assert (not (Q.mem packet_number info.sent));
+  info.sent <- Q.add packet_number sent info.sent;
+  info.ack_eliciting_in_flight <- info.ack_eliciting_in_flight + 1;
+  t.congestion.bytes_in_flight <- t.congestion.bytes_in_flight + sent_bytes;
+  if t.timer.pto_probe_count > 0
+  then t.timer.pto_probe_count <- t.timer.pto_probe_count - 1;
+  info.time_of_last_ack_eliciting_packet_ms <- Some time_sent_ms;
+  set_loss_detection_timer t
+
 let on_packet_sent t ~encryption_level ~packet_number frames =
   let time_sent_ms = next_implicit_now_ms t in
   let bytes_sent = if packet_is_in_flight frames then t.max_datagram_size else 0 in
@@ -682,6 +710,22 @@ module Debug = struct
       ~ranges
       ~ack_delay_ms
       ~now_ms
+
+  let record_ack_eliciting_in_flight_packet_sent
+        t
+        ~encryption_level
+        ~packet_number
+        ~bytes_sent
+        ~time_sent_ms
+        frames
+    =
+    record_ack_eliciting_in_flight_packet_sent
+      t
+      ~encryption_level
+      ~packet_number
+      ~bytes_sent
+      ~time_sent_ms
+      frames
 
   let on_loss_detection_timeout t ~now_ms = on_loss_detection_timeout t ~now_ms
 

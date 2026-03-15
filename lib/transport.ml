@@ -381,6 +381,17 @@ module Connection = struct
       ~time_sent_ms
       frames
 
+  let on_ack_eliciting_packet_sent t ~encryption_level ~packet_number ~bytes_sent frames =
+    let time_sent_ms = next_recovery_time_ms t in
+    t.last_activity_ms <- time_sent_ms;
+    Recovery.Debug.record_ack_eliciting_in_flight_packet_sent
+      t.recovery
+      ~encryption_level
+      ~packet_number
+      ~bytes_sent
+      ~time_sent_ms
+      frames
+
   type flush_ret =
     | Didnt_write
     | Wrote
@@ -1610,41 +1621,41 @@ module Connection = struct
             let _flushed =
               Stream.Send.flush ~max_bytes:max_flush_bytes stream.Stream.send
             in
-            if
-              Stream.Send.has_pending_output stream.send
-              && Encryption_level.mem encryption_level t.encdec
-            then (
-              let estimated_bytes = t.recovery.max_datagram_size in
-              if not (Recovery.can_send t.recovery ~bytes:estimated_bytes)
-              then acc
-              else
-                let packet_number =
-                  Packet_number.send_next
-                    (Spaces.of_encryption_level
-                       t.packet_number_spaces
-                       encryption_level)
-                in
-                let { Crypto.encrypter; _ } =
-                  Encryption_level.find_exn encryption_level t.encdec
-                in
-                let header_info =
-                  Writer.make_header_info
-                    ~encrypter
-                    ~packet_number
-                    ~encryption_level
-                    ~source_cid:t.source_cid
-                    ~token:t.token_value
-                    t.dest_cid
-                in
-                match stream_type with
+	            if
+	              Stream.Send.has_pending_output stream.send
+	              && Encryption_level.mem encryption_level t.encdec
+	            then (
+	              let estimated_bytes = t.recovery.max_datagram_size in
+	              if not (Recovery.can_send t.recovery ~bytes:estimated_bytes)
+	              then acc
+	              else
+	                match stream_type with
                 | `Crypto ->
+                  let packet_number =
+                    Packet_number.send_next
+                      (Spaces.of_encryption_level
+                         t.packet_number_spaces
+                         encryption_level)
+                  in
+                  let { Crypto.encrypter; _ } =
+                    Encryption_level.find_exn encryption_level t.encdec
+                  in
+                  let header_info =
+                    Writer.make_header_info
+                      ~encrypter
+                      ~packet_number
+                      ~encryption_level
+                      ~source_cid:t.source_cid
+                      ~token:t.token_value
+                      t.dest_cid
+                  in
                   let fragment, _is_fin = Stream.Send.pop_exn stream.send in
                   let frames = [ Frame.Crypto fragment ] in
                   let bytes_before = writer_pending_bytes t.writer in
                   Writer.write_frames_packet t.writer ~header_info frames;
                   finish_datagram_if_needed t ~encryption_level;
                   let bytes_sent = writer_pending_bytes t.writer - bytes_before in
-                  on_packet_sent
+                  on_ack_eliciting_packet_sent
                     t
                     ~encryption_level
                     ~packet_number
@@ -1661,11 +1672,29 @@ module Connection = struct
                   (match frames with
                   | [] -> acc
                   | _ ->
+                    let packet_number =
+                      Packet_number.send_next
+                        (Spaces.of_encryption_level
+                           t.packet_number_spaces
+                           encryption_level)
+                    in
+                    let { Crypto.encrypter; _ } =
+                      Encryption_level.find_exn encryption_level t.encdec
+                    in
+                    let header_info =
+                      Writer.make_header_info
+                        ~encrypter
+                        ~packet_number
+                        ~encryption_level
+                        ~source_cid:t.source_cid
+                        ~token:t.token_value
+                        t.dest_cid
+                    in
                     let bytes_before = writer_pending_bytes t.writer in
                     Writer.write_frames_packet t.writer ~header_info frames;
                     finish_datagram_if_needed t ~encryption_level;
                     let bytes_sent = writer_pending_bytes t.writer - bytes_before in
-                    on_packet_sent
+                    on_ack_eliciting_packet_sent
                       t
                       ~encryption_level
                       ~packet_number
