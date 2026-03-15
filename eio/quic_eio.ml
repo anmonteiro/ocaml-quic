@@ -386,18 +386,35 @@ module IO_loop = struct
         List.fold_left (fun acc { Faraday.len; _ } -> acc + len) 0 iovecs
       in
       let fallback_send () =
-        let iovecs =
-          List.map
-            (fun { Faraday.buffer; off; len } -> Cstruct.of_bigarray ~off ~len buffer)
-            iovecs
+        let cstructs =
+          Array.of_list
+            (List.map
+               (fun { Faraday.buffer; off; len } -> Cstruct.of_bigarray ~off ~len buffer)
+               iovecs)
         in
-        match
-          if connected_to_peer
-          then Eio.Net.send dsock iovecs
-          else Eio.Net.send dsock ~dst:(Addr.parse client_address) iovecs
-        with
-        | () -> `Ok lenv
-        | exception End_of_file -> `Closed
+        match Eio_unix.Resource.fd_opt dsock with
+        | Some fd ->
+          (try
+             let _sent =
+               if connected_to_peer
+               then Eio_posix.Low_level.send_msg fd cstructs
+               else
+                 Eio_posix.Low_level.send_msg
+                   fd
+                   ~dst:(Addr.parse_unix client_address)
+                   cstructs
+             in
+             `Ok lenv
+           with
+           | End_of_file -> `Closed)
+        | None ->
+          match
+            if connected_to_peer
+            then Eio.Net.send dsock (Array.to_list cstructs)
+            else Eio.Net.send dsock ~dst:(Addr.parse client_address) (Array.to_list cstructs)
+          with
+          | () -> `Ok lenv
+          | exception End_of_file -> `Closed
       in
       if udp_send_fast_path_enabled && lenv >= send_msg_fast_threshold
       then
