@@ -372,7 +372,13 @@ module IO_loop = struct
       in
       read
 
-    let writev dsock ~udp_send_fast_path_enabled ~client_address iovecs =
+    let writev
+          dsock
+          ~udp_send_fast_path_enabled
+          ~connected_to_peer
+          ~client_address
+          iovecs
+      =
       let lenv =
         List.fold_left (fun acc { Faraday.len; _ } -> acc + len) 0 iovecs
       in
@@ -382,7 +388,11 @@ module IO_loop = struct
             (fun { Faraday.buffer; off; len } -> Cstruct.of_bigarray ~off ~len buffer)
             iovecs
         in
-        match Eio.Net.send dsock ~dst:(Addr.parse client_address) iovecs with
+        match
+          if connected_to_peer
+          then Eio.Net.send dsock iovecs
+          else Eio.Net.send dsock ~dst:(Addr.parse client_address) iovecs
+        with
         | () -> `Ok lenv
         | exception End_of_file -> `Closed
       in
@@ -539,12 +549,17 @@ module IO_loop = struct
                   | None ->
                     Io.writev
                       ~udp_send_fast_path_enabled
+                      ~connected_to_peer:true
                       ~client_address
                       socket
                       io_vectors)
                | _ ->
                  Io.writev
                    ~udp_send_fast_path_enabled
+                   ~connected_to_peer:
+                     (match !connected_peer with
+                      | Some peer -> String.equal peer client_address
+                      | None -> false)
                    ~client_address
                    socket
                    io_vectors)
