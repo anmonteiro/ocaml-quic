@@ -2,8 +2,9 @@ open Eio.Std
 open H3
 
 let now_s () = Unix.gettimeofday ()
-let max_data_chunk_size = 16384
-let flush_batch_bytes = 256 * 1024
+let default_chunk_size = 256 * 1024
+let max_data_chunk_size = 4 * 1024 * 1024
+let flush_batch_bytes = 1024 * 1024
 
 let print_transfer_stats ~label ~bytes ~started_at =
   let duration_s = max 1e-6 (now_s () -. started_at) in
@@ -145,7 +146,7 @@ let () =
   let download = ref None in
   let upload = ref None in
   let path = ref None in
-  let chunk_size = ref max_data_chunk_size in
+  let chunk_size = ref default_chunk_size in
   let max_dgram_size = ref Quic.Config.default_max_datagram_size in
   let udp_connect = ref true in
   Arg.parse
@@ -162,7 +163,8 @@ let () =
     ; ( "-chunk-size"
       , Arg.Set_int chunk_size
       , Printf.sprintf
-          " File transfer chunk size in bytes (max %d)"
+          " File transfer chunk size in bytes (default %d, max %d)"
+          default_chunk_size
           max_data_chunk_size
       )
     ; ( "-max-dgram-size"
