@@ -1186,13 +1186,44 @@ module Relay_h3 = struct
             stats)
       )
 
-  let download env ~sw ~host ~port ~transfer_id ~output =
+  let download
+        env
+        ~sw
+        ~host
+        ~port
+        ~transfer_id
+        ~output
+        ~expected_name
+        ~expected_len
+      =
     let t, client, tls_host = connect_h3 env ~sw ~host ~port:(relay_data_port port) in
     Fun.protect
       ~finally:(fun () -> Quic_eio.shutdown t)
       (fun () ->
         let done_p, done_u = Eio.Promise.create () in
-        let stats_ref = ref None in
+        let progress_ref = ref None in
+        let out_path_ref = ref None in
+        let announce_receive sender_name expected_len out_path =
+          if Option.is_none !out_path_ref
+          then (
+            out_path_ref := Some out_path;
+            Printf.printf
+              "receiving %s (%s) into %s\n%!"
+              sender_name
+              (match expected_len with
+              | Some len -> Printf.sprintf "%Ld bytes" len
+              | None -> "unknown size")
+              out_path);
+          match !progress_ref, expected_len with
+          | None, Some total ->
+            let progress = create_progress ~label:"receiving" ~total in
+            progress_ref := Some progress;
+            update_progress progress 0L
+          | _ -> ()
+        in
+        let initial_name = Option.value expected_name ~default:"download.bin" in
+        let initial_out_path = Option.value output ~default:("recv-" ^ initial_name) in
+        announce_receive initial_name expected_len initial_out_path;
         let response_handler response response_body =
           let status = H3.Status.to_code response.H3.Response.status in
           if status < 200 || status >= 300
@@ -1210,30 +1241,23 @@ module Relay_h3 = struct
             in
             let out_path = Option.value output ~default:("recv-" ^ sender_name) in
             let stats = Transfer_stats.create ~label:"relay recv" ?total:expected_len () in
-            stats_ref := Some stats;
-            let progress =
-              Option.map (fun total -> create_progress ~label:"receiving" ~total) expected_len
-            in
-            Printf.printf
-              "receiving %s (%s) into %s\n%!"
-              sender_name
-              (match expected_len with
-              | Some len -> Printf.sprintf "%Ld bytes" len
-              | None -> "unknown size")
-              out_path;
-            Option.iter (fun p -> update_progress p 0L) progress;
+            announce_receive sender_name expected_len out_path;
             let oc = open_out_bin out_path in
             let rec read_body () =
               H3.Body.Reader.schedule_read
                 response_body
                 ~on_eof:(fun () ->
-                  Option.iter (fun p -> finish_progress p stats.bytes) progress;
+                  Option.iter
+                    (fun p -> finish_progress p stats.bytes)
+                    !progress_ref;
                   close_out_noerr oc;
                   Eio.Promise.resolve done_u (stats, out_path))
                 ~on_read:(fun bs ~off ~len ->
                   output_string oc (Bigstringaf.substring bs ~off ~len);
                   Transfer_stats.on_bytes stats len;
-                  Option.iter (fun p -> update_progress p stats.bytes) progress;
+                  Option.iter
+                    (fun p -> update_progress p stats.bytes)
+                    !progress_ref;
                   read_body ())
             in
             read_body ()
@@ -1281,7 +1305,11 @@ module Client = struct
 
   type transfer_mode =
     | Use_direct
-    | Use_relay_h3 of string
+    | Use_relay_h3 of
+        { transfer_id : string
+        ; filename : string option
+        ; total_size : int64 option
+        }
 
   let resolve_udp_address host port =
     let addrs =
@@ -1384,7 +1412,14 @@ module Client = struct
     let rec loop () =
       match split_words (wait_for_line_or_fail ch) with
       | [ "USE-DIRECT" ] -> Use_direct
-      | [ "USE-RELAY-H3"; transfer_id ] -> Use_relay_h3 transfer_id
+      | [ "USE-RELAY-H3"; transfer_id ] ->
+        Use_relay_h3 { transfer_id; filename = None; total_size = None }
+      | [ "USE-RELAY-H3"; transfer_id; filename_hex; total_s ] ->
+        Use_relay_h3
+          { transfer_id
+          ; filename = Some (string_of_hex filename_hex)
+          ; total_size = Some (parse_int64 total_s)
+          }
       | [ "PEER_LEFT" ] -> failwith "peer disconnected before transfer mode selected"
       | _ -> loop ()
     in
@@ -1673,10 +1708,17 @@ module Client = struct
                | None -> ()));
            if !transfer_stats = None
            then (
+             let stat = Unix.stat file in
+             let total_size = Int64.of_int stat.Unix.st_size in
+             let filename = Filename.basename file in
              let transfer_id = hex_of_string (random_bytes 16) in
              Line_channel.write_line
                ch
-               (Printf.sprintf "USE-RELAY-H3 %s" transfer_id);
+               (Printf.sprintf
+                  "USE-RELAY-H3 %s %s %Ld"
+                  transfer_id
+                  (hex_of_string filename)
+                  total_size);
              let stats =
                Relay_h3.upload env ~sw ~host:opts.host ~port:opts.port ~transfer_id ~file
              in
@@ -1746,15 +1788,17 @@ module Client = struct
              match direct_listener with
              | None ->
                (match wait_for_mode_or_fail ch with
-               | Use_relay_h3 transfer_id ->
-                 let stats, _out_path =
-                   Relay_h3.download
-                     env
-                     ~sw
-                     ~host:opts.host
-                     ~port:opts.port
-                     ~transfer_id
-                     ~output
+               | Use_relay_h3 { transfer_id; filename; total_size } ->
+                  let stats, _out_path =
+                    Relay_h3.download
+                      env
+                      ~sw
+                      ~host:opts.host
+                      ~port:opts.port
+                      ~transfer_id
+                      ~output
+                      ~expected_name:filename
+                      ~expected_len:total_size
                  in
                  transfer_stats := Some stats;
                  None
@@ -1772,7 +1816,7 @@ module Client = struct
                   transfer_stats := Some stats;
                   Format.printf "received direct upload into %s@." out_path;
                   None
-                | `Mode (Use_relay_h3 transfer_id) ->
+                | `Mode (Use_relay_h3 { transfer_id; filename; total_size }) ->
                   let stats, _out_path =
                     Relay_h3.download
                       env
@@ -1781,6 +1825,8 @@ module Client = struct
                       ~port:opts.port
                       ~transfer_id
                       ~output
+                      ~expected_name:filename
+                      ~expected_len:total_size
                   in
                   transfer_stats := Some stats;
                   None
