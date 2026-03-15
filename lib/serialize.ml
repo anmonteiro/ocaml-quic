@@ -413,6 +413,12 @@ end
 module Writer = struct
   open Faraday
 
+  let single_frame_needs_legacy_serializer = function
+    | Frame_desc.Stream { fragment = { Frame_desc.off; _ }; _ }
+    | Frame_desc.Crypto { Frame_desc.off; _ } ->
+      off >= (1 lsl 14)
+    | _ -> false
+
   type header_info =
     { version : int32
     ; source_cid : CID.t
@@ -880,94 +886,97 @@ module Writer = struct
     Faraday.write_string t.encoder sealed_payload
 
   let write_frames_packet t ~header_info frames =
-    assert (frames <> []);
-    let tag_len = Crypto.AEAD.tag_len header_info.encrypter in
-    let pn_length = packet_number_length header_info.packet_number in
-    let payload_len, write_frames =
+    let use_legacy =
       match frames with
-      | [ frame ] ->
-        let payload_len = frame_encoded_length frame in
-        payload_len, (fun plaintext -> ignore (write_frame_bytes plaintext 0 frame))
-      | _ ->
-        let payload_len =
-          List.fold_left (fun acc frame -> acc + frame_encoded_length frame) 0 frames
+      | [ frame ] -> single_frame_needs_legacy_serializer frame
+      | _ -> false
+    in
+    if use_legacy
+    then write_frames_packet_legacy t ~header_info frames
+    else (
+      assert (frames <> []);
+      let tag_len = Crypto.AEAD.tag_len header_info.encrypter in
+      let pn_length = packet_number_length header_info.packet_number in
+      let payload_len =
+        List.fold_left (fun acc frame -> acc + frame_encoded_length frame) 0 frames
+      in
+      let write_frames plaintext =
+        ignore (List.fold_left (write_frame_bytes plaintext) 0 frames)
+      in
+      let pn_offset = 4 - pn_length in
+      let min_payload_len = pn_offset + 16 - tag_len in
+      let padding =
+        if payload_len < min_payload_len then min_payload_len - payload_len else 0
+      in
+      let payload_len = payload_len + padding in
+      let plaintext = Bytes.create payload_len in
+      write_frames plaintext;
+      let payload_off = payload_len - padding in
+      let payload_off =
+        if padding > 0
+        then (
+          Bytes.fill plaintext payload_off padding '\x00';
+          payload_off + padding)
+        else payload_off
+      in
+      assert (payload_off = payload_len);
+      let header = header_of_encryption_level header_info in
+      let payload_length = payload_len + tag_len in
+      let header_len payload_length =
+        let payload_len_field =
+          match header with
+          | Packet.Header.Initial _
+          | Long { packet_type = Initial | Zero_RTT | Handshake; _ } ->
+            varint_encoding_length (pn_length + payload_length)
+          | Short _ -> 0
+          | Long { packet_type = Retry; _ } -> assert false
         in
-        payload_len, (fun plaintext ->
-          ignore (List.fold_left (write_frame_bytes plaintext) 0 frames))
-    in
-    let pn_offset = 4 - pn_length in
-    let min_payload_len = pn_offset + 16 - tag_len in
-    let padding =
-      if payload_len < min_payload_len then min_payload_len - payload_len else 0
-    in
-    let payload_len = payload_len + padding in
-    let plaintext = Bytes.create payload_len in
-    write_frames plaintext;
-    let payload_off = payload_len - padding in
-    let payload_off =
-      if padding > 0
-      then (
-        Bytes.fill plaintext payload_off padding '\x00';
-        payload_off + padding)
-      else payload_off
-    in
-    assert (payload_off = payload_len);
-    let header = header_of_encryption_level header_info in
-    let payload_length = payload_len + tag_len in
-    let header_len payload_length =
-      let payload_len_field =
+        header_base_length header + payload_len_field + pn_length
+      in
+      let packet_len_for_initial_padding =
+        header_base_length header
+        + payload_length
+        + pn_length
+        + varint_encoding_length 1200
+      in
+      let payload_length, plaintext =
+        match header_info.encryption_level, packet_len_for_initial_padding with
+        | Initial, packet_len when packet_len < 1200 ->
+          let padding_n = 1200 - packet_len in
+          let padded = Bytes.create (payload_len + padding_n) in
+          Bytes.blit plaintext 0 padded 0 payload_len;
+          Bytes.fill padded payload_len padding_n '\x00';
+          payload_length + padding_n, padded
+        | _ -> payload_length, plaintext
+      in
+      let header_len = header_len payload_length in
+      let unprotected_header = Bytes.create header_len in
+      let off = write_packet_header_bytes unprotected_header 0 ~pn_length ~header in
+      let off =
         match header with
         | Packet.Header.Initial _
         | Long { packet_type = Initial | Zero_RTT | Handshake; _ } ->
-          varint_encoding_length (pn_length + payload_length)
-        | Short _ -> 0
+          write_varint_bytes unprotected_header off (pn_length + payload_length)
+        | Short _ -> off
         | Long { packet_type = Retry; _ } -> assert false
       in
-      header_base_length header + payload_len_field + pn_length
-    in
-    let packet_len_for_initial_padding =
-      header_base_length header
-      + payload_length
-      + pn_length
-      + varint_encoding_length 1200
-    in
-    let payload_length, plaintext =
-      match header_info.encryption_level, packet_len_for_initial_padding with
-      | Initial, packet_len when packet_len < 1200 ->
-        let padding_n = 1200 - packet_len in
-        let padded = Bytes.create (payload_len + padding_n) in
-        Bytes.blit plaintext 0 padded 0 payload_len;
-        Bytes.fill padded payload_len padding_n '\x00';
-        payload_length + padding_n, padded
-      | _ -> payload_length, plaintext
-    in
-    let header_len = header_len payload_length in
-    let unprotected_header = Bytes.create header_len in
-    let off = write_packet_header_bytes unprotected_header 0 ~pn_length ~header in
-    let off =
-      match header with
-      | Packet.Header.Initial _ | Long { packet_type = Initial | Zero_RTT | Handshake; _ } ->
-        write_varint_bytes unprotected_header off (pn_length + payload_length)
-      | Short _ -> off
-      | Long { packet_type = Retry; _ } -> assert false
-    in
-    let off =
-      write_packet_number_bytes
-        unprotected_header
-        off
-        ~pn_length
-        ~packet_number:header_info.packet_number
-    in
-    assert (off = header_len);
-    let encrypted_header, sealed_payload =
-      Crypto.AEAD.encrypt_packet_parts
-        header_info.encrypter
-        ~packet_number:header_info.packet_number
-        ~header:(Bytes.unsafe_to_string unprotected_header)
-        (Bytes.unsafe_to_string plaintext)
-    in
-    Faraday.write_string t.encoder encrypted_header;
-    Faraday.write_string t.encoder sealed_payload
+      let off =
+        write_packet_number_bytes
+          unprotected_header
+          off
+          ~pn_length
+          ~packet_number:header_info.packet_number
+      in
+      assert (off = header_len);
+      let encrypted_header, sealed_payload =
+        Crypto.AEAD.encrypt_packet_parts
+          header_info.encrypter
+          ~packet_number:header_info.packet_number
+          ~header:(Bytes.unsafe_to_string unprotected_header)
+          (Bytes.unsafe_to_string plaintext)
+      in
+      Faraday.write_string t.encoder encrypted_header;
+      Faraday.write_string t.encoder sealed_payload)
 
   let faraday t = t.encoder
   let flush t f = flush t.encoder f

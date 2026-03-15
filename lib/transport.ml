@@ -366,6 +366,10 @@ module Connection = struct
   let writer_pending_bytes writer =
     Faraday.pending_bytes (Writer.faraday writer)
 
+  let finish_datagram_if_needed t ~encryption_level =
+    if encryption_level = Encryption_level.Application_data
+    then Writer.flush t.writer ignore
+
   let on_packet_sent t ~encryption_level ~packet_number ~bytes_sent frames =
     let time_sent_ms = next_recovery_time_ms t in
     if Frame.is_any_ack_eliciting frames then t.last_activity_ms <- time_sent_ms;
@@ -399,6 +403,7 @@ module Connection = struct
             (Queue.take t.queued_packets : Writer.header_info * Frame.t list);
           let bytes_before = writer_pending_bytes t.writer in
           Writer.write_frames_packet t.writer ~header_info frames;
+          finish_datagram_if_needed t ~encryption_level;
           let bytes_sent = writer_pending_bytes t.writer - bytes_before in
           on_packet_sent t ~encryption_level ~packet_number ~bytes_sent frames;
           let can_be_followed_by_other_packets =
@@ -1637,6 +1642,7 @@ module Connection = struct
                   let frames = [ Frame.Crypto fragment ] in
                   let bytes_before = writer_pending_bytes t.writer in
                   Writer.write_frames_packet t.writer ~header_info frames;
+                  finish_datagram_if_needed t ~encryption_level;
                   let bytes_sent = writer_pending_bytes t.writer - bytes_before in
                   on_packet_sent
                     t
@@ -1657,6 +1663,7 @@ module Connection = struct
                   | _ ->
                     let bytes_before = writer_pending_bytes t.writer in
                     Writer.write_frames_packet t.writer ~header_info frames;
+                    finish_datagram_if_needed t ~encryption_level;
                     let bytes_sent = writer_pending_bytes t.writer - bytes_before in
                     on_packet_sent
                       t
