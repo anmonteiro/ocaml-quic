@@ -4,6 +4,7 @@ module Crypto = Quic.Crypto
 module InitialAEAD = Quic.Crypto.InitialAEAD
 module AEAD = Quic.Crypto.AEAD
 module Packet_parser = Quic.Fast_parse.Packet_parser
+module Writer = Quic.Serialize.Writer
 
 let dest_cid = Hex.to_string (`Hex "8394c8f03e515708")
 
@@ -68,6 +69,72 @@ let stream_frame_payload =
        ; is_fin = false
        });
   Faraday.serialize_to_string f
+
+let serialize_with writer_fn ~header_info frames =
+  let writer = Writer.create 0x1000 in
+  writer_fn writer ~header_info frames;
+  Faraday.serialize_to_string writer.encoder
+
+let app_header_info ~packet_number =
+  let encrypter = InitialAEAD.make ~mode:Server (Quic.CID.of_string "abc") in
+  Writer.make_header_info
+    ~encrypter
+    ~encryption_level:Application_data
+    ~packet_number
+    ~token:""
+    (Quic.CID.of_string "abcdefgh")
+
+let serializer_cases =
+  let payload_1k = String.make 1024 'x' in
+  [ ( "serialize_runtime_small_stream"
+    , app_header_info ~packet_number:17L
+    , [ Quic.Frame.Stream
+          { id = 0L
+          ; fragment =
+              { Quic.Frame.off = 0
+              ; len = String.length payload_1k
+              ; payload = payload_1k
+              ; payload_off = 0
+              }
+          ; is_fin = false
+          }
+      ] )
+  ; ( "serialize_runtime_large_off"
+    , app_header_info ~packet_number:18L
+    , [ Quic.Frame.Stream
+          { id = 4L
+          ; fragment =
+              { Quic.Frame.off = 1 lsl 20
+              ; len = String.length payload_1k
+              ; payload = payload_1k
+              ; payload_off = 0
+              }
+          ; is_fin = false
+          }
+      ] )
+  ; ( "serialize_runtime_multi_frame"
+    , app_header_info ~packet_number:19L
+    , [ Quic.Frame.Ack
+          { delay = 3
+          ; ranges =
+              [ { Quic.Frame.Range.first = 8L; last = 10L }
+              ; { Quic.Frame.Range.first = 4L; last = 5L }
+              ]
+          ; ecn_counts = Some (1, 2, 3)
+          }
+      ; Quic.Frame.Max_data 4096
+      ; Quic.Frame.Stream
+          { id = 4L
+          ; fragment =
+              { Quic.Frame.off = 1024
+              ; len = 11
+              ; payload = "hello world"
+              ; payload_off = 0
+              }
+          ; is_fin = false
+          }
+      ] )
+  ]
 
 let benchmark name ~bytes_per_iter f =
   Gc.full_major ();
@@ -218,4 +285,29 @@ let () =
            with
            | Ok () -> ()
            | Error e -> failwith e);
-          !frames))
+          !frames);
+      List.iter
+        (fun (name, header_info, frames) ->
+           let bytes_per_iter =
+             String.length
+               (serialize_with Writer.write_frames_packet ~header_info frames)
+           in
+           benchmark
+             (name ^ "_dispatch")
+             ~bytes_per_iter
+             (fun () ->
+               String.length
+                 (serialize_with Writer.write_frames_packet ~header_info frames));
+           benchmark
+             (name ^ "_direct")
+             ~bytes_per_iter
+             (fun () ->
+               String.length
+                 (serialize_with Writer.write_frames_packet_direct ~header_info frames));
+           benchmark
+             (name ^ "_legacy")
+             ~bytes_per_iter
+             (fun () ->
+               String.length
+                 (serialize_with Writer.write_frames_packet_legacy ~header_info frames)))
+        serializer_cases)

@@ -705,6 +705,39 @@ module InitialAEAD_encryption = struct
     in
     Alcotest.(check string) "direct matches legacy" legacy direct
 
+  let test_writer_direct_matches_legacy_large_offset_stream () =
+    let module Writer = Quic.Serialize.Writer in
+    let encrypter = InitialAEAD.make ~mode:Server (Quic.CID.of_string "abc") in
+    let header_info =
+      Writer.make_header_info
+        ~encrypter
+        ~encryption_level:Application_data
+        ~packet_number:29L
+        ~token:""
+        (Quic.CID.of_string "abcdefgh")
+    in
+    let payload = String.make 1024 'x' in
+    let frames =
+      [ Quic.Frame.Stream
+          { id = 4L
+          ; fragment =
+              { off = 1 lsl 20
+              ; len = String.length payload
+              ; payload
+              ; payload_off = 0
+              }
+          ; is_fin = false
+          }
+      ]
+    in
+    let direct =
+      serialize_with Writer.write_frames_packet_direct ~header_info frames
+    in
+    let legacy =
+      serialize_with Writer.write_frames_packet_legacy ~header_info frames
+    in
+    Alcotest.(check string) "direct matches legacy" legacy direct
+
   let suite =
     [ ( "header encryption / decryption"
       , `Quick
@@ -726,6 +759,9 @@ module InitialAEAD_encryption = struct
     ; ( "writer direct matches legacy multi frame"
       , `Quick
       , test_writer_direct_matches_legacy_multi_frame )
+    ; ( "writer direct matches legacy large offset stream"
+      , `Quick
+      , test_writer_direct_matches_legacy_large_offset_stream )
     ]
 end
 
