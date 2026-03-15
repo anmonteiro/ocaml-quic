@@ -451,6 +451,14 @@ module Direct = struct
             (fun total -> create_progress ~label:"receiving" ~total)
             expected_len
         in
+        Printf.printf
+          "receiving %s (%s) into %s\n%!"
+          sender_name
+          (match expected_len with
+          | Some len -> Printf.sprintf "%Ld bytes" len
+          | None -> "unknown size")
+          out_path;
+        Option.iter (fun p -> update_progress p 0L) progress;
         let oc = open_out_bin out_path in
         let finished = ref false in
         let finalize ok =
@@ -1206,6 +1214,14 @@ module Relay_h3 = struct
             let progress =
               Option.map (fun total -> create_progress ~label:"receiving" ~total) expected_len
             in
+            Printf.printf
+              "receiving %s (%s) into %s\n%!"
+              sender_name
+              (match expected_len with
+              | Some len -> Printf.sprintf "%Ld bytes" len
+              | None -> "unknown size")
+              out_path;
+            Option.iter (fun p -> update_progress p 0L) progress;
             let oc = open_out_bin out_path in
             let rec read_body () =
               H3.Body.Reader.schedule_read
@@ -1706,7 +1722,7 @@ module Client = struct
                     ~output)
                direct_port
            in
-            (match direct_listener with
+           (match direct_listener with
             | None -> Line_channel.write_line ch "NO-DIRECT"
             | Some listener ->
              Eio.Time.sleep (Eio.Stdenv.clock env) 0.1;
@@ -1725,6 +1741,7 @@ module Client = struct
                "awaiting direct peer connection on udp port %d@."
                listener.port;
              send_direct_candidates ch candidates);
+           Printf.printf "waiting for sender to start transfer...\n%!";
            let recv_ch =
              match direct_listener with
              | None ->
