@@ -338,7 +338,8 @@ module Send = struct
   let max_buffered_bytes = 4 * 1024 * 1024
 
   type t =
-    { mutable deferred : Q.t
+    { mutable deferred_head : Frame.fragment option
+    ; mutable deferred : Q.t
     ; fresh : Frame.fragment Queue.t
     ; mutable offset : int (* TODO: int64? *)
     ; mutable buffered_bytes : int
@@ -366,18 +367,24 @@ module Send = struct
 
   let pop t =
     let next_fragment () =
-      match Q.pop t.deferred with
-      | Some ((_off, fragment), q') ->
-        t.deferred <- q';
+      match t.deferred_head with
+      | Some fragment ->
+        t.deferred_head <- None;
         t.buffered_bytes <- t.buffered_bytes - fragment.len;
         Some fragment
       | None ->
-        if Queue.is_empty t.fresh
-        then None
-        else (
-          let fragment = Queue.take t.fresh in
-          t.buffered_bytes <- t.buffered_bytes - fragment.len;
-          Some fragment)
+        (match Q.pop t.deferred with
+         | Some ((_off, fragment), q') ->
+           t.deferred <- q';
+           t.buffered_bytes <- t.buffered_bytes - fragment.len;
+           Some fragment
+         | None ->
+           if Queue.is_empty t.fresh
+           then None
+           else (
+             let fragment = Queue.take t.fresh in
+             t.buffered_bytes <- t.buffered_bytes - fragment.len;
+             Some fragment))
     in
     match next_fragment () with
     | Some fragment ->
@@ -386,7 +393,9 @@ module Send = struct
         | None -> false
         | Some fin_offset ->
           assert (fin_offset = t.offset);
-          Q.is_empty t.deferred && Queue.is_empty t.fresh
+          Option.is_none t.deferred_head
+          && Q.is_empty t.deferred
+          && Queue.is_empty t.fresh
       in
       Some (fragment, is_fin)
     | None -> None
@@ -397,19 +406,30 @@ module Send = struct
     | None -> failwith "Quic.Stream.Send.pop_exn"
 
   let remove off t =
-    match Q.find off t.deferred with
-    | Some fragment ->
-      t.buffered_bytes <- t.buffered_bytes - fragment.len;
-      t.deferred <- Q.remove off t.deferred
-    | None -> ()
+    match t.deferred_head with
+    | Some fragment when fragment.Frame.off = off ->
+      t.deferred_head <- None;
+      t.buffered_bytes <- t.buffered_bytes - fragment.len
+    | Some _ | None ->
+      (match Q.find off t.deferred with
+      | Some fragment ->
+        t.buffered_bytes <- t.buffered_bytes - fragment.len;
+        t.deferred <- Q.remove off t.deferred
+      | None -> ())
 
   let requeue fragment t =
-    let q' = Q.add fragment.Frame.off fragment t.deferred in
-    t.deferred <- q';
+    (match t.deferred_head with
+    | None -> t.deferred_head <- Some fragment
+    | Some current when fragment.Frame.off < current.Frame.off ->
+      t.deferred <- Q.add current.Frame.off current t.deferred;
+      t.deferred_head <- Some fragment
+    | Some _ ->
+      t.deferred <- Q.add fragment.Frame.off fragment t.deferred);
     t.buffered_bytes <- t.buffered_bytes + fragment.len
 
   let create when_ready =
-    { deferred = Q.empty
+    { deferred_head = None
+    ; deferred = Q.empty
     ; fresh = Queue.create ()
     ; offset = 0
     ; buffered_bytes = 0
@@ -422,7 +442,8 @@ module Send = struct
   let has_pending_output t =
     (* Force another write poll to make sure that a frame with the fin bit set
        is sent. *)
-    not (Q.is_empty t.deferred)
+    Option.is_some t.deferred_head
+    || not (Q.is_empty t.deferred)
     || not (Queue.is_empty t.fresh)
     || Buffer.has_pending_output t.producer
 
