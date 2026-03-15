@@ -358,7 +358,9 @@ module IO_loop = struct
         | exception Exit -> raise_notrace Exit
         | exception
             ( Unix.Unix_error (ENOTCONN, _, _)
+            | Unix.Unix_error (ECONNREFUSED, _, _)
             | Eio.Io (Eio.Exn.X (Eio_unix.Unix_error (ENOTCONN, _, _)), _)
+            | Eio.Io (Eio.Exn.X (Eio_unix.Unix_error (ECONNREFUSED, _, _)), _)
             | Eio.Io (Eio.Net.E (Connection_reset _), _) ) ->
           (* TODO(anmonteiro): logging? *)
           raise End_of_file
@@ -540,12 +542,19 @@ module IO_loop = struct
                       then (
                         try `Ok (send_msg_iovecs_connected_nb fd io_vectors)
                         with
-                        | Unix.Unix_error (Unix.EAGAIN, _, _) -> `Would_block)
+                        | Unix.Unix_error (Unix.EAGAIN, _, _) -> `Would_block
+                        | Unix.Unix_error (Unix.ECONNREFUSED, _, _) -> `Would_block
+                        | Unix.Unix_error (Unix.ECONNRESET, _, _) -> `Would_block)
                       else
                         try `Ok (send_msg_iovecs_connected_nb fd io_vectors)
                         with
                         | Unix.Unix_error (Unix.EAGAIN, _, _) ->
-                          `Ok (send_msg_iovecs_connected fd io_vectors))
+                          (try `Ok (send_msg_iovecs_connected fd io_vectors)
+                           with
+                           | Unix.Unix_error (Unix.ECONNREFUSED, _, _) -> `Would_block
+                           | Unix.Unix_error (Unix.ECONNRESET, _, _) -> `Would_block)
+                        | Unix.Unix_error (Unix.ECONNREFUSED, _, _) -> `Would_block
+                        | Unix.Unix_error (Unix.ECONNRESET, _, _) -> `Would_block)
                   | None ->
                     Io.writev
                       ~udp_send_fast_path_enabled
