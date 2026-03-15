@@ -303,11 +303,5 @@ let () =
              ~bytes_per_iter
              (fun () ->
                String.length
-                 (serialize_with Writer.write_frames_packet_direct ~header_info frames));
-           benchmark
-             (name ^ "_legacy")
-             ~bytes_per_iter
-             (fun () ->
-               String.length
-                 (serialize_with Writer.write_frames_packet_legacy ~header_info frames)))
+                 (serialize_with Writer.write_frames_packet_direct ~header_info frames)))
         serializer_cases)

@@ -620,7 +620,7 @@ module InitialAEAD_encryption = struct
     writer_fn writer ~header_info frames;
     Faraday.serialize_to_string writer.encoder
 
-  let test_writer_direct_matches_legacy_ack_initial () =
+  let test_writer_direct_matches_dispatch_ack_initial () =
     let module Writer = Quic.Serialize.Writer in
     let encrypter = InitialAEAD.make ~mode:Server (Quic.CID.of_string "abc") in
     let header_info =
@@ -639,13 +639,13 @@ module InitialAEAD_encryption = struct
           }
       ]
     in
-    let direct = serialize_with Writer.write_frames_packet ~header_info frames in
-    let legacy =
-      serialize_with Writer.write_frames_packet_legacy ~header_info frames
+    let dispatch = serialize_with Writer.write_frames_packet ~header_info frames in
+    let direct =
+      serialize_with Writer.write_frames_packet_direct ~header_info frames
     in
-    Alcotest.(check string) "direct matches legacy" legacy direct
+    Alcotest.(check string) "dispatch matches direct" dispatch direct
 
-  let test_writer_direct_matches_legacy_stream_app_data () =
+  let test_writer_direct_matches_dispatch_stream_app_data () =
     let module Writer = Quic.Serialize.Writer in
     let encrypter = InitialAEAD.make ~mode:Server (Quic.CID.of_string "abc") in
     let header_info =
@@ -664,13 +664,13 @@ module InitialAEAD_encryption = struct
           }
       ]
     in
-    let direct = serialize_with Writer.write_frames_packet ~header_info frames in
-    let legacy =
-      serialize_with Writer.write_frames_packet_legacy ~header_info frames
+    let dispatch = serialize_with Writer.write_frames_packet ~header_info frames in
+    let direct =
+      serialize_with Writer.write_frames_packet_direct ~header_info frames
     in
-    Alcotest.(check string) "direct matches legacy" legacy direct
+    Alcotest.(check string) "dispatch matches direct" dispatch direct
 
-  let test_writer_direct_matches_legacy_multi_frame () =
+  let test_writer_direct_matches_dispatch_multi_frame () =
     let module Writer = Quic.Serialize.Writer in
     let encrypter = InitialAEAD.make ~mode:Server (Quic.CID.of_string "abc") in
     let header_info =
@@ -699,13 +699,13 @@ module InitialAEAD_encryption = struct
           }
       ]
     in
-    let direct = serialize_with Writer.write_frames_packet ~header_info frames in
-    let legacy =
-      serialize_with Writer.write_frames_packet_legacy ~header_info frames
+    let dispatch = serialize_with Writer.write_frames_packet ~header_info frames in
+    let direct =
+      serialize_with Writer.write_frames_packet_direct ~header_info frames
     in
-    Alcotest.(check string) "direct matches legacy" legacy direct
+    Alcotest.(check string) "dispatch matches direct" dispatch direct
 
-  let test_writer_direct_matches_legacy_large_offset_stream () =
+  let test_writer_direct_matches_dispatch_large_offset_stream () =
     let module Writer = Quic.Serialize.Writer in
     let encrypter = InitialAEAD.make ~mode:Server (Quic.CID.of_string "abc") in
     let header_info =
@@ -733,10 +733,8 @@ module InitialAEAD_encryption = struct
     let direct =
       serialize_with Writer.write_frames_packet_direct ~header_info frames
     in
-    let legacy =
-      serialize_with Writer.write_frames_packet_legacy ~header_info frames
-    in
-    Alcotest.(check string) "direct matches legacy" legacy direct
+    let dispatch = serialize_with Writer.write_frames_packet ~header_info frames in
+    Alcotest.(check string) "dispatch matches direct" dispatch direct
 
   let suite =
     [ ( "header encryption / decryption"
@@ -750,18 +748,18 @@ module InitialAEAD_encryption = struct
       , test_server_initial_aead_packet_encryption_decryption )
     ; "ocaml-quic generated", `Quick, test_ocaml_quic_enc_dec
     ; "ocaml-quic serialized", `Quick, test_ocaml_quic_decrypt_serialized
-    ; ( "writer direct matches legacy ack initial"
+    ; ( "writer direct matches dispatch ack initial"
       , `Quick
-      , test_writer_direct_matches_legacy_ack_initial )
-    ; ( "writer direct matches legacy stream app data"
+      , test_writer_direct_matches_dispatch_ack_initial )
+    ; ( "writer direct matches dispatch stream app data"
       , `Quick
-      , test_writer_direct_matches_legacy_stream_app_data )
-    ; ( "writer direct matches legacy multi frame"
+      , test_writer_direct_matches_dispatch_stream_app_data )
+    ; ( "writer direct matches dispatch multi frame"
       , `Quick
-      , test_writer_direct_matches_legacy_multi_frame )
-    ; ( "writer direct matches legacy large offset stream"
+      , test_writer_direct_matches_dispatch_multi_frame )
+    ; ( "writer direct matches dispatch large offset stream"
       , `Quick
-      , test_writer_direct_matches_legacy_large_offset_stream )
+      , test_writer_direct_matches_dispatch_large_offset_stream )
     ]
 end
 
