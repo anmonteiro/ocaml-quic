@@ -1927,6 +1927,7 @@ let on_close t (connection : Connection.t) =
 
 let create_new_connection
       ?src_cid
+      ?max_datagram_size
       ~peer_address
       ~tls_state
       ~connection_handler
@@ -1951,7 +1952,7 @@ let create_new_connection
       ~peer_address
       ~tls_state
       ~transport_parameters:t.config.transport_parameters
-      ~max_datagram_size:t.config.max_datagram_size
+      ~max_datagram_size:(Option.value max_datagram_size ~default:t.config.max_datagram_size)
       ~now_ms:t.now_ms
       ~wakeup_writer:(ready_to_write t)
       ~shutdown:(on_close t)
@@ -2325,7 +2326,7 @@ module Client = struct
     create ~mode:Client ~now_ms ~config connection_handler
 end
 
-let connect t ~address ~host connection_handler =
+let connect ?max_datagram_size t ~address ~host connection_handler =
   let { Config.alpn_protocols; transport_parameters; _ } = t.config in
   let dest_cid = CID.generate () in
   let src_cid = CID.generate () in
@@ -2378,6 +2379,7 @@ let connect t ~address ~host connection_handler =
   let new_connection =
     create_new_connection
       t
+      ?max_datagram_size
       ~peer_address:address
       ~tls_state
       ~src_cid

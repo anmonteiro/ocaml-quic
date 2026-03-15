@@ -670,6 +670,7 @@ end
 
 type t =
   { transport : Quic.Transport.t
+  ; config : Quic.Config.t
   ; shutdown_io : unit -> unit
   ; connect_udp : string -> unit
   }
@@ -727,13 +728,26 @@ module Client = struct
         ~udp_send_fast_path_enabled:IO_loop.Io.client_udp_send_fast_path_enabled
         connection
         fd);
-    { transport = connection; shutdown_io; connect_udp }
+    { transport = connection; config; shutdown_io; connect_udp }
 end
 
 let connect t ~address ~host f =
   let address = Addr.serialize address in
   t.connect_udp address;
-  Quic.Transport.connect t.transport ~address ~host f
+  let max_datagram_size =
+    if t.config.max_datagram_size <> Quic.Config.default_max_datagram_size
+    then None
+    else
+      match Addr.parse address with
+      | `Unix _ -> None
+      | `Udp (host_ip, _port) ->
+        Some
+          (Eio.Net.Ipaddr.fold
+             host_ip
+             ~v4:(fun _ -> 1452)
+             ~v6:(fun _ -> 1232))
+  in
+  Quic.Transport.connect ?max_datagram_size t.transport ~address ~host f
 
 let shutdown t =
   t.shutdown_io ()

@@ -171,7 +171,8 @@ module Transport : sig
   end
 
   val connect
-    :  t
+    :  ?max_datagram_size:int
+    -> t
     -> address:string
     -> host:string
     -> (cid:string -> start_stream:start_stream -> stream_handler)
