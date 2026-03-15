@@ -220,6 +220,28 @@ module Producer = struct
       Queue.add { payload; off = 0; len } t.chunks;
       t.total_enqueued <- t.total_enqueued + len)
 
+  let queue_string_slice t s ~off ~len =
+    if len > 0
+    then
+      let payload =
+        if off = 0 && len = String.length s then s else String.sub s off len
+      in
+      queue_string_payload t payload
+
+  let queue_scratch_prefixed_string t s ~off ~len =
+    let payload = Bytes.create (t.scratch_len + len) in
+    Bytes.blit t.scratch 0 payload 0 t.scratch_len;
+    Bytes.blit_string s off payload t.scratch_len len;
+    t.scratch_len <- 0;
+    queue_string_payload t (Bytes.unsafe_to_string payload)
+
+  let queue_scratch_prefixed_bigstring t b ~off ~len =
+    let payload = Bytes.create (t.scratch_len + len) in
+    Bytes.blit t.scratch 0 payload 0 t.scratch_len;
+    Bigstringaf.blit_to_bytes b ~src_off:off payload ~dst_off:t.scratch_len ~len;
+    t.scratch_len <- 0;
+    queue_string_payload t (Bytes.unsafe_to_string payload)
+
   let flush_scratch t =
     if t.scratch_len > 0
     then (
@@ -271,12 +293,11 @@ module Producer = struct
       let len = Option.value len ~default:(String.length s - off) in
       if len <= 256
       then append_string t ~off ~len s
+      else if t.scratch_len > 0 && t.scratch_len <= 16
+      then queue_scratch_prefixed_string t s ~off ~len
       else (
         flush_scratch t;
-        let payload =
-          if off = 0 && len = String.length s then s else String.sub s off len
-        in
-        queue_string_payload t payload)
+        queue_string_slice t s ~off ~len)
 
   let write_bigstring t ?off ?len b =
     match t.mode with
@@ -290,6 +311,8 @@ module Producer = struct
         ensure_scratch_capacity t len;
         Bigstringaf.blit_to_bytes b ~src_off:off t.scratch ~dst_off:t.scratch_len ~len;
         t.scratch_len <- t.scratch_len + len)
+      else if t.scratch_len > 0 && t.scratch_len <= 16
+      then queue_scratch_prefixed_bigstring t b ~off ~len
       else (
         flush_scratch t;
         queue_string_payload t (Bigstringaf.substring b ~off ~len))
