@@ -158,6 +158,230 @@ module Buffer = struct
     ready t
 end
 
+module Producer = struct
+  type chunk =
+    { payload : string
+    ; mutable off : int
+    ; mutable len : int
+    }
+
+  type flush_marker =
+    { target : int
+    ; callback : unit -> unit
+    }
+
+  type mode =
+    | Queue_mode
+    | Faraday_mode of Buffer.t
+
+  type t =
+    { mutable mode : mode
+    ; chunks : chunk Queue.t
+    ; flushes : flush_marker Queue.t
+    ; mutable scratch : Bytes.t
+    ; mutable scratch_len : int
+    ; mutable total_enqueued : int
+    ; mutable total_drained : int
+    ; mutable closed : bool
+    ; when_ready : unit -> unit
+    }
+
+  let create when_ready =
+    { mode = Queue_mode
+    ; chunks = Queue.create ()
+    ; flushes = Queue.create ()
+    ; scratch = Bytes.create 0x1000
+    ; scratch_len = 0
+    ; total_enqueued = 0
+    ; total_drained = 0
+    ; closed = false
+    ; when_ready
+    }
+
+  let ensure_open t =
+    if t.closed then failwith "stream writer closed"
+
+  let ensure_scratch_capacity t needed =
+    let required = t.scratch_len + needed in
+    if required > Bytes.length t.scratch
+    then (
+      let next_len = ref (Bytes.length t.scratch) in
+      while !next_len < required do
+        next_len := !next_len * 2
+      done;
+      let next = Bytes.create !next_len in
+      Bytes.blit t.scratch 0 next 0 t.scratch_len;
+      t.scratch <- next)
+
+  let queue_string_payload t payload =
+    let len = String.length payload in
+    if len > 0
+    then (
+      Queue.add { payload; off = 0; len } t.chunks;
+      t.total_enqueued <- t.total_enqueued + len)
+
+  let flush_scratch t =
+    if t.scratch_len > 0
+    then (
+      queue_string_payload t (Bytes.sub_string t.scratch 0 t.scratch_len);
+      t.scratch_len <- 0)
+
+  let append_bytes t src ~src_off ~len =
+    ensure_scratch_capacity t len;
+    Bytes.blit src src_off t.scratch t.scratch_len len;
+    t.scratch_len <- t.scratch_len + len
+
+  let append_string t ?(off = 0) ?len s =
+    let len = match len with None -> String.length s - off | Some len -> len in
+    if len > 0 then append_bytes t (Bytes.unsafe_of_string s) ~src_off:off ~len
+
+  let maybe_complete_flushes t =
+    while
+      (not (Queue.is_empty t.flushes))
+      && (Queue.peek t.flushes).target <= t.total_drained
+    do
+      let { callback; _ } = Queue.take t.flushes in
+      callback ()
+    done
+
+  let write_uint8 t c =
+    match t.mode with
+    | Faraday_mode producer -> Buffer.write_uint8 producer c
+    | Queue_mode ->
+      ensure_open t;
+      ensure_scratch_capacity t 1;
+      Bytes.unsafe_set t.scratch t.scratch_len (Char.unsafe_chr c);
+      t.scratch_len <- t.scratch_len + 1
+
+  let write_char t c =
+    match t.mode with
+    | Faraday_mode producer -> Buffer.write_char producer c
+    | Queue_mode ->
+      ensure_open t;
+      ensure_scratch_capacity t 1;
+      Bytes.unsafe_set t.scratch t.scratch_len c;
+      t.scratch_len <- t.scratch_len + 1
+
+  let write_string t ?off ?len s =
+    match t.mode with
+    | Faraday_mode producer -> Buffer.write_string producer ?off ?len s
+    | Queue_mode ->
+      ensure_open t;
+      let off = Option.value off ~default:0 in
+      let len = Option.value len ~default:(String.length s - off) in
+      if len <= 256
+      then append_string t ~off ~len s
+      else (
+        flush_scratch t;
+        let payload =
+          if off = 0 && len = String.length s then s else String.sub s off len
+        in
+        queue_string_payload t payload)
+
+  let write_bigstring t ?off ?len b =
+    match t.mode with
+    | Faraday_mode producer -> Buffer.write_bigstring producer ?off ?len b
+    | Queue_mode ->
+      ensure_open t;
+      let off = Option.value off ~default:0 in
+      let len = Option.value len ~default:(Bigstringaf.length b - off) in
+      if len <= 256
+      then (
+        ensure_scratch_capacity t len;
+        Bigstringaf.blit_to_bytes b ~src_off:off t.scratch ~dst_off:t.scratch_len ~len;
+        t.scratch_len <- t.scratch_len + len)
+      else (
+        flush_scratch t;
+        queue_string_payload t (Bigstringaf.substring b ~off ~len))
+
+  let schedule_bigstring t ?off ?len b =
+    match t.mode with
+    | Faraday_mode producer -> Buffer.schedule_bigstring producer ?off ?len b
+    | Queue_mode ->
+      ensure_open t;
+      flush_scratch t;
+      let off = Option.value off ~default:0 in
+      let len = Option.value len ~default:(Bigstringaf.length b - off) in
+      queue_string_payload t (Bigstringaf.substring b ~off ~len)
+
+  let flush t kontinue =
+    match t.mode with
+    | Faraday_mode producer -> Buffer.flush producer kontinue
+    | Queue_mode ->
+      flush_scratch t;
+      let target = t.total_enqueued in
+      if target <= t.total_drained
+      then kontinue ()
+      else Queue.add { target; callback = kontinue } t.flushes;
+      t.when_ready ()
+
+  let has_pending_output t =
+    match t.mode with
+    | Faraday_mode producer -> Buffer.has_pending_output producer
+    | Queue_mode -> t.scratch_len > 0 || not (Queue.is_empty t.chunks)
+
+  let is_closed t =
+    match t.mode with
+    | Faraday_mode producer -> Buffer.is_closed producer
+    | Queue_mode -> t.closed
+
+  let close_writer t =
+    match t.mode with
+    | Faraday_mode producer -> Buffer.close_writer producer
+    | Queue_mode ->
+      flush_scratch t;
+      t.closed <- true;
+      t.when_ready ()
+
+  let unsafe_faraday t =
+    match t.mode with
+    | Faraday_mode producer -> Buffer.unsafe_faraday producer
+    | Queue_mode ->
+      let producer = Buffer.create (Bigstringaf.create 0x1000) t.when_ready in
+      flush_scratch t;
+      let replayed = ref t.total_drained in
+      Queue.iter
+        (fun { payload; off; len } ->
+          Buffer.write_string producer ~off ~len payload;
+          replayed := !replayed + len;
+          while
+            (not (Queue.is_empty t.flushes))
+            && (Queue.peek t.flushes).target <= !replayed
+          do
+            let { callback; _ } = Queue.take t.flushes in
+            Buffer.flush producer callback
+          done)
+        t.chunks;
+      Queue.clear t.chunks;
+      if t.closed then Buffer.close_writer producer;
+      t.mode <- Faraday_mode producer;
+      Buffer.unsafe_faraday producer
+
+  let drain t ~max_bytes ~push =
+    match t.mode with
+    | Faraday_mode producer -> `Faraday producer
+    | Queue_mode ->
+      flush_scratch t;
+      if Queue.is_empty t.chunks
+      then if t.closed then `Close else `Yield
+      else (
+        let remaining = ref max_bytes in
+        let drained = ref 0 in
+        while !remaining > 0 && not (Queue.is_empty t.chunks) do
+          let chunk = Queue.peek t.chunks in
+          let take = min chunk.len !remaining in
+          push chunk.payload chunk.off take;
+          chunk.off <- chunk.off + take;
+          chunk.len <- chunk.len - take;
+          remaining := !remaining - take;
+          drained := !drained + take;
+          t.total_drained <- t.total_drained + take;
+          if chunk.len = 0 then ignore (Queue.take t.chunks)
+        done;
+        maybe_complete_flushes t;
+        `Drained !drained)
+end
+
 (* From RFC<QUIC-RFC>§2.2:
  *   Endpoints MUST be able to deliver stream data to an application as an
  *   ordered byte-stream. Delivering an ordered byte-stream requires that an
@@ -343,7 +567,7 @@ module Send = struct
     ; fresh : Frame.fragment Queue.t
     ; mutable offset : int (* TODO: int64? *)
     ; mutable buffered_bytes : int
-    ; producer : Buffer.t
+    ; producer : Producer.t
     ; mutable fin_offset : int option
     }
 
@@ -357,13 +581,16 @@ module Send = struct
       | Reset_recvd
   end
 
-  let push payload t =
-    let len = String.length payload in
-    let fragment = { Frame.off = t.offset; len; payload; payload_off = 0 } in
+  let push_fragment payload ~payload_off ~len t =
+    let fragment = { Frame.off = t.offset; len; payload; payload_off } in
     Queue.add fragment t.fresh;
     t.offset <- t.offset + len;
     t.buffered_bytes <- t.buffered_bytes + len;
     fragment
+
+  let push payload t =
+    let len = String.length payload in
+    push_fragment payload ~payload_off:0 ~len t
 
   let pop t =
     let next_fragment () =
@@ -433,9 +660,7 @@ module Send = struct
     ; fresh = Queue.create ()
     ; offset = 0
     ; buffered_bytes = 0
-    ; producer =
-        (* TODO: configurable size? *)
-        Buffer.create (Bigstringaf.create 0x1000) when_ready
+    ; producer = Producer.create when_ready
     ; fin_offset = None
     }
 
@@ -445,45 +670,68 @@ module Send = struct
     Option.is_some t.deferred_head
     || not (Q.is_empty t.deferred)
     || not (Queue.is_empty t.fresh)
-    || Buffer.has_pending_output t.producer
+    || Producer.has_pending_output t.producer
 
   (* TODO: this is probably not needed? *)
   (* || Option.is_none t.fin_offset *)
 
   let flush ?(max_bytes = Int.max_int) t =
-    let faraday = t.producer.faraday in
-    match Faraday.operation faraday with
-    | `Yield -> 0
-    | `Close ->
-      (match t.fin_offset with
-      | None ->
-        t.fin_offset <- Some t.offset;
-        ignore (push "" t : Frame.fragment)
-      | Some _ -> ());
-      0
-    | `Writev iovecs ->
-      let lengthv = IOVec.lengthv iovecs in
-      let room = max 0 (max_buffered_bytes - t.buffered_bytes) in
-      let writev_len = min room (min max_bytes lengthv) in
-      if writev_len = 0
-      then 0
-      else (
-        let remaining = ref writev_len in
-        List.iter
-          (fun { IOVec.buffer; off; len } ->
-             if !remaining > 0
-             then
-               let take = min len !remaining in
-               if take > 0
-               then (
-                 (* Copy before shifting Faraday's internal buffer; otherwise
-                    queued fragments can alias mutable storage and get corrupted. *)
-                 let fragment = Bigstringaf.substring buffer ~off ~len:take in
-                 ignore (push fragment t : Frame.fragment);
-                 remaining := !remaining - take))
-          iovecs;
-        Faraday.shift faraday writev_len;
-        writev_len)
+    let room = max 0 (max_buffered_bytes - t.buffered_bytes) in
+    let max_bytes = min room max_bytes in
+    if max_bytes = 0
+    then 0
+    else
+      match
+        Producer.drain
+          t.producer
+          ~max_bytes
+          ~push:(fun payload off len ->
+            ignore
+              ((if off = 0 && len = String.length payload
+                then push_fragment payload ~payload_off:0 ~len t
+                else push_fragment payload ~payload_off:off ~len t)
+                : Frame.fragment))
+      with
+      | `Yield -> 0
+      | `Close ->
+        (match t.fin_offset with
+        | None ->
+          t.fin_offset <- Some t.offset;
+          ignore (push "" t : Frame.fragment)
+        | Some _ -> ());
+        0
+      | `Drained len -> len
+      | `Faraday producer ->
+        let faraday = Buffer.unsafe_faraday producer in
+        (match Faraday.operation faraday with
+        | `Yield -> 0
+        | `Close ->
+          (match t.fin_offset with
+          | None ->
+            t.fin_offset <- Some t.offset;
+            ignore (push "" t : Frame.fragment)
+          | Some _ -> ());
+          0
+        | `Writev iovecs ->
+          let lengthv = IOVec.lengthv iovecs in
+          let writev_len = min max_bytes lengthv in
+          if writev_len = 0
+          then 0
+          else (
+            let remaining = ref writev_len in
+            List.iter
+              (fun { IOVec.buffer; off; len } ->
+                 if !remaining > 0
+                 then
+                   let take = min len !remaining in
+                   if take > 0
+                   then (
+                     let fragment = Bigstringaf.substring buffer ~off ~len:take in
+                     ignore (push fragment t : Frame.fragment);
+                     remaining := !remaining - take))
+              iovecs;
+            Faraday.shift faraday writev_len;
+            writev_len))
 
   let final_size t =
     (* From RFC9000§4.5:
@@ -543,19 +791,19 @@ let direction { typ; _ } =
 let peer_address { peer_address; _ } = peer_address
 
 (* Public (application layer) API *)
-let write_uint8 t c = Buffer.write_uint8 t.send.producer c
-let write_char t c = Buffer.write_char t.send.producer c
-let write_string t ?off ?len s = Buffer.write_string t.send.producer ?off ?len s
+let write_uint8 t c = Producer.write_uint8 t.send.producer c
+let write_char t c = Producer.write_char t.send.producer c
+let write_string t ?off ?len s = Producer.write_string t.send.producer ?off ?len s
 
 let write_bigstring t ?off ?len b =
-  Buffer.write_bigstring t.send.producer ?off ?len b
+  Producer.write_bigstring t.send.producer ?off ?len b
 
 let schedule_bigstring t ?off ?len (b : Bigstringaf.t) =
-  Buffer.schedule_bigstring t.send.producer ?off ?len b
+  Producer.schedule_bigstring t.send.producer ?off ?len b
 
-let unsafe_faraday t = Buffer.unsafe_faraday t.send.producer
-let flush t k = Buffer.flush t.send.producer k
-let close_writer t = Buffer.close_writer t.send.producer
+let unsafe_faraday t = Producer.unsafe_faraday t.send.producer
+let flush t k = Producer.flush t.send.producer k
+let close_writer t = Producer.close_writer t.send.producer
 
 let schedule_read t ~on_eof ~on_read =
   Buffer.schedule_read t.recv.consumer ~on_eof ~on_read
@@ -563,6 +811,6 @@ let schedule_read t ~on_eof ~on_read =
 let close_reader t = Buffer.close_reader t.recv.consumer
 
 let is_closed t =
-  Buffer.is_closed t.recv.consumer && Buffer.is_closed t.send.producer
+  Buffer.is_closed t.recv.consumer && Producer.is_closed t.send.producer
 
 let report_application_error t code = t.report_application_error code
