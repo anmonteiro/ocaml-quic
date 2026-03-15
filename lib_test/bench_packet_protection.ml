@@ -183,6 +183,9 @@ let () =
         !iters
         (String.length packet)
         Client_initial.payload_length;
+      let sample_off =
+        4 - Quic.Crypto.packet_number_length_str Client_initial.unprotected_header
+      in
       benchmark
         "encrypt_payload_into"
         ~bytes_per_iter:(String.length Client_initial.unprotected_payload)
@@ -195,6 +198,37 @@ let () =
               Client_initial.unprotected_payload
           in
           Bytes.get_uint8 sealed 0);
+      benchmark
+        "encrypt_header_only"
+        ~bytes_per_iter:(String.length Client_initial.unprotected_header)
+        (fun () ->
+          let sealed =
+            AEAD.encrypt_payload_into
+              encrypter
+              ~packet_number:Client_initial.packet_number
+              ~header:Client_initial.unprotected_header
+              Client_initial.unprotected_payload
+          in
+          let protected =
+            AEAD.encrypt_header_ecb_at
+              encrypter
+              ~sample_src:sealed
+              ~sample_off
+              Client_initial.unprotected_header
+          in
+          Bytes.get_uint8 protected 0);
+      benchmark
+        "encrypt_packet_parts"
+        ~bytes_per_iter:(String.length packet)
+        (fun () ->
+          let protected_header, sealed =
+            AEAD.encrypt_packet_parts
+              encrypter
+              ~packet_number:Client_initial.packet_number
+              ~header:Client_initial.unprotected_header
+              Client_initial.unprotected_payload
+          in
+          String.length protected_header lxor String.length sealed);
       benchmark
         "decrypt_packet"
         ~bytes_per_iter:(String.length packet)
