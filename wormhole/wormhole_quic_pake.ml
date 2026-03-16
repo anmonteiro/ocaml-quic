@@ -85,10 +85,11 @@ type progress =
   ; total : int64
   ; width : int
   ; mutable last_percent : int
+  ; mutable last_rendered_at : float
   }
 
 let create_progress ~label ~total =
-  { label; total; width = 30; last_percent = -1 }
+  { label; total; width = 30; last_percent = -1; last_rendered_at = 0. }
 
 let progress_percent ~current ~total =
   if total <= 0L
@@ -115,9 +116,11 @@ let render_progress t ~current ~percent =
 
 let update_progress t current =
   let percent = progress_percent ~current ~total:t.total in
-  if percent <> t.last_percent || current = t.total
+  let now = Unix.gettimeofday () in
+  if current = t.total || ((percent <> t.last_percent) && now -. t.last_rendered_at >= 0.2)
   then (
     t.last_percent <- percent;
+    t.last_rendered_at <- now;
     render_progress t ~current ~percent)
 
 let finish_progress t current =
@@ -2281,10 +2284,17 @@ let usage () =
      HOST] [-p PORT]\n";
   exit 2
 
+let tune_gc () =
+  let gc = Gc.get () in
+  let target_minor_heap_size = 8 * 1024 * 1024 in
+  if gc.Gc.minor_heap_size < target_minor_heap_size
+  then Gc.set { gc with minor_heap_size = target_minor_heap_size }
+
 let () =
   Mirage_crypto_rng_unix.use_default ();
   Sys.(set_signal sigpipe Signal_ignore);
   Sys.catch_break true;
+  tune_gc ();
   let run () =
     if Array.length Sys.argv < 2 then usage ();
     match Sys.argv.(1) with
