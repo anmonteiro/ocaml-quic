@@ -134,6 +134,13 @@ let int64_to_be n =
   Bytes.set_int64_be b 0 n;
   Bytes.unsafe_to_string b
 
+let int32_to_be n =
+  let b = Bytes.create 4 in
+  Bytes.set_int32_be b 0 n;
+  Bytes.unsafe_to_string b
+
+let be_to_int32 s off = Bytes.get_int32_be (Bytes.unsafe_of_string s) off
+
 let constant_time_equal a b =
   let la = String.length a in
   let lb = String.length b in
@@ -345,6 +352,136 @@ module Pake = struct
     else
       let nonce = chunk_nonce t seq in
       Ok (xor_with_keystream ~key:t.enc_key ~nonce ciphertext)
+end
+
+module Binary_transfer = struct
+  let chunk_size = 16 * 1024
+  let flush_batch_bytes = 256 * 1024
+  let tag_len = 32
+  let header_len = 4 + tag_len
+
+  let send_file ~yield ~stream ~session ~file =
+    let stat = Unix.stat file in
+    let total_size = Int64.of_int stat.Unix.st_size in
+    let stats = Transfer_stats.create ~label:"relay send" ~total:total_size () in
+    let progress = create_progress ~label:"sending  " ~total:total_size in
+    let ic = open_in_bin file in
+    let done_p, done_u = Eio.Promise.create () in
+    Fun.protect
+      ~finally:(fun () -> close_in_noerr ic)
+      (fun () ->
+        let buf = Bytes.create chunk_size in
+        let digest = ref Digestif.SHA256.empty in
+        update_progress progress 0L;
+        let rec pump chunks_since_yield seq batched_bytes =
+          match input ic buf 0 (Bytes.length buf) with
+          | 0 ->
+            finish_progress progress stats.bytes;
+            Quic.Stream.flush stream (fun () ->
+              Quic.Stream.close_writer stream;
+              Eio.Promise.resolve done_u (Digestif.SHA256.(to_hex (get !digest)), stats))
+          | n ->
+            let plain = Bytes.sub_string buf 0 n in
+            digest := Digestif.SHA256.feed_string !digest plain;
+            let ciphertext, tag = Pake.encrypt_chunk session ~seq plain in
+            let frame = int32_to_be (Int32.of_int (String.length ciphertext)) ^ tag ^ ciphertext in
+            Quic.Stream.write_string stream frame;
+            Transfer_stats.on_bytes stats n;
+            update_progress progress stats.bytes;
+            let batched_bytes = batched_bytes + String.length frame in
+            let chunks_since_yield = chunks_since_yield + 1 in
+            if batched_bytes >= flush_batch_bytes
+            then
+              Quic.Stream.flush stream (fun () ->
+                if chunks_since_yield >= 64 then yield ();
+                pump (if chunks_since_yield >= 64 then 0 else chunks_since_yield) (Int64.succ seq) 0)
+            else (
+              if chunks_since_yield >= 64 then yield ();
+              pump
+                (if chunks_since_yield >= 64 then 0 else chunks_since_yield)
+                (Int64.succ seq)
+                batched_bytes)
+        in
+        pump 0 0L 0;
+        Eio.Promise.await done_p)
+
+  let recv_file ~stream ~session ~output ~expected_name ~expected_size =
+    let out_path = Option.value output ~default:("recv-" ^ expected_name) in
+    let stats = Transfer_stats.create ~label:"relay recv" ~total:expected_size () in
+    let progress = create_progress ~label:"receiving" ~total:expected_size in
+    let oc = open_out_bin out_path in
+    let done_p, done_u = Eio.Promise.create () in
+    let pending = Buffer.create (chunk_size + header_len) in
+    let digest = ref Digestif.SHA256.empty in
+    let seq = ref 0L in
+    let finished = ref false in
+    let finalize result =
+      if not !finished
+      then (
+        finished := true;
+        close_out_noerr oc;
+        Eio.Promise.resolve done_u result)
+    in
+    let rec drain_frames () =
+      let data = Buffer.contents pending in
+      let data_len = String.length data in
+      if data_len < header_len
+      then ()
+      else
+        let ciphertext_len = Int32.to_int (be_to_int32 data 0) in
+        let frame_len = header_len + ciphertext_len in
+        if data_len < frame_len
+        then ()
+        else (
+          let tag = String.sub data 4 tag_len in
+          let ciphertext = String.sub data header_len ciphertext_len in
+          let rest_len = data_len - frame_len in
+          Buffer.clear pending;
+          if rest_len > 0 then Buffer.add_substring pending data frame_len rest_len;
+          let plain =
+            match Pake.decrypt_chunk session ~seq:!seq ~ciphertext ~tag with
+            | Ok x -> x
+            | Error e -> failwith ("decrypt/auth failure: " ^ e)
+          in
+          output_string oc plain;
+          digest := Digestif.SHA256.feed_string !digest plain;
+          Transfer_stats.on_bytes stats (String.length plain);
+          update_progress progress stats.bytes;
+          seq := Int64.succ !seq;
+          drain_frames ())
+    in
+    Printf.printf "receiving %s (%Ld bytes) into %s\n%!" expected_name expected_size out_path;
+    update_progress progress 0L;
+    let rec read_stream () =
+      Quic.Stream.schedule_read
+        stream
+        ~on_eof:(fun () ->
+          try
+            if Buffer.length pending <> 0
+            then failwith "trailing partial relay frame";
+            if stats.bytes <> expected_size
+            then
+              failwith
+                (Printf.sprintf
+                   "size mismatch: expected=%Ld got=%Ld"
+                   expected_size
+                   stats.bytes);
+            finish_progress progress stats.bytes;
+            finalize (Ok (Digestif.SHA256.(to_hex (get !digest)), stats, out_path))
+          with
+          | exn -> finalize (Error exn))
+        ~on_read:(fun bs ~off ~len ->
+          try
+            Buffer.add_string pending (Bigstringaf.substring bs ~off ~len);
+            drain_frames ();
+            read_stream ()
+          with
+          | exn -> finalize (Error exn))
+    in
+    read_stream ();
+    match Eio.Promise.await done_p with
+    | Ok result -> result
+    | Error exn -> raise exn
 end
 
 module Direct = struct
@@ -628,11 +765,12 @@ module Direct = struct
                   match input ic buf 0 (Bytes.length buf) with
                   | 0 -> `Eof batched_bytes
                   | n ->
+                    let chunk = Bytes.sub_string buf 0 n in
                     H3.Body.Writer.write_string
                       request_body
                       ~off:0
                       ~len:n
-                      (Bytes.unsafe_to_string buf);
+                      chunk;
                     Transfer_stats.on_bytes stats n;
                     update_progress progress stats.bytes;
                     let batched_bytes = batched_bytes + n in
@@ -685,29 +823,50 @@ module Relay = struct
       | `Unix _ -> None)
 
   type peer =
-    { stream : Quic.Stream.t
+    { start_stream : Quic.Transport.start_stream
+    ; mutable control_stream : Quic.Stream.t option
     ; mutable room_name : string option
     ; mutable role : role option
-    ; observed_candidate : (string * int) option
+    ; mutable observed_candidate : (string * int) option
+    ; mutable pending_outgoing_transfer : string option
+    }
+  and transfer =
+    { transfer_id : string
+    ; sender : peer
+    ; receiver : peer
+    ; filename_hex : string
+    ; total_size : int64
+    ; mutable sender_stream_bound : bool
     }
 
   type room =
     { mutable sender : peer option
     ; mutable receiver : peer option
+    ; transfers : (string, transfer) Hashtbl.t
     }
 
   type state = { rooms : (string, room) Hashtbl.t }
 
   let create_state () = { rooms = Hashtbl.create 16 }
 
+  let control_stream_exn peer =
+    match peer.control_stream with
+    | Some stream -> stream
+    | None -> failwith "relay peer has no control stream"
+
   let send stream line =
     try Line_channel.write_line_raw stream line with _ -> ()
+
+  let send_peer peer line =
+    match peer.control_stream with
+    | Some stream -> send stream line
+    | None -> ()
 
   let room_of_state t room_name =
     match Hashtbl.find_opt t.rooms room_name with
     | Some room -> room
     | None ->
-      let room = { sender = None; receiver = None } in
+      let room = { sender = None; receiver = None; transfers = Hashtbl.create 4 } in
       Hashtbl.add t.rooms room_name room;
       room
 
@@ -729,8 +888,12 @@ module Relay = struct
           | Some p when p == peer -> room.receiver <- None
           | _ -> ()));
         (match partner room role with
-        | Some p -> send p.stream "PEER_LEFT"
+        | Some p -> send_peer p "PEER_LEFT"
         | None -> ());
+        Hashtbl.filter_map_inplace
+          (fun _ (transfer : transfer) ->
+             if transfer.sender == peer || transfer.receiver == peer then None else Some transfer)
+          room.transfers;
         if room.sender = None && room.receiver = None
         then Hashtbl.remove t.rooms room_name
       | None -> ());
@@ -741,8 +904,8 @@ module Relay = struct
   let maybe_notify_ready room =
     match room.sender, room.receiver with
     | Some sender, Some receiver ->
-      send sender.stream "READY receiver";
-      send receiver.stream "READY sender"
+      send_peer sender "READY receiver";
+      send_peer receiver "READY sender"
     | _ -> ()
 
   let register_peer t peer room_name role =
@@ -752,8 +915,8 @@ module Relay = struct
     in
     match slot with
     | Some _ ->
-      send peer.stream "ERROR room role already occupied";
-      Quic.Stream.close_writer peer.stream
+      send_peer peer "ERROR room role already occupied";
+      Quic.Stream.close_writer (control_stream_exn peer)
     | None ->
       (match role with
       | Sender -> room.sender <- Some peer
@@ -762,15 +925,40 @@ module Relay = struct
       peer.role <- Some role;
       (match peer.observed_candidate with
       | Some (host, port) ->
-        send
-          peer.stream
+        send_peer
+          peer
           (Printf.sprintf "OBSERVED %s %d" (hex_of_string host) port)
       | None -> ());
-      send peer.stream "JOINED";
+      send_peer peer "JOINED";
       (match partner room role with
       | Some _ -> ()
-      | None -> send peer.stream "WAITING");
+      | None -> send_peer peer "WAITING");
       maybe_notify_ready room
+
+  let bind_transfer_stream t peer transfer_id stream =
+    match peer.room_name with
+    | Some room_name ->
+      (match Hashtbl.find_opt t.rooms room_name with
+      | Some room ->
+      (match Hashtbl.find_opt room.transfers transfer_id with
+      | Some transfer when transfer.sender == peer && not transfer.sender_stream_bound ->
+        transfer.sender_stream_bound <- true;
+        let receiver_stream = transfer.receiver.start_stream Quic.Direction.Unidirectional in
+        let rec proxy () =
+          Quic.Stream.schedule_read
+            stream
+            ~on_eof:(fun () ->
+              Quic.Stream.flush receiver_stream (fun () ->
+                Quic.Stream.close_writer receiver_stream;
+                Hashtbl.remove room.transfers transfer_id))
+            ~on_read:(fun bs ~off ~len ->
+              Quic.Stream.schedule_bigstring receiver_stream ~off ~len bs;
+              Quic.Stream.flush receiver_stream proxy)
+        in
+        proxy ()
+      | _ -> Quic.Stream.close_reader stream)
+      | None -> Quic.Stream.close_reader stream)
+    | None -> Quic.Stream.close_reader stream
 
   let handle_line t peer line =
     match peer.room_name, peer.role with
@@ -780,27 +968,42 @@ module Relay = struct
         (match role_of_string role_name with
         | Some role -> register_peer t peer room_name role
         | None ->
-          send peer.stream "ERROR role must be sender or receiver";
-          Quic.Stream.close_writer peer.stream)
+          send_peer peer "ERROR role must be sender or receiver";
+          Quic.Stream.close_writer (control_stream_exn peer))
       | _ ->
-        send peer.stream "ERROR expected: JOIN <code> <sender|receiver>";
-        Quic.Stream.close_writer peer.stream)
+        send_peer peer "ERROR expected: JOIN <code> <sender|receiver>";
+        Quic.Stream.close_writer (control_stream_exn peer))
     | Some room_name, Some role ->
       (match Hashtbl.find_opt t.rooms room_name with
       | Some room ->
-        (match partner room role with
-        | Some p -> send p.stream line
-        | None -> send peer.stream "WAITING")
-      | None -> send peer.stream "ERROR room disappeared")
+        (match split_words line, partner room role with
+        | [ "USE-RELAY"; transfer_id; filename_hex; total_s ], Some receiver
+          when role = Sender ->
+          let transfer =
+            { transfer_id
+            ; sender = peer
+            ; receiver
+            ; filename_hex
+            ; total_size = parse_int64 total_s
+            ; sender_stream_bound = false
+            }
+          in
+          Hashtbl.replace room.transfers transfer_id transfer;
+          peer.pending_outgoing_transfer <- Some transfer_id;
+          send_peer receiver line;
+          send_peer peer ("RELAY-READY " ^ transfer_id)
+        | _line, Some p -> send_peer p line
+        | _, None -> send_peer peer "WAITING")
+      | None -> send_peer peer "ERROR room disappeared")
     | _ ->
-      send peer.stream "ERROR invalid peer state";
-      Quic.Stream.close_writer peer.stream
+      send_peer peer "ERROR invalid peer state";
+      Quic.Stream.close_writer (control_stream_exn peer)
 
   let attach_parser t peer =
     let buf = Buffer.create 4096 in
     let rec pump () =
       Quic.Stream.schedule_read
-        peer.stream
+        (control_stream_exn peer)
         ~on_eof:(fun () ->
           Line_channel.drain_lines buf (fun line -> handle_line t peer line);
           remove_peer t peer)
@@ -811,17 +1014,37 @@ module Relay = struct
     in
     pump ()
 
-  let connection_handler t ~cid:_ ~start_stream:_ =
+  let handle_stream t peer stream =
+    match peer.control_stream, Quic.Stream.direction stream with
+    | None, Quic.Direction.Bidirectional ->
+      peer.control_stream <- Some stream;
+      attach_parser t peer
+    | Some _, Quic.Direction.Unidirectional ->
+      (match peer.pending_outgoing_transfer with
+      | Some transfer_id ->
+        peer.pending_outgoing_transfer <- None;
+        bind_transfer_stream t peer transfer_id stream
+      | None -> Quic.Stream.close_reader stream)
+    | None, Quic.Direction.Unidirectional
+    | Some _, Quic.Direction.Bidirectional ->
+      Quic.Stream.close_reader stream
+
+  let connection_handler t ~cid:_ ~start_stream =
+    let peer =
+      { start_stream
+      ; control_stream = None
+      ; room_name = None
+      ; role = None
+      ; observed_candidate = None
+      ; pending_outgoing_transfer = None
+      }
+    in
     Quic.Transport.F
       (fun stream ->
-        let peer =
-          { stream
-          ; room_name = None
-          ; role = None
-          ; observed_candidate = observed_udp_candidate stream
-          }
-        in
-        attach_parser t peer;
+        (match peer.observed_candidate with
+        | None -> peer.observed_candidate <- observed_udp_candidate stream
+        | Some _ -> ());
+        handle_stream t peer stream;
         { on_error = (fun _ -> remove_peer t peer) })
 
   let run env ~sw ~port =
@@ -1163,11 +1386,12 @@ module Relay_h3 = struct
                 match input ic buf 0 (Bytes.length buf) with
                 | 0 -> `Eof batched_bytes
                 | n ->
+                  let chunk = Bytes.sub_string buf 0 n in
                   H3.Body.Writer.write_string
                     request_body
                     ~off:0
                     ~len:n
-                    (Bytes.unsafe_to_string buf);
+                    chunk;
                   Transfer_stats.on_bytes stats n;
                   update_progress progress stats.bytes;
                   let batched_bytes = batched_bytes + n in
@@ -1288,9 +1512,7 @@ module Relay_h3 = struct
 end
 
 let run_relay env ~sw ~port =
-  Eio.Fiber.both
-    (fun () -> Relay.run env ~sw ~port)
-    (fun () -> Relay_h3.run env ~sw ~port)
+  Relay.run env ~sw ~port
 
 module Client = struct
   type opts =
@@ -1308,9 +1530,16 @@ module Client = struct
     { observed_host : string option
     }
 
+  type relay_connection =
+    { transport : Quic_eio.t
+    ; control_stream : Quic.Stream.t
+    ; start_stream : Quic.Transport.start_stream
+    ; incoming_streams : Quic.Stream.t Eio.Stream.t
+    }
+
   type transfer_mode =
     | Use_direct
-    | Use_relay_h3 of
+    | Use_relay of
         { transfer_id : string
         ; filename : string option
         ; total_size : int64 option
@@ -1345,13 +1574,18 @@ module Client = struct
 
   let connect_with_config env ~sw ~config ~(opts : opts) =
     let on_connect_p, on_connect_u = Eio.Promise.create () in
+    let incoming_streams = Eio.Stream.create max_int in
+    let stream_handler =
+      Quic.Transport.F (fun stream ->
+        Eio.Stream.add incoming_streams stream;
+        { on_error = ignore })
+    in
     let t =
       Quic_eio.Client.create
         env
         ~sw
         ~config
-        (fun ~cid:_ ~start_stream:_ ->
-           Quic.Transport.F (fun _ -> { on_error = ignore }))
+        (fun ~cid:_ ~start_stream:_ -> stream_handler)
     in
     let address = resolve_udp_address opts.host opts.port in
     let tls_host =
@@ -1363,9 +1597,13 @@ module Client = struct
     in
     Quic_eio.connect t ~address ~host:tls_host (fun ~cid:_ ~start_stream ->
       Eio.Promise.resolve on_connect_u start_stream;
-      Quic.Transport.F (fun _ -> { on_error = ignore }));
+      stream_handler);
     let start_stream = Eio.Promise.await on_connect_p in
-    t, start_stream Quic.Direction.Bidirectional
+    { transport = t
+    ; control_stream = start_stream Quic.Direction.Bidirectional
+    ; start_stream
+    ; incoming_streams
+    }
 
   let connect env ~sw ~(opts : opts) =
     connect_with_config env ~sw ~config:(relay_config ()) ~opts
@@ -1417,15 +1655,16 @@ module Client = struct
     let rec loop () =
       match split_words (wait_for_line_or_fail ch) with
       | [ "USE-DIRECT" ] -> Use_direct
-      | [ "USE-RELAY-H3"; transfer_id ] ->
-        Use_relay_h3 { transfer_id; filename = None; total_size = None }
-      | [ "USE-RELAY-H3"; transfer_id; filename_hex; total_s ] ->
-        Use_relay_h3
+      | [ "USE-RELAY"; transfer_id ] ->
+        Use_relay { transfer_id; filename = None; total_size = None }
+      | [ "USE-RELAY"; transfer_id; filename_hex; total_s ] ->
+        Use_relay
           { transfer_id
           ; filename = Some (string_of_hex filename_hex)
           ; total_size = Some (parse_int64 total_s)
           }
       | [ "PEER_LEFT" ] -> failwith "peer disconnected before transfer mode selected"
+      | [ "RELAY-READY"; _ ] -> loop ()
       | _ -> loop ()
     in
     loop ()
@@ -1436,11 +1675,11 @@ module Client = struct
       | (host, port) :: rest ->
         let opts = { host; port; code = ""; password = "" } in
         let attempt () =
-          let t, stream =
+          let conn =
             connect_with_config env ~sw ~config:(Direct.config ()) ~opts
           in
-          let ch = Line_channel.of_stream stream in
-          Some (t, ch)
+          let ch = Line_channel.of_stream conn.control_stream in
+          Some (conn.transport, ch)
         in
         let result =
           try
@@ -1453,6 +1692,65 @@ module Client = struct
         | None -> try_candidates rest)
     in
     try_candidates candidates
+
+  let wait_for_relay_result ch =
+    let rec loop () =
+      match split_words (wait_for_line_or_fail ch) with
+      | [ "RECV-OK" ] | [ "RECV-OK"; _ ] -> ()
+      | "RECV-BAD" :: msg ->
+        failwith ("receiver reported integrity failure: " ^ String.concat " " msg)
+      | [ "PEER_LEFT" ] -> failwith "peer disconnected before final ack"
+      | _ -> loop ()
+    in
+    loop ()
+
+  let relay_send ~yield ~conn ~ch ~session ~file ~transfer_id =
+    let stat = Unix.stat file in
+    let total_size = Int64.of_int stat.Unix.st_size in
+    let filename = Filename.basename file in
+    Line_channel.write_line
+      ch
+      (Printf.sprintf "USE-RELAY %s %s %Ld" transfer_id (hex_of_string filename) total_size);
+    let rec wait_ready () =
+      match split_words (wait_for_line_or_fail ch) with
+      | [ "RELAY-READY"; ready_id ] when String.equal ready_id transfer_id -> ()
+      | [ "PEER_LEFT" ] -> failwith "peer disconnected before relay transfer started"
+      | "ERROR" :: msg -> failwith ("ERROR " ^ String.concat " " msg)
+      | _ -> wait_ready ()
+    in
+    wait_ready ();
+    let data_stream = conn.start_stream Quic.Direction.Unidirectional in
+    let digest_hex, stats =
+      Binary_transfer.send_file ~yield ~stream:data_stream ~session ~file
+    in
+    wait_for_relay_result ch;
+    if digest_hex = "" then failwith "unexpected empty digest";
+    stats
+
+  let relay_recv ~conn ~ch ~session ~output ~filename ~total_size =
+    let data_stream =
+      let rec await () =
+        match Eio.Stream.take conn.incoming_streams with
+        | stream when Quic.Stream.direction stream = Quic.Direction.Unidirectional -> stream
+        | _ -> await ()
+      in
+      await ()
+    in
+    try
+      let digest_hex, stats, _out_path =
+        Binary_transfer.recv_file
+          ~stream:data_stream
+          ~session
+          ~output
+          ~expected_name:filename
+          ~expected_size:total_size
+      in
+      Line_channel.write_line ch ("RECV-OK " ^ digest_hex);
+      stats
+    with
+    | exn ->
+      Line_channel.write_line ch ("RECV-BAD " ^ hex_of_string (Printexc.to_string exn));
+      raise exn
 
   let send_transfer ~yield ~ch ~session ~file =
     let stat = Unix.stat file in
@@ -1679,7 +1977,7 @@ module Client = struct
     session
 
   let do_send env ~sw ~opts ~file ~direct =
-    let t, stream = connect env ~sw ~opts in
+    let conn = connect env ~sw ~opts in
     let transfer_stats : Transfer_stats.t option ref = ref None in
     let report_stats status =
       match !transfer_stats with
@@ -1688,11 +1986,11 @@ module Client = struct
     in
     Fun.protect
       ~finally:(fun () ->
-        Quic.Stream.close_writer stream;
-        Quic_eio.shutdown t)
+        Quic.Stream.close_writer conn.control_stream;
+        Quic_eio.shutdown conn.transport)
       (fun () ->
          try
-           let ch = Line_channel.of_stream stream in
+           let ch = Line_channel.of_stream conn.control_stream in
            Line_channel.write_line
              ch
              (Printf.sprintf "JOIN %s %s" opts.code (role_to_string Sender));
@@ -1713,19 +2011,9 @@ module Client = struct
                | None -> ()));
            if !transfer_stats = None
            then (
-             let stat = Unix.stat file in
-             let total_size = Int64.of_int stat.Unix.st_size in
-             let filename = Filename.basename file in
              let transfer_id = hex_of_string (random_bytes 16) in
-             Line_channel.write_line
-               ch
-               (Printf.sprintf
-                  "USE-RELAY-H3 %s %s %Ld"
-                  transfer_id
-                  (hex_of_string filename)
-                  total_size);
              let stats =
-               Relay_h3.upload env ~sw ~host:opts.host ~port:opts.port ~transfer_id ~file
+               relay_send ~yield:Eio.Fiber.yield ~conn ~ch ~session ~file ~transfer_id
              in
              transfer_stats := Some stats);
            report_stats "completed"
@@ -1738,7 +2026,7 @@ module Client = struct
            raise exn)
 
   let do_recv env ~sw ~opts ~output ~direct_port ~direct_host =
-    let t, stream = connect env ~sw ~opts in
+    let conn = connect env ~sw ~opts in
     let transfer_stats : Transfer_stats.t option ref = ref None in
     let report_stats status =
       match !transfer_stats with
@@ -1747,11 +2035,11 @@ module Client = struct
     in
     Fun.protect
       ~finally:(fun () ->
-        Quic.Stream.close_writer stream;
-        Quic_eio.shutdown t)
+        Quic.Stream.close_writer conn.control_stream;
+        Quic_eio.shutdown conn.transport)
       (fun () ->
          try
-           let ch = Line_channel.of_stream stream in
+           let ch = Line_channel.of_stream conn.control_stream in
            Line_channel.write_line
              ch
              (Printf.sprintf "JOIN %s %s" opts.code (role_to_string Receiver));
@@ -1789,63 +2077,48 @@ module Client = struct
                listener.port;
              send_direct_candidates ch candidates);
            Printf.printf "waiting for sender to start transfer...\n%!";
-           let recv_ch =
-             match direct_listener with
-             | None ->
-               (match wait_for_mode_or_fail ch with
-               | Use_relay_h3 { transfer_id; filename; total_size } ->
-                  let stats, _out_path =
-                    Relay_h3.download
-                      env
-                      ~sw
-                      ~host:opts.host
-                      ~port:opts.port
-                      ~transfer_id
-                      ~output
-                      ~expected_name:filename
-                      ~expected_len:total_size
+           (match direct_listener with
+            | None ->
+              (match wait_for_mode_or_fail ch with
+              | Use_relay { transfer_id = _; filename; total_size } ->
+                 let stats =
+                   relay_recv
+                     ~conn
+                     ~ch
+                     ~session
+                     ~output
+                     ~filename:(Option.value filename ~default:"download.bin")
+                     ~total_size:(Option.value total_size ~default:0L)
                  in
+                transfer_stats := Some stats
+              | Use_direct ->
+                failwith "sender selected direct mode but receiver has no direct listener")
+            | Some listener ->
+              (match
+                 Eio.Fiber.first
+                   (fun () -> `Mode (wait_for_mode_or_fail ch))
+                   (fun () ->
+                     let stats, out_path = Direct.await_completion listener in
+                     `Direct_done (stats, out_path))
+               with
+               | `Direct_done (stats, out_path) ->
                  transfer_stats := Some stats;
-                 None
-               | Use_direct ->
-                 failwith "sender selected direct mode but receiver has no direct listener")
-             | Some listener ->
-               (match
-                  Eio.Fiber.first
-                    (fun () -> `Mode (wait_for_mode_or_fail ch))
-                    (fun () ->
-                      let stats, out_path = Direct.await_completion listener in
-                      `Direct_done (stats, out_path))
-                with
-                | `Direct_done (stats, out_path) ->
-                  transfer_stats := Some stats;
-                  Format.printf "received direct upload into %s@." out_path;
-                  None
-                | `Mode (Use_relay_h3 { transfer_id; filename; total_size }) ->
-                  let stats, _out_path =
-                    Relay_h3.download
-                      env
-                      ~sw
-                      ~host:opts.host
-                      ~port:opts.port
-                      ~transfer_id
-                      ~output
-                      ~expected_name:filename
-                      ~expected_len:total_size
-                  in
-                  transfer_stats := Some stats;
-                  None
-                | `Mode Use_direct ->
-                  let stats, out_path = Direct.await_completion listener in
-                  transfer_stats := Some stats;
-                  Format.printf "received direct upload into %s@." out_path;
-                  None)
-           in
-           (match recv_ch with
-           | Some recv_ch ->
-             let stats = recv_transfer ~ch:recv_ch ~session ~output in
-             transfer_stats := Some stats
-           | None -> ());
+                 Format.printf "received direct upload into %s@." out_path
+               | `Mode (Use_relay { transfer_id = _; filename; total_size }) ->
+                 let stats =
+                   relay_recv
+                     ~conn
+                     ~ch
+                     ~session
+                     ~output
+                     ~filename:(Option.value filename ~default:"download.bin")
+                     ~total_size:(Option.value total_size ~default:0L)
+                 in
+                 transfer_stats := Some stats
+               | `Mode Use_direct ->
+                 let stats, out_path = Direct.await_completion listener in
+                 transfer_stats := Some stats;
+                 Format.printf "received direct upload into %s@." out_path));
            Eio.Time.sleep (Eio.Stdenv.clock env) 0.1;
            (match !transfer_stats with
            | Some stats ->
