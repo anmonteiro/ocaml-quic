@@ -399,8 +399,7 @@ module Binary_transfer = struct
               Quic.Stream.close_writer stream;
               Eio.Promise.resolve done_u stats)
           | n ->
-            let chunk = Bytes.sub_string buf 0 n in
-            Quic.Stream.write_string stream ~off:0 ~len:n chunk;
+            Quic.Stream.write_bytes_unsafe stream ~off:0 ~len:n buf;
             Transfer_stats.on_bytes stats n;
             update_progress progress stats.bytes;
             let batched_bytes = batched_bytes + n in
@@ -937,8 +936,7 @@ module Relay = struct
                 Quic.Stream.close_writer receiver_stream;
                 Hashtbl.remove room.transfers transfer_id))
             ~on_read:(fun bs ~off ~len ->
-              let chunk = Bigstringaf.substring bs ~off ~len in
-              Quic.Stream.write_string receiver_stream ~off:0 ~len chunk;
+              Quic.Stream.write_bigstring_copy receiver_stream ~off ~len bs;
               pending_flush := !pending_flush + len;
               if !pending_flush >= Binary_transfer.flush_batch_bytes
               then (

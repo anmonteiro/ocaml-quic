@@ -109,7 +109,9 @@ module Stream : sig
   val write_uint8 : t -> int -> unit
   val write_char : t -> char -> unit
   val write_string : t -> ?off:int -> ?len:int -> string -> unit
+  val write_bytes_unsafe : t -> ?off:int -> ?len:int -> bytes -> unit
   val write_bigstring : t -> ?off:int -> ?len:int -> Bigstringaf.t -> unit
+  val write_bigstring_copy : t -> ?off:int -> ?len:int -> Bigstringaf.t -> unit
   val schedule_bigstring : t -> ?off:int -> ?len:int -> Bigstringaf.t -> unit
   val flush : t -> (unit -> unit) -> unit
   val close_reader : t -> unit

@@ -222,6 +222,9 @@ module Producer = struct
   let queue_string_payload t payload =
     queue_payload t (Frame.String payload) ~off:0 ~len:(String.length payload)
 
+  let queue_bytes_payload t payload =
+    queue_payload t (Frame.Bytes payload) ~off:0 ~len:(Bytes.length payload)
+
   let queue_string_slice t s ~off ~len =
     if len > 0
     then
@@ -229,6 +232,14 @@ module Producer = struct
         if off = 0 && len = String.length s then s else String.sub s off len
       in
       queue_string_payload t payload
+
+  let queue_bytes_slice t b ~off ~len =
+    if len > 0
+    then
+      let payload =
+        if off = 0 && len = Bytes.length b then b else Bytes.sub b off len
+      in
+      queue_bytes_payload t payload
 
   let queue_bigstring_payload t b ~off ~len =
     queue_payload t (Frame.Bigstring b) ~off ~len
@@ -239,6 +250,13 @@ module Producer = struct
     Bytes.blit_string s off payload t.scratch_len len;
     t.scratch_len <- 0;
     queue_string_payload t (Bytes.unsafe_to_string payload)
+
+  let queue_scratch_prefixed_bytes t b ~off ~len =
+    let payload = Bytes.create (t.scratch_len + len) in
+    Bytes.blit t.scratch 0 payload 0 t.scratch_len;
+    Bytes.blit b off payload t.scratch_len len;
+    t.scratch_len <- 0;
+    queue_bytes_payload t payload
 
   let queue_scratch_prefixed_bigstring t b ~off ~len =
     let payload = Bytes.create (t.scratch_len + len) in
@@ -304,6 +322,23 @@ module Producer = struct
         flush_scratch t;
         queue_string_slice t s ~off ~len)
 
+  let write_bytes_unsafe t ?off ?len b =
+    match t.mode with
+    | Faraday_mode producer ->
+      let s = Bytes.unsafe_to_string b in
+      Buffer.write_string producer ?off ?len s
+    | Queue_mode ->
+      ensure_open t;
+      let off = Option.value off ~default:0 in
+      let len = Option.value len ~default:(Bytes.length b - off) in
+      if len <= 256
+      then append_bytes t b ~src_off:off ~len
+      else if t.scratch_len > 0 && t.scratch_len <= 16
+      then queue_scratch_prefixed_bytes t b ~off ~len
+      else (
+        flush_scratch t;
+        queue_bytes_slice t b ~off ~len)
+
   let write_bigstring t ?off ?len b =
     match t.mode with
     | Faraday_mode producer -> Buffer.write_bigstring producer ?off ?len b
@@ -321,6 +356,26 @@ module Producer = struct
       else (
         flush_scratch t;
         queue_bigstring_payload t b ~off ~len)
+
+  let write_bigstring_copy t ?off ?len b =
+    match t.mode with
+    | Faraday_mode producer -> Buffer.write_bigstring producer ?off ?len b
+    | Queue_mode ->
+      ensure_open t;
+      let off = Option.value off ~default:0 in
+      let len = Option.value len ~default:(Bigstringaf.length b - off) in
+      if len <= 256
+      then (
+        ensure_scratch_capacity t len;
+        Bigstringaf.blit_to_bytes b ~src_off:off t.scratch ~dst_off:t.scratch_len ~len;
+        t.scratch_len <- t.scratch_len + len)
+      else if t.scratch_len > 0 && t.scratch_len <= 16
+      then queue_scratch_prefixed_bigstring t b ~off ~len
+      else (
+        flush_scratch t;
+        let payload = Bytes.create len in
+        Bigstringaf.blit_to_bytes b ~src_off:off payload ~dst_off:0 ~len;
+        queue_bytes_payload t payload)
 
   let schedule_bigstring t ?off ?len b =
     match t.mode with
@@ -370,9 +425,11 @@ module Producer = struct
       let replayed = ref t.total_drained in
       Queue.iter
         (fun { payload; off; len } ->
-          (match payload with
-           | Frame.String payload -> Buffer.write_string producer ~off ~len payload
-           | Frame.Bigstring payload -> Buffer.write_bigstring producer ~off ~len payload);
+        (match payload with
+         | Frame.String payload -> Buffer.write_string producer ~off ~len payload
+         | Frame.Bytes payload ->
+           Buffer.write_string producer ~off ~len (Bytes.unsafe_to_string payload)
+         | Frame.Bigstring payload -> Buffer.write_bigstring producer ~off ~len payload);
           replayed := !replayed + len;
           while
             (not (Queue.is_empty t.flushes))
@@ -525,13 +582,19 @@ module Recv = struct
           t.offset <- t.offset + fragment.len;
           if not (Buffer.is_closed t.consumer)
           then (
-            (match fragment.payload with
+             (match fragment.payload with
              | Frame.String payload ->
                Buffer.write_string
                  t.consumer
                  ~off:fragment.payload_off
                  ~len:fragment.len
                  payload
+             | Frame.Bytes payload ->
+               Buffer.write_string
+                 t.consumer
+                 ~off:fragment.payload_off
+                 ~len:fragment.len
+                 (Bytes.unsafe_to_string payload)
              | Frame.Bigstring payload ->
                Buffer.write_bigstring
                  t.consumer
@@ -585,6 +648,12 @@ module Recv = struct
                    ~off:fragment.payload_off
                    ~len:fragment.len
                    payload
+               | Frame.Bytes payload ->
+                 Buffer.write_string
+                   t.consumer
+                   ~off:fragment.payload_off
+                   ~len:fragment.len
+                   (Bytes.unsafe_to_string payload)
                | Frame.Bigstring payload ->
                  Buffer.write_bigstring
                    t.consumer
@@ -846,8 +915,14 @@ let write_uint8 t c = Producer.write_uint8 t.send.producer c
 let write_char t c = Producer.write_char t.send.producer c
 let write_string t ?off ?len s = Producer.write_string t.send.producer ?off ?len s
 
+let write_bytes_unsafe t ?off ?len b =
+  Producer.write_bytes_unsafe t.send.producer ?off ?len b
+
 let write_bigstring t ?off ?len b =
   Producer.write_bigstring t.send.producer ?off ?len b
+
+let write_bigstring_copy t ?off ?len b =
+  Producer.write_bigstring_copy t.send.producer ?off ?len b
 
 let schedule_bigstring t ?off ?len (b : Bigstringaf.t) =
   Producer.schedule_bigstring t.send.producer ?off ?len b

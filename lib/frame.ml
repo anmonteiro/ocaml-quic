@@ -209,21 +209,28 @@ end
 
 type payload =
   | String of string
+  | Bytes of bytes
   | Bigstring of Bigstringaf.t
 
 let payload_length = function
   | String s -> String.length s
+  | Bytes b -> Bytes.length b
   | Bigstring b -> Bigstringaf.length b
 
 let payload_substring payload ~off ~len =
   match payload with
   | String s ->
     if off = 0 && len = String.length s then s else String.sub s off len
+  | Bytes b ->
+    if off = 0 && len = Bytes.length b
+    then Bytes.unsafe_to_string b
+    else Bytes.sub_string b off len
   | Bigstring b -> Bigstringaf.substring b ~off ~len
 
 let payload_blit_to_bytes payload ~src_off dst ~dst_off ~len =
   match payload with
   | String s -> Bytes.blit_string s src_off dst dst_off len
+  | Bytes b -> Bytes.blit b src_off dst dst_off len
   | Bigstring b -> Bigstringaf.blit_to_bytes b ~src_off dst ~dst_off ~len
 
 type fragment =

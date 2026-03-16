@@ -144,6 +144,8 @@ module Frame = struct
     write_variable_length_integer t len;
     (match payload with
      | Frame.String payload -> Faraday.write_string t ~off:payload_off ~len payload
+     | Frame.Bytes payload ->
+       Faraday.write_string t ~off:payload_off ~len (Bytes.unsafe_to_string payload)
      | Frame.Bigstring payload -> Faraday.write_bigstring t ~off:payload_off ~len payload)
 
   let write_new_token t ~length ~data =
@@ -157,6 +159,8 @@ module Frame = struct
     if len > 0 then write_variable_length_integer t len;
     (match payload with
      | Frame.String payload -> Faraday.write_string t ~off:payload_off ~len payload
+     | Frame.Bytes payload ->
+       Faraday.write_string t ~off:payload_off ~len (Bytes.unsafe_to_string payload)
      | Frame.Bigstring payload -> Faraday.write_bigstring t ~off:payload_off ~len payload)
 
   let write_max_data t ~max = write_variable_length_integer t max
