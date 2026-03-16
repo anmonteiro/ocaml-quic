@@ -50,7 +50,7 @@ let make_stream_frame ~id ~off ~len =
   let payload = String.make len '\x00' in
   Frame.Stream
     { id
-    ; fragment = { Frame.off = off; len; payload; payload_off = 0 }
+    ; fragment = { Frame.off = off; len; payload = Frame.String payload; payload_off = 0 }
     ; is_fin = false
     }
 

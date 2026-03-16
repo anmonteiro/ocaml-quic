@@ -854,11 +854,7 @@ module Connection = struct
   let exhaust_crypto_stream t ~packet_info ~(stream : Stream.t) =
     let { encryption_level; _ } = packet_info in
     Stream.Recv.drain stream.recv ~f:(fun { payload; payload_off; len; _ } ->
-      let fragment_cstruct =
-        if payload_off = 0 && len = String.length payload
-        then payload
-        else String.sub payload payload_off len
-      in
+      let fragment_cstruct = Frame.payload_substring payload ~off:payload_off ~len in
       (match encryption_level with
       | Initial when t.mode = Server ->
         handle_crypto_record

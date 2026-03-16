@@ -213,7 +213,7 @@ module Frame = struct
     let payload = Cursor.take_string cursor len in
     Frame.Stream
       { id = stream_id
-      ; fragment = { Frame.off; len; payload; payload_off = 0 }
+      ; fragment = { Frame.off; len; payload = Frame.String payload; payload_off = 0 }
       ; is_fin = fin
       }
 
@@ -249,7 +249,7 @@ module Frame = struct
       let off = parse_varint cursor in
       let len = parse_varint cursor in
       let payload = Cursor.take_string cursor len in
-      Frame.Crypto { Frame.off; len; payload; payload_off = 0 }
+      Frame.Crypto { Frame.off; len; payload = Frame.String payload; payload_off = 0 }
     | New_token ->
       let length = parse_varint cursor in
       let data = Cursor.take_bigstring cursor length in
@@ -355,7 +355,8 @@ module Frame = struct
     cursor.off <- cursor.off + len;
     Frame.Stream
       { id = stream_id
-      ; fragment = { Frame.off; len; payload = cursor.buffer; payload_off }
+      ; fragment =
+          { Frame.off; len; payload = Frame.String cursor.buffer; payload_off }
       ; is_fin = fin
       }
 
@@ -391,7 +392,8 @@ module Frame = struct
       let len = parse_varint_string cursor in
       let payload_off = cursor.off in
       cursor.off <- cursor.off + len;
-      Frame.Crypto { Frame.off; len; payload = cursor.buffer; payload_off }
+      Frame.Crypto
+        { Frame.off; len; payload = Frame.String cursor.buffer; payload_off }
     | New_token ->
       let length = parse_varint_string cursor in
       let data = String_cursor.take_bigstring cursor length in

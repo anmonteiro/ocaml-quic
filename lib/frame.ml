@@ -207,10 +207,29 @@ module Type = struct
     | x -> Unknown x
 end
 
+type payload =
+  | String of string
+  | Bigstring of Bigstringaf.t
+
+let payload_length = function
+  | String s -> String.length s
+  | Bigstring b -> Bigstringaf.length b
+
+let payload_substring payload ~off ~len =
+  match payload with
+  | String s ->
+    if off = 0 && len = String.length s then s else String.sub s off len
+  | Bigstring b -> Bigstringaf.substring b ~off ~len
+
+let payload_blit_to_bytes payload ~src_off dst ~dst_off ~len =
+  match payload with
+  | String s -> Bytes.blit_string s src_off dst dst_off len
+  | Bigstring b -> Bigstringaf.blit_to_bytes b ~src_off dst ~dst_off ~len
+
 type fragment =
   { off : int
   ; len : int
-  ; payload : string
+  ; payload : payload
   ; payload_off : int
   }
 

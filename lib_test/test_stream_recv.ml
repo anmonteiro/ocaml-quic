@@ -13,7 +13,7 @@ let fragment ~off data =
   let len = String.length data in
   { Frame.off = off
   ; len
-  ; payload = data
+  ; payload = Frame.String data
   ; payload_off = 0
   }
 
@@ -25,7 +25,10 @@ let test_in_order_push_is_immediately_poppable () =
   | Some fragment ->
     Alcotest.(check int) "fragment offset" 0 fragment.Frame.off;
     Alcotest.(check int) "fragment len" 4 fragment.Frame.len;
-    Alcotest.(check string) "fragment payload" "abcd" fragment.Frame.payload;
+    Alcotest.(check string)
+      "fragment payload"
+      "abcd"
+      (Frame.payload_substring fragment.Frame.payload ~off:0 ~len:fragment.Frame.len);
     Alcotest.(check (option int)) "no queued fragment remains" None
       (Option.map (fun { Frame.len; _ } -> len) (Stream.Recv.pop stream.recv))
 
@@ -91,7 +94,10 @@ let test_send_requeue_precedes_fresh_data () =
   Stream.Send.requeue first send;
   let fragment, _ = Option.get (Stream.Send.pop send) in
   Alcotest.(check int) "requeued offset popped first" 0 fragment.Frame.off;
-  Alcotest.(check string) "requeued payload" "ab" fragment.payload
+  Alcotest.(check string)
+    "requeued payload"
+    "ab"
+    (Frame.payload_substring fragment.payload ~off:0 ~len:fragment.len)
 
 let test_send_fin_waits_for_deferred_queue_to_empty () =
   let stream = make_stream () in

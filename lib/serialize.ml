@@ -142,7 +142,9 @@ module Frame = struct
     let { Frame.off; len; payload; payload_off } = fragment in
     write_variable_length_integer t off;
     write_variable_length_integer t len;
-    Faraday.write_string t ~off:payload_off ~len payload
+    (match payload with
+     | Frame.String payload -> Faraday.write_string t ~off:payload_off ~len payload
+     | Frame.Bigstring payload -> Faraday.write_bigstring t ~off:payload_off ~len payload)
 
   let write_new_token t ~length ~data =
     write_variable_length_integer t length;
@@ -153,7 +155,9 @@ module Frame = struct
     write_variable_length_integer t (Int64.to_int stream_id);
     if off > 0 then write_variable_length_integer t off;
     if len > 0 then write_variable_length_integer t len;
-    Faraday.write_string t ~off:payload_off ~len payload
+    (match payload with
+     | Frame.String payload -> Faraday.write_string t ~off:payload_off ~len payload
+     | Frame.Bigstring payload -> Faraday.write_bigstring t ~off:payload_off ~len payload)
 
   let write_max_data t ~max = write_variable_length_integer t max
 
@@ -513,12 +517,12 @@ module Writer = struct
     Bytes.blit_string s 0 buf off (String.length s);
     off + String.length s
 
-  let write_string_slice_bytes buf off s ~src_off ~len =
-    Bytes.blit_string s src_off buf off len;
-    off + len
-
   let write_bigstring_bytes buf off bs ~src_off ~len =
     Bigstringaf.blit_to_bytes bs ~src_off buf ~dst_off:off ~len;
+    off + len
+
+  let write_payload_slice_bytes buf off payload ~src_off ~len =
+    Frame_desc.payload_blit_to_bytes payload ~src_off buf ~dst_off:off ~len;
     off + len
 
   let write_varint_bytes buf off n =
@@ -742,7 +746,7 @@ module Writer = struct
     | Frame_desc.Crypto { Frame_desc.off = frame_off; len; payload; payload_off } ->
       let off = write_varint_bytes buf off frame_off in
       let off = write_varint_bytes buf off len in
-      write_string_slice_bytes buf off payload ~src_off:payload_off ~len
+      write_payload_slice_bytes buf off payload ~src_off:payload_off ~len
     | Frame_desc.New_token { length; data } ->
       let off = write_varint_bytes buf off length in
       write_bigstring_bytes buf off data ~src_off:0 ~len:(Bigstringaf.length data)
@@ -756,7 +760,7 @@ module Writer = struct
         if frame_off > 0 then write_varint_bytes buf off frame_off else off
       in
       let off = if len > 0 then write_varint_bytes buf off len else off in
-      write_string_slice_bytes buf off payload ~src_off:payload_off ~len
+      write_payload_slice_bytes buf off payload ~src_off:payload_off ~len
     | Frame_desc.Max_data max -> write_varint_bytes buf off max
     | Frame_desc.Max_stream_data { stream_id; max_data } ->
       let off = write_varint_bytes buf off (Int64.to_int stream_id) in

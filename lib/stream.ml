@@ -160,7 +160,7 @@ end
 
 module Producer = struct
   type chunk =
-    { payload : string
+    { payload : Frame.payload
     ; mutable off : int
     ; mutable len : int
     }
@@ -213,12 +213,14 @@ module Producer = struct
       Bytes.blit t.scratch 0 next 0 t.scratch_len;
       t.scratch <- next)
 
-  let queue_string_payload t payload =
-    let len = String.length payload in
+  let queue_payload t payload ~off ~len =
     if len > 0
     then (
-      Queue.add { payload; off = 0; len } t.chunks;
+      Queue.add { payload; off; len } t.chunks;
       t.total_enqueued <- t.total_enqueued + len)
+
+  let queue_string_payload t payload =
+    queue_payload t (Frame.String payload) ~off:0 ~len:(String.length payload)
 
   let queue_string_slice t s ~off ~len =
     if len > 0
@@ -227,6 +229,9 @@ module Producer = struct
         if off = 0 && len = String.length s then s else String.sub s off len
       in
       queue_string_payload t payload
+
+  let queue_bigstring_payload t b ~off ~len =
+    queue_payload t (Frame.Bigstring b) ~off ~len
 
   let queue_scratch_prefixed_string t s ~off ~len =
     let payload = Bytes.create (t.scratch_len + len) in
@@ -315,7 +320,7 @@ module Producer = struct
       then queue_scratch_prefixed_bigstring t b ~off ~len
       else (
         flush_scratch t;
-        queue_string_payload t (Bigstringaf.substring b ~off ~len))
+        queue_bigstring_payload t b ~off ~len)
 
   let schedule_bigstring t ?off ?len b =
     match t.mode with
@@ -325,7 +330,7 @@ module Producer = struct
       flush_scratch t;
       let off = Option.value off ~default:0 in
       let len = Option.value len ~default:(Bigstringaf.length b - off) in
-      queue_string_payload t (Bigstringaf.substring b ~off ~len)
+      queue_bigstring_payload t b ~off ~len
 
   let flush t kontinue =
     match t.mode with
@@ -365,7 +370,9 @@ module Producer = struct
       let replayed = ref t.total_drained in
       Queue.iter
         (fun { payload; off; len } ->
-          Buffer.write_string producer ~off ~len payload;
+          (match payload with
+           | Frame.String payload -> Buffer.write_string producer ~off ~len payload
+           | Frame.Bigstring payload -> Buffer.write_bigstring producer ~off ~len payload);
           replayed := !replayed + len;
           while
             (not (Queue.is_empty t.flushes))
@@ -518,11 +525,19 @@ module Recv = struct
           t.offset <- t.offset + fragment.len;
           if not (Buffer.is_closed t.consumer)
           then (
-            Buffer.write_string
-              t.consumer
-              ~off:fragment.payload_off
-              ~len:fragment.len
-              fragment.payload;
+            (match fragment.payload with
+             | Frame.String payload ->
+               Buffer.write_string
+                 t.consumer
+                 ~off:fragment.payload_off
+                 ~len:fragment.len
+                 payload
+             | Frame.Bigstring payload ->
+               Buffer.write_bigstring
+                 t.consumer
+                 ~off:fragment.payload_off
+                 ~len:fragment.len
+                 payload);
             flush t;
             close_if_finished ());
           Some fragment))
@@ -560,14 +575,22 @@ module Recv = struct
             close_if_finished ();
             loop ())
           else (
-            t.offset <- t.offset + fragment.len;
-            if not (Buffer.is_closed t.consumer)
-            then (
-              Buffer.write_string
-                t.consumer
-                ~off:fragment.payload_off
-                ~len:fragment.len
-                fragment.payload;
+          t.offset <- t.offset + fragment.len;
+          if not (Buffer.is_closed t.consumer)
+          then (
+              (match fragment.payload with
+               | Frame.String payload ->
+                 Buffer.write_string
+                   t.consumer
+                   ~off:fragment.payload_off
+                   ~len:fragment.len
+                   payload
+               | Frame.Bigstring payload ->
+                 Buffer.write_bigstring
+                   t.consumer
+                   ~off:fragment.payload_off
+                   ~len:fragment.len
+                   payload);
               flush t;
               close_if_finished ());
             f fragment;
@@ -613,7 +636,7 @@ module Send = struct
 
   let push payload t =
     let len = String.length payload in
-    push_fragment payload ~payload_off:0 ~len t
+    push_fragment (Frame.String payload) ~payload_off:0 ~len t
 
   let pop t =
     let next_fragment () =
@@ -710,7 +733,7 @@ module Send = struct
           ~max_bytes
           ~push:(fun payload off len ->
             ignore
-              ((if off = 0 && len = String.length payload
+              ((if off = 0 && len = Frame.payload_length payload
                 then push_fragment payload ~payload_off:0 ~len t
                 else push_fragment payload ~payload_off:off ~len t)
                 : Frame.fragment))
@@ -749,8 +772,13 @@ module Send = struct
                    let take = min len !remaining in
                    if take > 0
                    then (
-                     let fragment = Bigstringaf.substring buffer ~off ~len:take in
-                     ignore (push fragment t : Frame.fragment);
+                     ignore
+                       (push_fragment
+                          (Frame.Bigstring buffer)
+                          ~payload_off:off
+                          ~len:take
+                          t
+                        : Frame.fragment);
                      remaining := !remaining - take))
               iovecs;
             Faraday.shift faraday writev_len;
