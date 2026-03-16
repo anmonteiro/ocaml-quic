@@ -62,6 +62,8 @@ module Server : sig
     -> sw:Eio.Switch.t
     -> ?should_drop:should_drop
     -> ?udp_connect_first_peer:bool
+    -> ?udp_send_fast_path_enabled:bool
+    -> ?udp_recv_fast_path_enabled:bool
     -> config:Config.t
     -> Eio.Net.Sockaddr.datagram
     -> (cid:
@@ -82,6 +84,8 @@ module Client : sig
     -> sw:Eio.Switch.t
     -> ?should_drop:should_drop
     -> ?udp_connect:bool
+    -> ?udp_send_fast_path_enabled:bool
+    -> ?udp_recv_fast_path_enabled:bool
     -> config:Config.t
     -> (cid:
           (* Unix.sockaddr -> *)

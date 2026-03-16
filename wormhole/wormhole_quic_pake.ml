@@ -1053,6 +1053,8 @@ module Relay = struct
     Quic_eio.Server.establish_server
       env
       ~sw
+      ~udp_send_fast_path_enabled:false
+      ~udp_recv_fast_path_enabled:false
       ~config
       (`Udp (Eio.Net.Ipaddr.V4.any, port))
       (connection_handler state)
@@ -1573,6 +1575,8 @@ module Client = struct
       Quic_eio.Client.create
         env
         ~sw
+        ~udp_send_fast_path_enabled:false
+        ~udp_recv_fast_path_enabled:false
         ~config
         (fun ~cid:_ ~start_stream:_ -> stream_handler)
     in

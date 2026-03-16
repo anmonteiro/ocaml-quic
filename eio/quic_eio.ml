@@ -264,7 +264,7 @@ module IO_loop = struct
       | `Exn of exn
       ]
 
-    let read_once dsock buffer last_client_address connected_peer =
+    let read_once ~udp_recv_fast_path_enabled dsock buffer last_client_address connected_peer =
       let p, u = Promise.create () in
       (try
          Buffer.put
@@ -351,10 +351,12 @@ module IO_loop = struct
     (* | `Eof -> `Eof *)
     (* | `Ok n -> `Ok (n, Promise.await addr_p) *)
 
-    let read ?(connected_peer = ref None) =
+    let read ?(udp_recv_fast_path_enabled = udp_recv_fast_path_enabled) ?(connected_peer = ref None) =
       let last_client_address = ref None in
       let read_datagram flow buffer =
-        match read_once flow buffer last_client_address connected_peer with
+        match
+          read_once ~udp_recv_fast_path_enabled flow buffer last_client_address connected_peer
+        with
         | r -> r
         | exception Exit -> raise_notrace Exit
         | exception
@@ -457,6 +459,7 @@ module IO_loop = struct
         ~connect_on_first_peer
         ~connected_peer
         ~udp_send_fast_path_enabled
+        ~udp_recv_fast_path_enabled
         t
         socket
     =
@@ -466,11 +469,11 @@ module IO_loop = struct
     let write_burst_limit = 64 in
     let read_once =
       match cancel with
-      | None -> (fun () -> Io.read ~connected_peer socket read_buffer)
+      | None -> (fun () -> Io.read ~udp_recv_fast_path_enabled ~connected_peer socket read_buffer)
       | Some cancel ->
         (fun () ->
            Fiber.first
-             (fun () -> Io.read ~connected_peer socket read_buffer)
+             (fun () -> Io.read ~udp_recv_fast_path_enabled ~connected_peer socket read_buffer)
              (fun () ->
                 Promise.await cancel;
                 raise Cancelled))
@@ -484,7 +487,7 @@ module IO_loop = struct
             (match !connected_peer, connect_on_first_peer with
             | None, true ->
               (match Eio_unix.Resource.fd_opt socket with
-              | Some file_descr when Io.udp_send_fast_path_enabled || Io.udp_recv_fast_path_enabled ->
+              | Some file_descr when udp_send_fast_path_enabled || udp_recv_fast_path_enabled ->
                 Eio_unix.Fd.use file_descr ~if_closed:(fun () -> ()) (fun fd ->
                   Unix.connect fd (Addr.parse_unix client_address);
                   connected_peer := Some client_address)
@@ -653,6 +656,8 @@ module Server = struct
         ~sw
         ?(should_drop = IO_loop.never_drop)
         ?(udp_connect_first_peer = false)
+        ?(udp_send_fast_path_enabled = IO_loop.Io.udp_send_fast_path_enabled)
+        ?(udp_recv_fast_path_enabled = IO_loop.Io.udp_recv_fast_path_enabled)
         ~config
         listen_address
         handler
@@ -682,7 +687,8 @@ module Server = struct
       ~should_drop
       ~connect_on_first_peer:udp_connect_first_peer
       ~connected_peer:(ref None)
-      ~udp_send_fast_path_enabled:IO_loop.Io.udp_send_fast_path_enabled
+      ~udp_send_fast_path_enabled
+      ~udp_recv_fast_path_enabled
       server_fd
 end
 
@@ -699,6 +705,8 @@ module Client = struct
         ~sw
         ?(should_drop = IO_loop.never_drop)
         ?(udp_connect = true)
+        ?(udp_send_fast_path_enabled = IO_loop.Io.client_udp_send_fast_path_enabled)
+        ?(udp_recv_fast_path_enabled = IO_loop.Io.udp_recv_fast_path_enabled)
         ~config
         handler
     =
@@ -725,7 +733,7 @@ module Client = struct
       try Eio.Resource.close fd with _ -> ()
     in
     let connect_udp address =
-      if udp_connect && (IO_loop.Io.client_udp_send_fast_path_enabled || IO_loop.Io.udp_recv_fast_path_enabled)
+      if udp_connect && (udp_send_fast_path_enabled || udp_recv_fast_path_enabled)
       then
         match Eio_unix.Resource.fd_opt fd with
         | Some file_descr ->
@@ -743,7 +751,8 @@ module Client = struct
         ~should_drop
         ~connect_on_first_peer:false
         ~connected_peer
-        ~udp_send_fast_path_enabled:IO_loop.Io.client_udp_send_fast_path_enabled
+        ~udp_send_fast_path_enabled
+        ~udp_recv_fast_path_enabled
         connection
         fd);
     { transport = connection; config; shutdown_io; connect_udp }

@@ -251,6 +251,8 @@ let run_relay env ~sw ~port ~max_datagram_size =
   Quic_eio.Server.establish_server
     env
     ~sw
+    ~udp_send_fast_path_enabled:false
+    ~udp_recv_fast_path_enabled:false
     ~config:(config ~max_datagram_size "wormhole-relay-bench-v1")
     (`Udp (Eio.Net.Ipaddr.V4.any, port))
     (relay_connection_handler state)
@@ -334,6 +336,8 @@ let connect env ~sw ~host ~port ~max_datagram_size =
     Quic_eio.Client.create
       env
       ~sw
+      ~udp_send_fast_path_enabled:false
+      ~udp_recv_fast_path_enabled:false
       ~config:(config ~max_datagram_size "wormhole-relay-bench-v1")
       (fun ~cid:_ ~start_stream:_ -> stream_handler)
   in
