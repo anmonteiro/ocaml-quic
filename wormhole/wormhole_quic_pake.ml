@@ -184,6 +184,22 @@ let random_bytes n = Mirage_crypto_rng.generate n
 let sha256_raw s = Digestif.SHA256.(to_raw_string (digest_string s))
 let sha256_hex s = Digestif.SHA256.(to_hex (digest_string s))
 
+let sha256_hex_file path =
+  let ic = open_in_bin path in
+  Fun.protect
+    ~finally:(fun () -> close_in_noerr ic)
+    (fun () ->
+      let buf = Bytes.create (256 * 1024) in
+      let digest = ref Digestif.SHA256.empty in
+      let rec loop () =
+        match input ic buf 0 (Bytes.length buf) with
+        | 0 -> Digestif.SHA256.(to_hex (get !digest))
+        | n ->
+          digest := Digestif.SHA256.feed_bytes !digest buf ~off:0 ~len:n;
+          loop ()
+      in
+      loop ())
+
 let hmac_sha256_raw ~key s =
   Digestif.SHA256.(to_raw_string (hmac_string ~key s))
 
@@ -357,10 +373,8 @@ end
 module Binary_transfer = struct
   let chunk_size = 16 * 1024
   let flush_batch_bytes = 256 * 1024
-  let tag_len = 32
-  let header_len = 4 + tag_len
 
-  let send_file ~yield ~stream ~session ~file =
+  let send_file ~yield ~stream ~file =
     let stat = Unix.stat file in
     let total_size = Int64.of_int stat.Unix.st_size in
     let stats = Transfer_stats.create ~label:"relay send" ~total:total_size () in
@@ -371,49 +385,40 @@ module Binary_transfer = struct
       ~finally:(fun () -> close_in_noerr ic)
       (fun () ->
         let buf = Bytes.create chunk_size in
-        let digest = ref Digestif.SHA256.empty in
         update_progress progress 0L;
-        let rec pump chunks_since_yield seq batched_bytes =
+        let rec pump chunks_since_yield batched_bytes =
           match input ic buf 0 (Bytes.length buf) with
           | 0 ->
             finish_progress progress stats.bytes;
             Quic.Stream.flush stream (fun () ->
               Quic.Stream.close_writer stream;
-              Eio.Promise.resolve done_u (Digestif.SHA256.(to_hex (get !digest)), stats))
+              Eio.Promise.resolve done_u stats)
           | n ->
-            let plain = Bytes.sub_string buf 0 n in
-            digest := Digestif.SHA256.feed_string !digest plain;
-            let ciphertext, tag = Pake.encrypt_chunk session ~seq plain in
-            let frame = int32_to_be (Int32.of_int (String.length ciphertext)) ^ tag ^ ciphertext in
-            Quic.Stream.write_string stream frame;
+            let chunk = Bytes.sub_string buf 0 n in
+            Quic.Stream.write_string stream ~off:0 ~len:n chunk;
             Transfer_stats.on_bytes stats n;
             update_progress progress stats.bytes;
-            let batched_bytes = batched_bytes + String.length frame in
+            let batched_bytes = batched_bytes + n in
             let chunks_since_yield = chunks_since_yield + 1 in
             if batched_bytes >= flush_batch_bytes
             then
               Quic.Stream.flush stream (fun () ->
                 if chunks_since_yield >= 64 then yield ();
-                pump (if chunks_since_yield >= 64 then 0 else chunks_since_yield) (Int64.succ seq) 0)
+                pump (if chunks_since_yield >= 64 then 0 else chunks_since_yield) 0)
             else (
               if chunks_since_yield >= 64 then yield ();
-              pump
-                (if chunks_since_yield >= 64 then 0 else chunks_since_yield)
-                (Int64.succ seq)
-                batched_bytes)
+              pump (if chunks_since_yield >= 64 then 0 else chunks_since_yield) batched_bytes)
         in
-        pump 0 0L 0;
+        pump 0 0;
         Eio.Promise.await done_p)
 
-  let recv_file ~stream ~session ~output ~expected_name ~expected_size =
+  let recv_file ~stream ~output ~expected_name ~expected_size =
     let out_path = Option.value output ~default:("recv-" ^ expected_name) in
     let stats = Transfer_stats.create ~label:"relay recv" ~total:expected_size () in
     let progress = create_progress ~label:"receiving" ~total:expected_size in
     let oc = open_out_bin out_path in
     let done_p, done_u = Eio.Promise.create () in
-    let pending = Buffer.create (chunk_size + header_len) in
     let digest = ref Digestif.SHA256.empty in
-    let seq = ref 0L in
     let finished = ref false in
     let finalize result =
       if not !finished
@@ -422,34 +427,6 @@ module Binary_transfer = struct
         close_out_noerr oc;
         Eio.Promise.resolve done_u result)
     in
-    let rec drain_frames () =
-      let data = Buffer.contents pending in
-      let data_len = String.length data in
-      if data_len < header_len
-      then ()
-      else
-        let ciphertext_len = Int32.to_int (be_to_int32 data 0) in
-        let frame_len = header_len + ciphertext_len in
-        if data_len < frame_len
-        then ()
-        else (
-          let tag = String.sub data 4 tag_len in
-          let ciphertext = String.sub data header_len ciphertext_len in
-          let rest_len = data_len - frame_len in
-          Buffer.clear pending;
-          if rest_len > 0 then Buffer.add_substring pending data frame_len rest_len;
-          let plain =
-            match Pake.decrypt_chunk session ~seq:!seq ~ciphertext ~tag with
-            | Ok x -> x
-            | Error e -> failwith ("decrypt/auth failure: " ^ e)
-          in
-          output_string oc plain;
-          digest := Digestif.SHA256.feed_string !digest plain;
-          Transfer_stats.on_bytes stats (String.length plain);
-          update_progress progress stats.bytes;
-          seq := Int64.succ !seq;
-          drain_frames ())
-    in
     Printf.printf "receiving %s (%Ld bytes) into %s\n%!" expected_name expected_size out_path;
     update_progress progress 0L;
     let rec read_stream () =
@@ -457,8 +434,6 @@ module Binary_transfer = struct
         stream
         ~on_eof:(fun () ->
           try
-            if Buffer.length pending <> 0
-            then failwith "trailing partial relay frame";
             if stats.bytes <> expected_size
             then
               failwith
@@ -472,8 +447,11 @@ module Binary_transfer = struct
           | exn -> finalize (Error exn))
         ~on_read:(fun bs ~off ~len ->
           try
-            Buffer.add_string pending (Bigstringaf.substring bs ~off ~len);
-            drain_frames ();
+            let chunk = Bigstringaf.substring bs ~off ~len in
+            output_string oc chunk;
+            digest := Digestif.SHA256.feed_string !digest chunk;
+            Transfer_stats.on_bytes stats len;
+            update_progress progress stats.bytes;
             read_stream ()
           with
           | exn -> finalize (Error exn))
@@ -836,6 +814,7 @@ module Relay = struct
     ; receiver : peer
     ; filename_hex : string
     ; total_size : int64
+    ; digest_hex : string
     ; mutable sender_stream_bound : bool
     }
 
@@ -944,6 +923,7 @@ module Relay = struct
       | Some transfer when transfer.sender == peer && not transfer.sender_stream_bound ->
         transfer.sender_stream_bound <- true;
         let receiver_stream = transfer.receiver.start_stream Quic.Direction.Unidirectional in
+        let pending_flush = ref 0 in
         let rec proxy () =
           Quic.Stream.schedule_read
             stream
@@ -952,8 +932,15 @@ module Relay = struct
                 Quic.Stream.close_writer receiver_stream;
                 Hashtbl.remove room.transfers transfer_id))
             ~on_read:(fun bs ~off ~len ->
-              Quic.Stream.schedule_bigstring receiver_stream ~off ~len bs;
-              Quic.Stream.flush receiver_stream proxy)
+              let chunk = Bigstringaf.substring bs ~off ~len in
+              Quic.Stream.write_string receiver_stream ~off:0 ~len chunk;
+              pending_flush := !pending_flush + len;
+              if !pending_flush >= Binary_transfer.flush_batch_bytes
+              then (
+                pending_flush := 0;
+                Quic.Stream.flush receiver_stream proxy)
+              else
+                proxy ())
         in
         proxy ()
       | _ -> Quic.Stream.close_reader stream)
@@ -977,7 +964,7 @@ module Relay = struct
       (match Hashtbl.find_opt t.rooms room_name with
       | Some room ->
         (match split_words line, partner room role with
-        | [ "USE-RELAY"; transfer_id; filename_hex; total_s ], Some receiver
+        | [ "USE-RELAY"; transfer_id; filename_hex; total_s; digest_hex ], Some receiver
           when role = Sender ->
           let transfer =
             { transfer_id
@@ -985,6 +972,7 @@ module Relay = struct
             ; receiver
             ; filename_hex
             ; total_size = parse_int64 total_s
+            ; digest_hex
             ; sender_stream_bound = false
             }
           in
@@ -1543,6 +1531,7 @@ module Client = struct
         { transfer_id : string
         ; filename : string option
         ; total_size : int64 option
+        ; digest_hex : string option
         }
 
   let resolve_udp_address host port =
@@ -1656,12 +1645,20 @@ module Client = struct
       match split_words (wait_for_line_or_fail ch) with
       | [ "USE-DIRECT" ] -> Use_direct
       | [ "USE-RELAY"; transfer_id ] ->
-        Use_relay { transfer_id; filename = None; total_size = None }
+        Use_relay { transfer_id; filename = None; total_size = None; digest_hex = None }
+      | [ "USE-RELAY"; transfer_id; filename_hex; total_s; digest_hex ] ->
+        Use_relay
+          { transfer_id
+          ; filename = Some (string_of_hex filename_hex)
+          ; total_size = Some (parse_int64 total_s)
+          ; digest_hex = Some digest_hex
+          }
       | [ "USE-RELAY"; transfer_id; filename_hex; total_s ] ->
         Use_relay
           { transfer_id
           ; filename = Some (string_of_hex filename_hex)
           ; total_size = Some (parse_int64 total_s)
+          ; digest_hex = None
           }
       | [ "PEER_LEFT" ] -> failwith "peer disconnected before transfer mode selected"
       | [ "RELAY-READY"; _ ] -> loop ()
@@ -1708,26 +1705,33 @@ module Client = struct
     let stat = Unix.stat file in
     let total_size = Int64.of_int stat.Unix.st_size in
     let filename = Filename.basename file in
+    let digest_hex = sha256_hex_file file in
+    let _ = session in
     Line_channel.write_line
       ch
-      (Printf.sprintf "USE-RELAY %s %s %Ld" transfer_id (hex_of_string filename) total_size);
+      (Printf.sprintf
+         "USE-RELAY %s %s %Ld %s"
+         transfer_id
+         (hex_of_string filename)
+         total_size
+         digest_hex);
     let rec wait_ready () =
       match split_words (wait_for_line_or_fail ch) with
-      | [ "RELAY-READY"; ready_id ] when String.equal ready_id transfer_id -> ()
+      | [ "RELAY-READY"; ready_id ] when String.equal ready_id transfer_id ->
+        ()
+      | [ "RELAY-READY"; ready_id ] ->
+        wait_ready ()
       | [ "PEER_LEFT" ] -> failwith "peer disconnected before relay transfer started"
       | "ERROR" :: msg -> failwith ("ERROR " ^ String.concat " " msg)
       | _ -> wait_ready ()
     in
     wait_ready ();
     let data_stream = conn.start_stream Quic.Direction.Unidirectional in
-    let digest_hex, stats =
-      Binary_transfer.send_file ~yield ~stream:data_stream ~session ~file
-    in
+    let stats = Binary_transfer.send_file ~yield ~stream:data_stream ~file in
     wait_for_relay_result ch;
-    if digest_hex = "" then failwith "unexpected empty digest";
     stats
 
-  let relay_recv ~conn ~ch ~session ~output ~filename ~total_size =
+  let relay_recv ~conn ~ch ~session ~output ~filename ~total_size ~expected_digest =
     let data_stream =
       let rec await () =
         match Eio.Stream.take conn.incoming_streams with
@@ -1736,17 +1740,24 @@ module Client = struct
       in
       await ()
     in
+    let _ = session in
     try
       let digest_hex, stats, _out_path =
         Binary_transfer.recv_file
           ~stream:data_stream
-          ~session
           ~output
           ~expected_name:filename
           ~expected_size:total_size
       in
-      Line_channel.write_line ch ("RECV-OK " ^ digest_hex);
-      stats
+      if not (String.equal digest_hex expected_digest)
+      then (
+        Line_channel.write_line
+          ch
+          (Printf.sprintf "RECV-BAD digest expected=%s got=%s" expected_digest digest_hex);
+        failwith "digest mismatch")
+      else (
+        Line_channel.write_line ch ("RECV-OK " ^ digest_hex);
+        stats)
     with
     | exn ->
       Line_channel.write_line ch ("RECV-BAD " ^ hex_of_string (Printexc.to_string exn));
@@ -2080,7 +2091,7 @@ module Client = struct
            (match direct_listener with
             | None ->
               (match wait_for_mode_or_fail ch with
-              | Use_relay { transfer_id = _; filename; total_size } ->
+              | Use_relay { transfer_id = _; filename; total_size; digest_hex } ->
                  let stats =
                    relay_recv
                      ~conn
@@ -2089,6 +2100,7 @@ module Client = struct
                      ~output
                      ~filename:(Option.value filename ~default:"download.bin")
                      ~total_size:(Option.value total_size ~default:0L)
+                     ~expected_digest:(Option.value digest_hex ~default:"")
                  in
                 transfer_stats := Some stats
               | Use_direct ->
@@ -2104,7 +2116,7 @@ module Client = struct
                | `Direct_done (stats, out_path) ->
                  transfer_stats := Some stats;
                  Format.printf "received direct upload into %s@." out_path
-               | `Mode (Use_relay { transfer_id = _; filename; total_size }) ->
+               | `Mode (Use_relay { transfer_id = _; filename; total_size; digest_hex }) ->
                  let stats =
                    relay_recv
                      ~conn
@@ -2113,6 +2125,7 @@ module Client = struct
                      ~output
                      ~filename:(Option.value filename ~default:"download.bin")
                      ~total_size:(Option.value total_size ~default:0L)
+                     ~expected_digest:(Option.value digest_hex ~default:"")
                  in
                  transfer_stats := Some stats
                | `Mode Use_direct ->
