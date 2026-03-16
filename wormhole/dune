@@ -1,7 +1,7 @@
 (executable
  (name wormhole_quic_pake)
  (modules wormhole_quic_pake qx509)
- (libraries h3 quic-eio qtls_openssl eio_main mirage-crypto-rng.unix))
+ (libraries quic-eio qtls_openssl eio_main mirage-crypto-rng.unix))
 
 (executable
  (name wormhole_relay_bench)

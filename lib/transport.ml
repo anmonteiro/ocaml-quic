@@ -60,10 +60,95 @@ let string_of_encryption_level = function
   | Handshake -> "handshake"
   | Application_data -> "application_data"
 
+let getenv_positive_int name ~default =
+  match Sys.getenv_opt name with
+  | Some value ->
+    (match int_of_string_opt value with
+    | Some value when value > 0 -> value
+    | Some _ -> failwith (name ^ " must be > 0")
+    | None -> failwith ("invalid " ^ name ^ ": " ^ value))
+  | None -> default
+
+module Write_profile = struct
+  type t =
+    { enabled : bool
+    ; mutable reported : bool
+    ; mutable writer_ready_hits : int
+    ; mutable queued_packet_flushes : int
+    ; mutable stream_flushes : int
+    ; mutable next_writev_ops : int
+    ; mutable next_yield_ops : int
+    ; mutable bytes_reported_ok : int64
+    ; mutable max_bytes_reported_ok : int
+    }
+
+  let enabled () =
+    match Sys.getenv_opt "QUIC_PROFILE_WRITE" with
+    | Some ("1" | "true" | "TRUE" | "yes" | "YES") -> true
+    | _ -> false
+
+  let create () =
+    { enabled = enabled ()
+    ; reported = false
+    ; writer_ready_hits = 0
+    ; queued_packet_flushes = 0
+    ; stream_flushes = 0
+    ; next_writev_ops = 0
+    ; next_yield_ops = 0
+    ; bytes_reported_ok = 0L
+    ; max_bytes_reported_ok = 0
+    }
+
+  let on_writer_ready t =
+    if t.enabled then t.writer_ready_hits <- t.writer_ready_hits + 1
+
+  let on_queued_packet_flush t =
+    if t.enabled then t.queued_packet_flushes <- t.queued_packet_flushes + 1
+
+  let on_stream_flush t =
+    if t.enabled then t.stream_flushes <- t.stream_flushes + 1
+
+  let on_next_writev t =
+    if t.enabled then t.next_writev_ops <- t.next_writev_ops + 1
+
+  let on_next_yield t =
+    if t.enabled then t.next_yield_ops <- t.next_yield_ops + 1
+
+  let on_write_result_ok t len =
+    if t.enabled
+    then (
+      t.bytes_reported_ok <- Int64.add t.bytes_reported_ok (Int64.of_int len);
+      t.max_bytes_reported_ok <- max t.max_bytes_reported_ok len)
+
+  let report t ~cid ~peer =
+    if t.enabled && not t.reported
+    then (
+      t.reported <- true;
+      let avg_bytes =
+        if t.next_writev_ops = 0
+        then 0.
+        else Int64.to_float t.bytes_reported_ok /. float_of_int t.next_writev_ops
+      in
+      Printf.eprintf
+        "transport write profile: cid=%s peer=%s writer-ready=%d queued-flush=%d \
+         stream-flush=%d writev=%d yields=%d bytes-ok=%Ld avg-bytes=%.0f max-bytes=%d\n%!"
+        cid
+        peer
+        t.writer_ready_hits
+        t.queued_packet_flushes
+        t.stream_flushes
+        t.next_writev_ops
+        t.next_yield_ops
+        t.bytes_reported_ok
+        avg_bytes
+        t.max_bytes_reported_ok)
+end
+
 module Packet_number = struct
   let max_ack_ranges = 32
   let ack_history_window = 4096L
-  let delayed_ack_packet_threshold = 2
+  let delayed_ack_packet_threshold =
+    getenv_positive_int "QUIC_DELAYED_ACK_PACKET_THRESHOLD" ~default:2
   let delayed_ack_timeout_ms = 25L
   let aggressive_ack_window_packets = 8
 
@@ -272,6 +357,7 @@ module Connection = struct
       mutable processed_retry_packet : bool
     ; mutable token_value : string
     ; now_ms : unit -> int64
+    ; write_profile : Write_profile.t
     }
 
   let invoke_handler t ~cid ~start_stream stream =
@@ -432,6 +518,7 @@ module Connection = struct
     wakeup_writer t
 
   let force_shutdown t =
+    Write_profile.report t.write_profile ~cid:(CID.to_string t.source_cid) ~peer:t.peer_address;
     Queue.clear t.queued_packets;
     Writer.close_and_drain t.writer;
     t.shutdown t
@@ -439,6 +526,7 @@ module Connection = struct
   let shutdown t =
     let shutdown () =
       shutdown_writer t;
+      Write_profile.report t.write_profile ~cid:(CID.to_string t.source_cid) ~peer:t.peer_address;
       t.shutdown t
     in
     match _flush_pending_packets t with
@@ -1397,7 +1485,7 @@ module Connection = struct
       ; sent_stream_highest_offsets = Hashtbl.create ~random:true 1024
       ; recovery = Recovery.create ~max_datagram_size ()
       ; queued_packets = Queue.create ()
-      ; writer = Writer.create 0x1000
+      ; writer = Writer.create 0x10000
       ; streams = Hashtbl.create ~random:true 1024
       ; last_stream_id = None
       ; last_stream = None
@@ -1424,6 +1512,7 @@ module Connection = struct
       ; processed_retry_packet = false
       ; token_value = ""
       ; now_ms
+      ; write_profile = Write_profile.create ()
       }
     in
     t
@@ -1499,7 +1588,8 @@ module Connection = struct
       ]
 
     let app_data_payload_budget t =
-      max 1 (t.recovery.max_datagram_size - 64)
+      let headroom = getenv_positive_int "QUIC_APP_DATA_HEADROOM_BYTES" ~default:64 in
+      max 1 (t.recovery.max_datagram_size - headroom)
 
     let stream_frame_overhead_budget ~stream_id ~fragment =
       let fragment : Frame.fragment = fragment in
@@ -2430,58 +2520,70 @@ let report_exn _t exn =
   else
     Format.eprintf "transport exception: %s@.%s@." (Printexc.to_string exn) bt_s
 
-let flush_pending_packets t =
-  let result = ref None in
-  iter_unique_connections t (fun (connection : Connection.t) ->
-    if Option.is_none !result
-    then
-      let cid = connection.source_cid in
-      match Writer.next connection.writer with
-      | `Write _ ->
-        result :=
-          Some (connection.writer, connection.peer_address, CID.to_string cid)
-      | `Yield | `Close _ ->
-        (match Connection._flush_pending_packets connection with
-        | Wrote_app_data ->
+  let flush_pending_packets t =
+    let result = ref None in
+    iter_unique_connections t (fun (connection : Connection.t) ->
+      if Option.is_none !result
+      then
+        let cid = connection.source_cid in
+        match Writer.next connection.writer with
+        | `Write _ ->
+          Write_profile.on_writer_ready connection.write_profile;
           result :=
             Some (connection.writer, connection.peer_address, CID.to_string cid)
-        | Didnt_write ->
-          (match Connection.Streams.flush connection connection.streams with
-          | Wrote | Wrote_app_data ->
+        | `Yield | `Close _ ->
+          (match Connection._flush_pending_packets connection with
+          | Wrote_app_data ->
+            Write_profile.on_queued_packet_flush connection.write_profile;
             result :=
               Some (connection.writer, connection.peer_address, CID.to_string cid)
-          | _ -> ())
-        | Wrote ->
-          ignore
-            (Connection.Streams.flush connection connection.streams
-             : Connection.flush_ret);
-          result :=
-            Some (connection.writer, connection.peer_address, CID.to_string cid)));
+          | Didnt_write ->
+            (match Connection.Streams.flush connection connection.streams with
+            | Wrote | Wrote_app_data ->
+              Write_profile.on_stream_flush connection.write_profile;
+              result :=
+                Some (connection.writer, connection.peer_address, CID.to_string cid)
+            | _ -> ())
+          | Wrote ->
+            Write_profile.on_queued_packet_flush connection.write_profile;
+            ignore
+              (Connection.Streams.flush connection connection.streams
+               : Connection.flush_ret);
+            result :=
+              Some (connection.writer, connection.peer_address, CID.to_string cid)));
   !result
 
-let next_write_operation (t : t) =
-  if t.closed
-  then `Close 0
-  else
-    match flush_pending_packets t with
-    | Some (writer, client_address, cid) ->
-      (match Writer.next writer with
-      | `Write iovecs -> `Writev (iovecs, client_address, cid)
-      | `Yield -> `Yield (next_timeout_ms t)
-      | `Close n -> `Close n)
-    | None -> `Yield (next_timeout_ms t)
+  let next_write_operation (t : t) =
+    if t.closed
+    then `Close 0
+    else
+      match flush_pending_packets t with
+      | Some (writer, client_address, cid) ->
+        (match Writer.next writer with
+        | `Write iovecs ->
+          (match Connection.Table.find_opt t.connections (CID.of_string cid) with
+          | Some conn -> Write_profile.on_next_writev conn.write_profile
+          | None -> ());
+          `Writev (iovecs, client_address, cid)
+        | `Yield ->
+          (match Connection.Table.find_opt t.connections (CID.of_string cid) with
+          | Some conn -> Write_profile.on_next_yield conn.write_profile
+          | None -> ());
+          `Yield (next_timeout_ms t)
+        | `Close n -> `Close n)
+      | None -> `Yield (next_timeout_ms t)
 
-let report_write_result t ~cid result =
-  match Connection.Table.find_opt t.connections (CID.of_string cid) with
-  | Some conn ->
-    (match result with
-    | `Closed ->
+  let report_write_result t ~cid result =
+    match Connection.Table.find_opt t.connections (CID.of_string cid) with
+    | Some conn ->
+      (match result with
+      | `Closed ->
       Format.eprintf
         "write_result closed: cid=%s peer=%s@."
         (CID.to_string conn.source_cid)
         conn.peer_address
-    | `Ok _ -> ());
-    Writer.report_result conn.writer result
+      | `Ok len -> Write_profile.on_write_result_ok conn.write_profile len);
+      Writer.report_result conn.writer result
   | None ->
     Format.eprintf "connection not found: probably already retired?@.";
     ()

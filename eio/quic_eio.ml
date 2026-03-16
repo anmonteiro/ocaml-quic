@@ -85,6 +85,70 @@ type drop_packet_kind =
 type should_drop =
   direction:drop_direction -> packet_kind:drop_packet_kind -> seq_no:int -> len:int -> bool
 
+module Write_profile = struct
+  type t =
+    { enabled : bool
+    ; started_at : float
+    ; mutable write_ops : int
+    ; mutable write_bytes : int64
+    ; mutable would_block : int
+    ; mutable yield_ops : int
+    ; mutable max_write_bytes : int
+    ; mutable reported : bool
+    }
+
+  let enabled () =
+    match Sys.getenv_opt "QUIC_PROFILE_WRITE" with
+    | Some ("1" | "true" | "TRUE" | "yes" | "YES") -> true
+    | _ -> false
+
+  let now_s () = Unix.gettimeofday ()
+
+  let create () =
+    { enabled = enabled ()
+    ; started_at = now_s ()
+    ; write_ops = 0
+    ; write_bytes = 0L
+    ; would_block = 0
+    ; yield_ops = 0
+    ; max_write_bytes = 0
+    ; reported = false
+    }
+
+  let on_write t bytes =
+    if t.enabled
+    then (
+      t.write_ops <- t.write_ops + 1;
+      t.write_bytes <- Int64.add t.write_bytes (Int64.of_int bytes);
+      t.max_write_bytes <- max t.max_write_bytes bytes)
+
+  let on_would_block t =
+    if t.enabled then t.would_block <- t.would_block + 1
+
+  let on_yield t =
+    if t.enabled then t.yield_ops <- t.yield_ops + 1
+
+  let report t ~label =
+    if t.enabled && not t.reported
+    then (
+      t.reported <- true;
+      let elapsed_s = max 1e-6 (now_s () -. t.started_at) in
+      let avg_bytes =
+        if t.write_ops = 0 then 0. else Int64.to_float t.write_bytes /. float_of_int t.write_ops
+      in
+      Printf.eprintf
+        "eio write profile: label=%s write-ops=%d bytes=%Ld avg-bytes=%.0f \
+         max-bytes=%d would-block=%d yields=%d elapsed=%.3fs\n%!"
+        label
+        t.write_ops
+        t.write_bytes
+        avg_bytes
+        t.max_write_bytes
+        t.would_block
+        t.yield_ops
+        elapsed_s)
+end
+
 module Addr = struct
   let parsed = Hashtbl.create 16
   let parsed_unix = Hashtbl.create 16
@@ -466,6 +530,7 @@ module IO_loop = struct
     let read_buffer = Buffer.create read_buffer_size in
     let recv_seq_no = ref 0 in
     let send_seq_no = ref 0 in
+    let write_profile = Write_profile.create () in
     let write_burst_limit = 64 in
     let read_once =
       match cancel with
@@ -561,16 +626,22 @@ module IO_loop = struct
                     Eio_unix.Fd.use fd ~if_closed:(fun () -> `Closed) (fun fd ->
                       if sent_len <= Io.send_msg_nb_threshold
                       then (
-                        try `Ok (send_msg_iovecs_connected_nb fd io_vectors)
+                        try
+                          let _sent = send_msg_iovecs_connected_nb fd io_vectors in
+                          `Ok sent_len
                         with
                         | Unix.Unix_error (Unix.EAGAIN, _, _) -> `Would_block
                         | Unix.Unix_error (Unix.ECONNREFUSED, _, _) -> `Would_block
                         | Unix.Unix_error (Unix.ECONNRESET, _, _) -> `Would_block)
                       else
-                        try `Ok (send_msg_iovecs_connected_nb fd io_vectors)
+                        try
+                          let _sent = send_msg_iovecs_connected_nb fd io_vectors in
+                          `Ok sent_len
                         with
                         | Unix.Unix_error (Unix.EAGAIN, _, _) ->
-                          (try `Ok (send_msg_iovecs_connected fd io_vectors)
+                          (try
+                             let _sent = send_msg_iovecs_connected fd io_vectors in
+                             `Ok sent_len
                            with
                            | Unix.Unix_error (Unix.ECONNREFUSED, _, _) -> `Would_block
                            | Unix.Unix_error (Unix.ECONNRESET, _, _) -> `Would_block)
@@ -596,9 +667,13 @@ module IO_loop = struct
           in
           (match write_result with
           | `Would_block ->
+            Write_profile.on_would_block write_profile;
             Fiber.yield ();
             `Continue
           | (`Ok _ | `Closed) as write_result ->
+            (match write_result with
+            | `Ok len -> Write_profile.on_write write_profile len
+            | `Closed -> ());
             Runtime.report_write_result t ~cid write_result;
             let writes_since_yield = writes_since_yield + 1 in
             if writes_since_yield >= write_burst_limit
@@ -607,6 +682,7 @@ module IO_loop = struct
               `Continue)
             else write_loop_step writes_since_yield)
         | `Yield timeout_ms ->
+          Write_profile.on_yield write_profile;
           let wake_p, wake_u = Promise.create () in
           Runtime.yield_writer t (Promise.resolve wake_u);
           let wait_for_timeout () =
@@ -637,8 +713,9 @@ module IO_loop = struct
       in
       match write_loop_step 0 with
       | `Continue -> write_loop ()
-      | `Stop -> ()
-      | exception Cancelled -> ()
+      | `Stop -> Write_profile.report write_profile ~label:"io-loop"
+      | exception Cancelled ->
+        Write_profile.report write_profile ~label:"io-loop"
       | exception exn ->
         if Runtime.is_closed t
         then ()
@@ -733,7 +810,12 @@ module Client = struct
       try Eio.Resource.close fd with _ -> ()
     in
     let connect_udp address =
-      if udp_connect && (udp_send_fast_path_enabled || udp_recv_fast_path_enabled)
+      let should_connect_udp =
+        udp_connect
+        && (udp_send_fast_path_enabled || udp_recv_fast_path_enabled)
+        && not (IO_loop.Io.running_on_macos && udp_send_fast_path_enabled)
+      in
+      if should_connect_udp
       then
         match Eio_unix.Resource.fd_opt fd with
         | Some file_descr ->
