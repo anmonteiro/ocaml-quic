@@ -21,6 +21,8 @@ let parse_int64 s =
 let parse_int s =
   try int_of_string s with _ -> failwith ("invalid int: " ^ s)
 
+let wormhole_max_datagram_size = 1452
+
 module Transfer_stats = struct
   type t =
     { label : string
@@ -371,7 +373,7 @@ module Pake = struct
 end
 
 module Binary_transfer = struct
-  let chunk_size = 16 * 1024
+  let chunk_size = 256 * 1024
   let flush_batch_bytes = 256 * 1024
 
   let send_file ~yield ~stream ~file =
@@ -497,7 +499,7 @@ module Direct = struct
     { Quic.Config.certificates
     ; alpn_protocols = [ alpn ]
     ; transport_parameters = Quic.Config.default_transport_parameters
-    ; max_datagram_size = Quic.Config.default_max_datagram_size
+    ; max_datagram_size = wormhole_max_datagram_size
     }
 
   let candidate_hosts ?advertise_host () =
@@ -1045,7 +1047,7 @@ module Relay = struct
       { Quic.Config.certificates
       ; alpn_protocols = [ "wormhole-relay-v1" ]
       ; transport_parameters = Quic.Config.default_transport_parameters
-      ; max_datagram_size = Quic.Config.default_max_datagram_size
+      ; max_datagram_size = wormhole_max_datagram_size
       }
     in
     let state = create_state () in
@@ -1072,7 +1074,7 @@ module Relay_h3 = struct
     { Quic.Config.certificates
     ; alpn_protocols = [ alpn ]
     ; transport_parameters = Quic.Config.default_transport_parameters
-    ; max_datagram_size = Quic.Config.default_max_datagram_size
+    ; max_datagram_size = wormhole_max_datagram_size
     }
 
   let relay_data_port port = port + 1
@@ -1560,7 +1562,7 @@ module Client = struct
     { Quic.Config.certificates
     ; alpn_protocols = [ "wormhole-relay-v1" ]
     ; transport_parameters = Quic.Config.default_transport_parameters
-    ; max_datagram_size = Quic.Config.default_max_datagram_size
+    ; max_datagram_size = wormhole_max_datagram_size
     }
 
   let connect_with_config env ~sw ~config ~(opts : opts) =
